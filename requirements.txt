@@ -8,3 +8,4 @@ openai
 sqlalchemy
 psycopg2-binary
 python-dotenv
+passlib[bcrypt]
