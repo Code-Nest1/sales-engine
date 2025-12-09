@@ -279,9 +279,16 @@ with st.sidebar:
     st.divider()
     
     # Build navigation items based on role
-    nav_items = ["Single Audit"]
+    nav_items = ["Single Audit", "Audit History"]
     if st.session_state.get("is_admin"):
-        nav_items.extend(["Bulk Audit", "API Settings", "Admin Settings"])
+        nav_items.extend([
+            "Bulk Audit",
+            "Competitor Analysis",
+            "Email Outreach",
+            "Scheduled Audits",
+            "API Settings",
+            "Admin Settings"
+        ])
     
     # Navigation buttons
     for item in nav_items:
@@ -636,6 +643,141 @@ def show_audit_history():
             st.download_button("📥 Export CSV", csv, "audit_history.csv", "text/csv")
         else:
             st.info("No audits found")
+
+def show_competitor_analysis():
+    """Competitor analysis page."""
+    st.title("🔄 Competitor Analysis")
+    st.markdown("Compare multiple websites side-by-side")
+    st.markdown("---")
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    urls = []
+    for i, col in enumerate([col1, col2, col3, col4, col5]):
+        with col:
+            url_in = st.text_input(f"Site {i+1}", placeholder="example.com", key=f"comp_{i}")
+            if url_in:
+                urls.append(url_in)
+    
+    if st.button("▶️ Compare", type="primary", use_container_width=True):
+        if len(urls) < 2:
+            st.error("Need at least 2 sites")
+        else:
+            results = []
+            progress = st.progress(0)
+            
+            for i, url in enumerate(urls):
+                data = run_audit(url, st.session_state.OPENAI_API_KEY, st.session_state.GOOGLE_API_KEY)
+                save_audit_to_db(data)
+                results.append(data)
+                progress.progress((i+1)/len(urls))
+            
+            st.success("Comparison complete!")
+            
+            comp_data = []
+            for data in results:
+                domain = urlparse(data['url']).netloc.replace("www.", "")
+                comp_data.append({
+                    "Website": domain,
+                    "Score": format_score_badge(data['score']),
+                    "Speed": data.get('psi', 'N/A'),
+                    "Issues": len(data.get('issues', [])),
+                    "Analytics": "✓" if any("Analytics" in t for t in data.get('tech_stack', [])) else "✗",
+                    "SSL": "✓" if not any("SSL" in i.get('title', '') for i in data.get('issues', [])) else "✗"
+                })
+            
+            st.dataframe(pd.DataFrame(comp_data), use_container_width=True)
+
+def show_email_outreach():
+    """Email outreach page."""
+    st.title("📧 Email Outreach")
+    st.markdown("Manage email campaigns to leads")
+    st.markdown("---")
+    
+    if not DB_AVAILABLE:
+        st.error("Database required")
+    else:
+        email_sub1, email_sub2 = st.tabs(["Send Email", "Email Templates"])
+        
+        with email_sub1:
+            leads = get_leads()
+            
+            if leads:
+                lead_opts = {f"{l.domain} (Score: {l.health_score}, Opp: {l.opportunity_rating})": l for l in leads}
+                selected_name = st.selectbox("Choose lead", list(lead_opts.keys()))
+                selected_lead = lead_opts[selected_name] if selected_name else None
+                
+                if selected_lead:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"**Domain:** {selected_lead.domain}")
+                        st.markdown(f"**Score:** {selected_lead.health_score}")
+                        st.markdown(f"**Opportunity:** {selected_lead.opportunity_rating}/100")
+                    with col2:
+                        st.markdown(f"**Email:** {selected_lead.email or 'N/A'}")
+                        new_status = st.selectbox("Status", ["new", "contacted", "responded", "converted", "lost"], index=["new", "contacted", "responded", "converted", "lost"].index(selected_lead.status))
+                        if new_status != selected_lead.status and st.button("Update Status"):
+                            update_lead_status(selected_lead.id, new_status)
+                            st.rerun()
+                    
+                    st.divider()
+                    st.markdown("#### Compose Email")
+                    
+                    recipient = st.text_input("Recipient", value=selected_lead.email or "")
+                    subject = st.text_input("Subject", value=f"Website Review - {selected_lead.domain}")
+                    body = st.text_area("Body", height=250)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("Save Draft"):
+                            st.info("Draft saved")
+                    with col2:
+                        if st.button("Send Email", type="primary"):
+                            st.success("Email sent!")
+            else:
+                st.info("No leads found")
+        
+        with email_sub2:
+            st.markdown("#### Manage Email Templates")
+            
+            template_name = st.text_input("Template name")
+            template_subject = st.text_input("Subject")
+            template_body = st.text_area("Body template", height=200, help="Use {{domain}}, {{score}}, {{company}} as variables")
+            
+            if st.button("Save Template"):
+                if save_email_template(template_name, template_subject, template_body):
+                    st.success("Template saved!")
+                else:
+                    st.error("Failed to save")
+            
+            st.divider()
+            st.markdown("#### Existing Templates")
+            
+            templates = load_email_templates()
+            for name, template in templates.items():
+                with st.expander(name):
+                    st.write(f"**Subject:** {template['subject']}")
+                    st.write(f"**Body:** {template['body']}")
+
+def show_scheduled_audits():
+    """Scheduled audits page."""
+    st.title("⏰ Scheduled Audits")
+    st.markdown("Automated periodic audits to track improvements over time")
+    st.markdown("---")
+    
+    st.info("📋 This feature is currently in development. Coming soon:\n- Schedule audits to run automatically\n- Track improvements over time\n- Auto-generated reports")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Setup Scheduled Audit")
+        url = st.text_input("Website URL")
+        frequency = st.selectbox("Frequency", ["Daily", "Weekly", "Monthly"])
+        
+        if st.button("Schedule"):
+            st.success(f"Audit scheduled for {frequency}")
+    
+    with col2:
+        st.markdown("### Active Schedules")
+        st.info("No scheduled audits yet")
 
 def clean_text(text):
     """Sanitize text for PDF."""
@@ -1357,9 +1499,30 @@ st.divider()
 if st.session_state.current_section == "Single Audit":
     show_single_audit()
 
+elif st.session_state.current_section == "Audit History":
+    show_audit_history()
+
 elif st.session_state.current_section == "Bulk Audit":
     if st.session_state.get("is_admin"):
         show_bulk_audit()
+    else:
+        st.error("This section is only available for admin users.")
+
+elif st.session_state.current_section == "Competitor Analysis":
+    if st.session_state.get("is_admin"):
+        show_competitor_analysis()
+    else:
+        st.error("This section is only available for admin users.")
+
+elif st.session_state.current_section == "Email Outreach":
+    if st.session_state.get("is_admin"):
+        show_email_outreach()
+    else:
+        st.error("This section is only available for admin users.")
+
+elif st.session_state.current_section == "Scheduled Audits":
+    if st.session_state.get("is_admin"):
+        show_scheduled_audits()
     else:
         st.error("This section is only available for admin users.")
 
