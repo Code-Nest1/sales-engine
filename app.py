@@ -17,9 +17,15 @@ from pathlib import Path
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import pyotp
-import qrcode
 from io import BytesIO
+
+# Optional: 2FA support
+try:
+    import pyotp
+    import qrcode
+    TWO_FA_AVAILABLE = True
+except ImportError:
+    TWO_FA_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -112,10 +118,14 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 def generate_2fa_secret():
     """Generate 2FA secret."""
+    if not TWO_FA_AVAILABLE:
+        return None
     return pyotp.random_base32()
 
 def verify_2fa_token(secret: str, token: str) -> bool:
     """Verify 2FA token."""
+    if not TWO_FA_AVAILABLE or not secret:
+        return False
     try:
         totp = pyotp.TOTP(secret)
         return totp.verify(token)
@@ -285,31 +295,34 @@ with st.sidebar:
     if st.session_state.get('is_admin'):
         st.divider()
         if st.checkbox("Admin Settings"):
-            st.markdown("### Enable 2FA for Your Account")
-            if st.button("Setup 2FA"):
-                secret = generate_2fa_secret()
-                st.session_state["2fa_setup_secret"] = secret
-                
-                totp = pyotp.TOTP(secret)
-                qr = qrcode.QRCode(version=1, box_size=10)
-                qr.add_data(totp.provisioning_uri(st.session_state['current_user'], issuer_name='Code Nest'))
-                qr.make(fit=True)
-                img = qr.make_image(fill_color="black", back_color="white")
-                
-                st.image(img, width=200)
-                st.code(secret, language="text")
-                st.info("Scan QR code with authenticator app (Google Authenticator, Authy, etc)")
-                
-                token = st.text_input("Enter 6-digit code to confirm")
-                if token and verify_2fa_token(secret, token):
-                    secrets_2fa = load_2fa_secrets()
-                    secrets_2fa[st.session_state['current_user']] = {
-                        "secret": secret,
-                        "enabled": True
-                    }
-                    save_2fa_secrets(secrets_2fa)
-                    st.success("2FA enabled!")
-                    st.rerun()
+            if TWO_FA_AVAILABLE:
+                st.markdown("### Enable 2FA for Your Account")
+                if st.button("Setup 2FA"):
+                    secret = generate_2fa_secret()
+                    st.session_state["2fa_setup_secret"] = secret
+                    
+                    totp = pyotp.TOTP(secret)
+                    qr = qrcode.QRCode(version=1, box_size=10)
+                    qr.add_data(totp.provisioning_uri(st.session_state['current_user'], issuer_name='Code Nest'))
+                    qr.make(fit=True)
+                    img = qr.make_image(fill_color="black", back_color="white")
+                    
+                    st.image(img, width=200)
+                    st.code(secret, language="text")
+                    st.info("Scan QR code with authenticator app (Google Authenticator, Authy, etc)")
+                    
+                    token = st.text_input("Enter 6-digit code to confirm")
+                    if token and verify_2fa_token(secret, token):
+                        secrets_2fa = load_2fa_secrets()
+                        secrets_2fa[st.session_state['current_user']] = {
+                            "secret": secret,
+                            "enabled": True
+                        }
+                        save_2fa_secrets(secrets_2fa)
+                        st.success("2FA enabled!")
+                        st.rerun()
+            else:
+                st.info("2FA requires pyotp and qrcode packages. Install via: pip install pyotp qrcode[pil]")
 
 # ============================================================================
 # HELPER FUNCTIONS
