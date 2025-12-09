@@ -501,7 +501,7 @@ def show_api_settings():
         col1, col2 = st.columns([3, 1])
         
         with col1:
-            if current_keys.get("openai"):
+            if current_keys.get("openai") and not st.session_state.get("edit_openai"):
                 # Show masked key with options
                 masked_key = current_keys["openai"][:8] + "..." + current_keys["openai"][-4:] if len(current_keys["openai"]) > 12 else "***"
                 st.markdown(f"""
@@ -534,47 +534,46 @@ def show_api_settings():
                 with col_add:
                     if st.button("🔄 Replace Key", key="replace_openai", use_container_width=True):
                         st.session_state.edit_openai = True
-            else:
-                st.markdown("""
-                <div class="api-key-card">
-                    <div class="api-key-status">
-                        <div>
-                            <div class="api-key-name">❌ No Key Added</div>
-                            <div style="font-size: 12px; opacity: 0.8;">Add your OpenAI key to enable AI features</div>
-                        </div>
-                        <div class="api-key-badge badge-inactive">INACTIVE</div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        with col2:
-            st.empty()
-        
-        # Add/Edit form
-        if st.session_state.get("edit_openai") or not current_keys.get("openai"):
-            st.markdown("**Add or Replace OpenAI API Key:**")
-            new_openai_key = st.text_input(
-                "Paste your OpenAI API Key",
-                type="password",
-                key="input_openai",
-                placeholder="sk-..."
-            )
+                        st.rerun()
             
-            col_save, col_cancel = st.columns(2)
-            with col_save:
-                if st.button("✅ Save OpenAI Key", use_container_width=True):
-                    if new_openai_key:
-                        save_user_api_key(username, "openai", new_openai_key)
-                        st.success("✓ OpenAI key saved securely")
+            elif st.session_state.get("edit_openai") or not current_keys.get("openai"):
+                # Add/Edit form
+                if not current_keys.get("openai"):
+                    st.markdown("""
+                    <div class="api-key-card">
+                        <div class="api-key-status">
+                            <div>
+                                <div class="api-key-name">❌ No Key Added</div>
+                                <div style="font-size: 12px; opacity: 0.8;">Add your OpenAI key to enable AI features</div>
+                            </div>
+                            <div class="api-key-badge badge-inactive">INACTIVE</div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown("**Add or Replace OpenAI API Key:**")
+                new_openai_key = st.text_input(
+                    "Paste your OpenAI API Key",
+                    type="password",
+                    key="input_openai",
+                    placeholder="sk-..."
+                )
+                
+                col_save, col_cancel = st.columns(2)
+                with col_save:
+                    if st.button("✅ Save OpenAI Key", key="save_openai_btn", use_container_width=True):
+                        if new_openai_key:
+                            save_user_api_key(username, "openai", new_openai_key)
+                            st.success("✓ OpenAI key saved securely")
+                            st.session_state.edit_openai = False
+                            st.rerun()
+                        else:
+                            st.error("Please enter an API key")
+                
+                with col_cancel:
+                    if st.button("❌ Cancel", key="cancel_openai_btn", use_container_width=True):
                         st.session_state.edit_openai = False
                         st.rerun()
-                    else:
-                        st.error("Please enter an API key")
-            
-            with col_cancel:
-                if st.button("❌ Cancel", use_container_width=True):
-                    st.session_state.edit_openai = False
-                    st.rerun()
     
     st.divider()
     
@@ -586,7 +585,7 @@ def show_api_settings():
         col1, col2 = st.columns([3, 1])
         
         with col1:
-            if current_keys.get("google"):
+            if current_keys.get("google") and not st.session_state.get("edit_google"):
                 masked_key = current_keys["google"][:8] + "..." + current_keys["google"][-4:] if len(current_keys["google"]) > 12 else "***"
                 st.markdown(f"""
                 <div class="api-key-card">
@@ -618,47 +617,46 @@ def show_api_settings():
                 with col_add:
                     if st.button("🔄 Replace Key", key="replace_google", use_container_width=True):
                         st.session_state.edit_google = True
-            else:
-                st.markdown("""
-                <div class="api-key-card">
-                    <div class="api-key-status">
-                        <div>
-                            <div class="api-key-name">❌ No Key Added</div>
-                            <div style="font-size: 12px; opacity: 0.8;">Add your Google PageSpeed key to enable performance analysis</div>
-                        </div>
-                        <div class="api-key-badge badge-inactive">INACTIVE</div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        with col2:
-            st.empty()
-        
-        # Add/Edit form
-        if st.session_state.get("edit_google") or not current_keys.get("google"):
-            st.markdown("**Add or Replace Google PageSpeed API Key:**")
-            new_google_key = st.text_input(
-                "Paste your Google PageSpeed API Key",
-                type="password",
-                key="input_google",
-                placeholder="AIza..."
-            )
+                        st.rerun()
             
-            col_save, col_cancel = st.columns(2)
-            with col_save:
-                if st.button("✅ Save Google Key", use_container_width=True):
-                    if new_google_key:
-                        save_user_api_key(username, "google", new_google_key)
-                        st.success("✓ Google key saved securely")
+            elif st.session_state.get("edit_google") or not current_keys.get("google"):
+                # Add/Edit form
+                if not current_keys.get("google"):
+                    st.markdown("""
+                    <div class="api-key-card">
+                        <div class="api-key-status">
+                            <div>
+                                <div class="api-key-name">❌ No Key Added</div>
+                                <div style="font-size: 12px; opacity: 0.8;">Add your Google PageSpeed key to enable performance analysis</div>
+                            </div>
+                            <div class="api-key-badge badge-inactive">INACTIVE</div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown("**Add or Replace Google PageSpeed API Key:**")
+                new_google_key = st.text_input(
+                    "Paste your Google PageSpeed API Key",
+                    type="password",
+                    key="input_google",
+                    placeholder="AIza..."
+                )
+                
+                col_save, col_cancel = st.columns(2)
+                with col_save:
+                    if st.button("✅ Save Google Key", key="save_google_btn", use_container_width=True):
+                        if new_google_key:
+                            save_user_api_key(username, "google", new_google_key)
+                            st.success("✓ Google key saved securely")
+                            st.session_state.edit_google = False
+                            st.rerun()
+                        else:
+                            st.error("Please enter an API key")
+                
+                with col_cancel:
+                    if st.button("❌ Cancel", key="cancel_google_btn", use_container_width=True):
                         st.session_state.edit_google = False
                         st.rerun()
-                    else:
-                        st.error("Please enter an API key")
-            
-            with col_cancel:
-                if st.button("❌ Cancel", use_container_width=True):
-                    st.session_state.edit_google = False
-                    st.rerun()
     
     st.divider()
     
@@ -670,7 +668,7 @@ def show_api_settings():
         col1, col2 = st.columns([3, 1])
         
         with col1:
-            if current_keys.get("slack"):
+            if current_keys.get("slack") and not st.session_state.get("edit_slack"):
                 masked_key = current_keys["slack"][:20] + "..." + current_keys["slack"][-10:] if len(current_keys["slack"]) > 30 else "***"
                 st.markdown(f"""
                 <div class="api-key-card">
@@ -702,47 +700,46 @@ def show_api_settings():
                 with col_add:
                     if st.button("🔄 Replace URL", key="replace_slack", use_container_width=True):
                         st.session_state.edit_slack = True
-            else:
-                st.markdown("""
-                <div class="api-key-card">
-                    <div class="api-key-status">
-                        <div>
-                            <div class="api-key-name">❌ No Webhook Added</div>
-                            <div style="font-size: 12px; opacity: 0.8;">Add your Slack webhook to receive notifications</div>
-                        </div>
-                        <div class="api-key-badge badge-inactive">INACTIVE</div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        with col2:
-            st.empty()
-        
-        # Add/Edit form
-        if st.session_state.get("edit_slack") or not current_keys.get("slack"):
-            st.markdown("**Add or Replace Slack Webhook URL:**")
-            new_slack_key = st.text_input(
-                "Paste your Slack Webhook URL",
-                type="password",
-                key="input_slack",
-                placeholder="https://hooks.slack.com/services/..."
-            )
+                        st.rerun()
             
-            col_save, col_cancel = st.columns(2)
-            with col_save:
-                if st.button("✅ Save Slack URL", use_container_width=True):
-                    if new_slack_key:
-                        save_user_api_key(username, "slack", new_slack_key)
-                        st.success("✓ Slack webhook saved securely")
+            elif st.session_state.get("edit_slack") or not current_keys.get("slack"):
+                # Add/Edit form
+                if not current_keys.get("slack"):
+                    st.markdown("""
+                    <div class="api-key-card">
+                        <div class="api-key-status">
+                            <div>
+                                <div class="api-key-name">❌ No Webhook Added</div>
+                                <div style="font-size: 12px; opacity: 0.8;">Add your Slack webhook to receive notifications</div>
+                            </div>
+                            <div class="api-key-badge badge-inactive">INACTIVE</div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown("**Add or Replace Slack Webhook URL:**")
+                new_slack_key = st.text_input(
+                    "Paste your Slack Webhook URL",
+                    type="password",
+                    key="input_slack",
+                    placeholder="https://hooks.slack.com/services/..."
+                )
+                
+                col_save, col_cancel = st.columns(2)
+                with col_save:
+                    if st.button("✅ Save Slack URL", key="save_slack_btn", use_container_width=True):
+                        if new_slack_key:
+                            save_user_api_key(username, "slack", new_slack_key)
+                            st.success("✓ Slack webhook saved securely")
+                            st.session_state.edit_slack = False
+                            st.rerun()
+                        else:
+                            st.error("Please enter a webhook URL")
+                
+                with col_cancel:
+                    if st.button("❌ Cancel", key="cancel_slack_btn", use_container_width=True):
                         st.session_state.edit_slack = False
                         st.rerun()
-                    else:
-                        st.error("Please enter a webhook URL")
-            
-            with col_cancel:
-                if st.button("❌ Cancel", use_container_width=True):
-                    st.session_state.edit_slack = False
-                    st.rerun()
     
     st.markdown("---")
     st.info("🔒 **Security:** Your API keys are encrypted and stored securely in the database. They are never displayed in plain text unless you explicitly view them.")
