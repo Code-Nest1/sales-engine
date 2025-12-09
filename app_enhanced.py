@@ -17,15 +17,9 @@ from pathlib import Path
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import pyotp
+import qrcode
 from io import BytesIO
-
-# Optional: 2FA support
-try:
-    import pyotp
-    import qrcode
-    TWO_FA_AVAILABLE = True
-except ImportError:
-    TWO_FA_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -118,14 +112,10 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 def generate_2fa_secret():
     """Generate 2FA secret."""
-    if not TWO_FA_AVAILABLE:
-        return None
     return pyotp.random_base32()
 
 def verify_2fa_token(secret: str, token: str) -> bool:
     """Verify 2FA token."""
-    if not TWO_FA_AVAILABLE or not secret:
-        return False
     try:
         totp = pyotp.TOTP(secret)
         return totp.verify(token)
@@ -295,34 +285,31 @@ with st.sidebar:
     if st.session_state.get('is_admin'):
         st.divider()
         if st.checkbox("Admin Settings"):
-            if TWO_FA_AVAILABLE:
-                st.markdown("### Enable 2FA for Your Account")
-                if st.button("Setup 2FA"):
-                    secret = generate_2fa_secret()
-                    st.session_state["2fa_setup_secret"] = secret
-                    
-                    totp = pyotp.TOTP(secret)
-                    qr = qrcode.QRCode(version=1, box_size=10)
-                    qr.add_data(totp.provisioning_uri(st.session_state['current_user'], issuer_name='Code Nest'))
-                    qr.make(fit=True)
-                    img = qr.make_image(fill_color="black", back_color="white")
-                    
-                    st.image(img, width=200)
-                    st.code(secret, language="text")
-                    st.info("Scan QR code with authenticator app (Google Authenticator, Authy, etc)")
-                    
-                    token = st.text_input("Enter 6-digit code to confirm")
-                    if token and verify_2fa_token(secret, token):
-                        secrets_2fa = load_2fa_secrets()
-                        secrets_2fa[st.session_state['current_user']] = {
-                            "secret": secret,
-                            "enabled": True
-                        }
-                        save_2fa_secrets(secrets_2fa)
-                        st.success("2FA enabled!")
-                        st.rerun()
-            else:
-                st.info("2FA requires pyotp and qrcode packages. Install via: pip install pyotp qrcode[pil]")
+            st.markdown("### Enable 2FA for Your Account")
+            if st.button("Setup 2FA"):
+                secret = generate_2fa_secret()
+                st.session_state["2fa_setup_secret"] = secret
+                
+                totp = pyotp.TOTP(secret)
+                qr = qrcode.QRCode(version=1, box_size=10)
+                qr.add_data(totp.provisioning_uri(st.session_state['current_user'], issuer_name='Code Nest'))
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                
+                st.image(img, width=200)
+                st.code(secret, language="text")
+                st.info("Scan QR code with authenticator app (Google Authenticator, Authy, etc)")
+                
+                token = st.text_input("Enter 6-digit code to confirm")
+                if token and verify_2fa_token(secret, token):
+                    secrets_2fa = load_2fa_secrets()
+                    secrets_2fa[st.session_state['current_user']] = {
+                        "secret": secret,
+                        "enabled": True
+                    }
+                    save_2fa_secrets(secrets_2fa)
+                    st.success("2FA enabled!")
+                    st.rerun()
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -679,9 +666,6 @@ def save_audit_to_db(data, comparison_group=None):
         db.commit()
         db.refresh(audit)
         
-        # Store audit_id in data for PDF generation
-        data['audit_id'] = audit.id
-        
         # Create/update lead
         existing_lead = db.query(Lead).filter(Lead.domain == domain).first()
         opp_score = calculate_opportunity_score(data)
@@ -850,12 +834,11 @@ def generate_pdf(data):
     pdf.set_text_color(0, 0, 0)
     pdf.set_font('Arial', '', 10)
     pdf.cell(0, 6, f"Domain Age: {data.get('domain_age', 'Unknown')}", 0, 1)
-    pdf.cell(0, 6, f"Report Date: {datetime.now().strftime('%B %d, %Y at %H:%M')}", 0, 1)
+    pdf.cell(0, 6, f"Report Date: {datetime.now().strftime('%B %d, %Y')}", 0, 1)
     if data.get('psi'):
         pdf.cell(0, 6, f"Google Speed Score: {data['psi']}/100", 0, 1)
     if data.get('accessibility_score'):
         pdf.cell(0, 6, f"Accessibility Score: {data['accessibility_score']}/100", 0, 1)
-    pdf.cell(0, 6, f"Audit ID: {data.get('audit_id', 'N/A')}", 0, 1)
     pdf.ln(5)
 
     # Executive summary
@@ -895,29 +878,6 @@ def generate_pdf(data):
     pdf.cell(0, 6, f"Report by {COMPANY_NAME} | {CONTACT_EMAIL}", 0, 1, 'C')
 
     return pdf.output(dest='S').encode('latin-1')
-
-def save_audit_pdf_to_file(audit_id, pdf_bytes):
-    """Save PDF to file for persistent download."""
-    pdf_dir = Path(__file__).parent / "audit_pdfs"
-    pdf_dir.mkdir(exist_ok=True)
-    
-    pdf_path = pdf_dir / f"audit_{audit_id}.pdf"
-    try:
-        with open(pdf_path, 'wb') as f:
-            f.write(pdf_bytes)
-        return str(pdf_path)
-    except Exception as e:
-        return None
-
-def get_audit_pdf(audit_id):
-    """Retrieve stored audit PDF."""
-    pdf_path = Path(__file__).parent / "audit_pdfs" / f"audit_{audit_id}.pdf"
-    try:
-        if pdf_path.exists():
-            return pdf_path.read_bytes()
-        return None
-    except Exception:
-        return None
 
 def show_admin_settings():
     """Admin settings page with enhanced features."""
@@ -1055,7 +1015,7 @@ if st.session_state.get("is_admin"):
         "⚙️ Admin Settings"
     ]
 else:
-    tab_names = ["📊 Dashboard", "🚀 Single Audit", "📊 Audit History"]
+    tab_names = ["📊 Dashboard", "🚀 Single Audit"]
 
 tabs = st.tabs(tab_names)
 
@@ -1204,7 +1164,6 @@ with tabs[single_audit_idx]:
                         st.text_area("", value=clean_text(data['ai']['email']), height=250, key="email_draft")
                     
                     # Save to DB
-                    audit_id = None
                     if DB_AVAILABLE:
                         audit_id = save_audit_to_db(data)
                         if audit_id:
@@ -1214,17 +1173,11 @@ with tabs[single_audit_idx]:
                             if SLACK_WEBHOOK:
                                 send_slack_notification(f"🔍 New audit: {url} (Score: {data['score']}/100)")
                     
-                    # PDF export and persistent storage
+                    # PDF export
                     st.markdown("---")
                     try:
                         pdf_bytes = generate_pdf(data)
                         domain_name = urlparse(data['url']).netloc.replace("www.", "").replace(".", "_")
-                        
-                        # Save PDF to persistent storage if audit was saved to DB
-                        if audit_id:
-                            save_audit_pdf_to_file(audit_id, pdf_bytes)
-                            st.info(f"✓ PDF saved for future downloads")
-                        
                         st.download_button(
                             "📥 Download PDF Report",
                             pdf_bytes,
@@ -1292,70 +1245,42 @@ if st.session_state.get("is_admin"):
                         use_container_width=True
                     )
 
-# Audit History tab (admin and users)
+# Audit History tab (admin only)
 if st.session_state.get("is_admin"):
     hist_idx = 3
-else:
-    hist_idx = 2
-
-with tabs[hist_idx]:
-    st.markdown("### 📊 Audit History")
-    
-    if not DB_AVAILABLE:
-        st.error("Database required")
-    else:
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            search = st.text_input("Search domain", key="hist_search")
-        with col2:
-            min_score = st.number_input("Min Score", 0, 100, 0)
-        with col3:
-            max_score = st.number_input("Max Score", 0, 100, 100)
+    with tabs[hist_idx]:
+        st.markdown("### 📊 Audit History")
         
-        audits = get_audit_history(limit=100, search_query=search if search else None, min_score=min_score if min_score > 0 else None, max_score=max_score if max_score < 100 else None)
-        
-        if audits:
-            hist_data = []
-            for audit in audits:
-                hist_data.append({
-                    "Domain": audit.domain,
-                    "Score": format_score_badge(audit.health_score),
-                    "Speed": audit.psi_score if audit.psi_score else "N/A",
-                    "Issues": len(audit.issues) if audit.issues else 0,
-                    "Date": audit.created_at.strftime("%m/%d %H:%M") if audit.created_at else "N/A",
-                    "ID": audit.id
-                })
-            
-            st.dataframe(pd.DataFrame(hist_data).drop(columns=["ID"]), use_container_width=True)
-            
-            # Add download buttons for each audit
-            st.markdown("---")
-            st.markdown("### 📥 Download Audit PDFs")
-            
-            cols = st.columns(3)
-            col_idx = 0
-            for audit in audits:
-                with cols[col_idx % 3]:
-                    if st.button(f"📄 {audit.domain}", key=f"dl_audit_{audit.id}"):
-                        pdf_bytes = get_audit_pdf(audit.id)
-                        if pdf_bytes:
-                            st.download_button(
-                                label=f"⬇️ {audit.domain}",
-                                data=pdf_bytes,
-                                file_name=f"audit_{audit.id}_{audit.domain}.pdf",
-                                mime="application/pdf",
-                                key=f"btn_{audit.id}"
-                            )
-                        else:
-                            st.warning(f"PDF not available for this audit. Run audit again to generate.")
-                col_idx += 1
-            
-            # Export CSV option
-            st.markdown("---")
-            csv = pd.DataFrame(hist_data).drop(columns=["ID"]).to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Export CSV", csv, "audit_history.csv", "text/csv")
+        if not DB_AVAILABLE:
+            st.error("Database required")
         else:
-            st.info("No audits found")
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                search = st.text_input("Search domain", key="hist_search")
+            with col2:
+                min_score = st.number_input("Min Score", 0, 100, 0)
+            with col3:
+                max_score = st.number_input("Max Score", 0, 100, 100)
+            
+            audits = get_audit_history(limit=100, search_query=search if search else None, min_score=min_score if min_score > 0 else None, max_score=max_score if max_score < 100 else None)
+            
+            if audits:
+                hist_data = []
+                for audit in audits:
+                    hist_data.append({
+                        "Domain": audit.domain,
+                        "Score": format_score_badge(audit.health_score),
+                        "Speed": audit.psi_score if audit.psi_score else "N/A",
+                        "Issues": len(audit.issues) if audit.issues else 0,
+                        "Date": audit.created_at.strftime("%m/%d %H:%M") if audit.created_at else "N/A"
+                    })
+                
+                st.dataframe(pd.DataFrame(hist_data), use_container_width=True)
+                
+                csv = pd.DataFrame(hist_data).to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Export CSV", csv, "audit_history.csv", "text/csv")
+            else:
+                st.info("No audits found")
 
 # Competitor Analysis tab (admin only)
 if st.session_state.get("is_admin"):
@@ -1483,4 +1408,4 @@ if st.session_state.get("is_admin"):
 if st.session_state.get("is_admin"):
     admin_idx = 7
     with tabs[admin_idx]:
-        show_admin_settings()
+        show_admin_setting()
