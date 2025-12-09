@@ -820,11 +820,10 @@ if st.session_state.get("is_admin"):
         "⚙️ Admin Settings"
     ])
 else:
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, = st.tabs([
         "🚀 Single Audit"
     ])
-    tab2 = tab3 = tab4 = tab5 = tab6 = None
-    tab7 = None
+    tab2 = tab3 = tab4 = tab5 = tab6 = tab7 = None
 
 with tab1:
     st.markdown("### Run a Deep Diagnostic")
