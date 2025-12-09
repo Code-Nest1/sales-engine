@@ -24,18 +24,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Ensure target branch exists
+      - name: Ensure target branch exists (create if missing)
         run: |
+          set -e
           git fetch origin
           if git ls-remote --exit-code --heads origin "${{ github.event.inputs.target_branch }}"; then
             echo "Branch exists remotely"
           else
-            git checkout -b ${{ github.event.inputs.target_branch }} || git checkout ${{ github.event.inputs.target_branch }}
-            git push -u origin ${{ github.event.inputs.target_branch }}
+            git checkout -b "${{ github.event.inputs.target_branch }}"
+            git push -u origin "${{ github.event.inputs.target_branch }}"
           fi
 
       - name: Switch to target branch
-        run: git checkout ${{ github.event.inputs.target_branch }}
+        run: git checkout "${{ github.event.inputs.target_branch }}"
 
       - name: Download patch
         run: |
@@ -46,6 +47,7 @@ jobs:
       - name: Apply patch
         run: |
           set -e
+          echo "Applying patch..."
           git apply --index /tmp/patch.diff || ( echo "git apply failed. Showing first 200 lines:" && sed -n '1,200p' /tmp/patch.diff && exit 1 )
           git add -A
           git commit -m "${{ github.event.inputs.commit_message }}" || echo "No changes to commit"
@@ -55,4 +57,4 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
           git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${{ github.repository }}.git"
-          git push origin ${{ github.event.inputs.target_branch }}
+          git push origin "${{ github.event.inputs.target_branch }}"
