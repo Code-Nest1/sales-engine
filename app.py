@@ -11,23 +11,73 @@ import whois
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-
-# Load environment variables from a local .env file if present
-load_dotenv()
 import json
 import hashlib
 from pathlib import Path
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import pyotp
+import qrcode
+from io import BytesIO
 
-# --- Simple file-based user store (users.json) ---
+# Load environment variables
+load_dotenv()
+from models import init_db, get_db, Audit, Lead, EmailOutreach, DATABASE_URL, User
+
+# ============================================================================
+# ENHANCED APP CONFIGURATION
+# ============================================================================
+
+st.set_page_config(
+    page_title="Code Nest Sales Engine Pro",
+    layout="wide",
+    page_icon="🦅",
+    initial_sidebar_state="expanded"
+)
+
+# Branding
+COMPANY_NAME = "Code Nest"
+COMPANY_TAGLINE = "Launch. Scale. Optimize."
+CONTACT_EMAIL = "services@codenest.agency"
+
+# Color scheme
+COLORS = {
+    "success": "#00D084",
+    "warning": "#FFA500",
+    "danger": "#FF6B6B",
+    "info": "#0066CC",
+    "primary": "#0066CC",
+    "neutral": "#666666"
+}
+
+# Initialize database
+DB_AVAILABLE = False
+if DATABASE_URL:
+    try:
+        DB_AVAILABLE = init_db()
+    except Exception as e:
+        DB_AVAILABLE = False
+
+# ============================================================================
+# AUTHENTICATION & USER MANAGEMENT
+# ============================================================================
+
 USERS_PATH = Path(__file__).parent / "users.json"
+TWO_FA_PATH = Path(__file__).parent / "two_fa.json"
 
 def init_users_file():
-    """Create an empty users.json file if it doesn't exist."""
+    """Create users.json if it doesn't exist."""
     if not USERS_PATH.exists():
         USERS_PATH.write_text(json.dumps({"users": {}}, indent=2))
 
+def init_2fa_file():
+    """Create two_fa.json if it doesn't exist."""
+    if not TWO_FA_PATH.exists():
+        TWO_FA_PATH.write_text(json.dumps({}, indent=2))
+
 def load_users():
-    """Return the users dict from users.json."""
+    """Return users dict from users.json."""
     init_users_file()
     try:
         data = json.loads(USERS_PATH.read_text())
@@ -36,174 +86,284 @@ def load_users():
         return {}
 
 def save_users(users: dict):
-    """Save the users dict into users.json."""
+    """Save users dict to users.json."""
     data = {"users": users}
     USERS_PATH.write_text(json.dumps(data, indent=2))
 
-def hash_password(password: str) -> str:
-    """Return a SHA-256 hex digest of the password (simple hashing).
+def load_2fa_secrets():
+    """Load 2FA secrets."""
+    init_2fa_file()
+    try:
+        return json.loads(TWO_FA_PATH.read_text())
+    except Exception:
+        return {}
 
-    Note: For production prefer bcrypt. This is a simple file-based example.
-    """
+def save_2fa_secrets(secrets: dict):
+    """Save 2FA secrets."""
+    TWO_FA_PATH.write_text(json.dumps(secrets, indent=2))
+
+def hash_password(password: str) -> str:
+    """Hash password with SHA-256."""
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
 def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify password."""
     return hash_password(password) == stored_hash
 
+def generate_2fa_secret():
+    """Generate 2FA secret."""
+    return pyotp.random_base32()
+
+def verify_2fa_token(secret: str, token: str) -> bool:
+    """Verify 2FA token."""
+    try:
+        totp = pyotp.TOTP(secret)
+        return totp.verify(token)
+    except Exception:
+        return False
+
 def show_auth_page():
-    """Render the login / signup UI. Sets st.session_state['authenticated']=True on success."""
-    st.title("🦅 Code Nest — Sign In")
-    st.write("Please login or create an account to continue.")
-
+    """Enhanced login/signup UI with 2FA support."""
+    st.markdown("""
+    <style>
+    .auth-container {
+        max-width: 500px;
+        margin: 0 auto;
+        padding: 2rem;
+        border-radius: 10px;
+        background: linear-gradient(135deg, #0066CC 0%, #004A99 100%);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.title("🦅 Code Nest Sales Engine")
+    st.caption("Sign in to access intelligent website auditing & lead generation")
+    
     tab = st.radio("", ["Login", "Sign Up"], horizontal=True)
-
     users = load_users()
-
+    
     if tab == "Login":
-        st.subheader("Login")
+        st.subheader("🔐 Login")
         username = st.text_input("Username", key="login_username")
         password = st.text_input("Password", type="password", key="login_password")
-        if st.button("Login"):
-            if not username:
-                st.error("Username must not be empty.")
-            elif not password:
-                st.error("Password must not be empty.")
+        
+        if st.button("Login", type="primary", use_container_width=True):
+            if not username or not password:
+                st.error("Please fill in all fields")
             elif username not in users:
-                st.error("User not found. Please sign up first.")
+                st.error("User not found")
+            elif not verify_password(password, users[username]["password_hash"]):
+                st.error("Invalid credentials")
             else:
-                if verify_password(password, users[username]["password_hash"]):
+                # Check if 2FA is enabled
+                secrets_2fa = load_2fa_secrets()
+                if username in secrets_2fa and secrets_2fa[username].get("enabled"):
+                    st.session_state["2fa_pending"] = True
+                    st.session_state["2fa_username"] = username
+                    st.rerun()
+                else:
                     st.session_state["authenticated"] = True
                     st.session_state["current_user"] = username
                     st.session_state["is_admin"] = users[username].get("role") == "admin"
+                    st.session_state["user_role"] = users[username].get("role", "user")
                     st.success(f"Welcome, {users[username].get('name') or username}!")
+                    time.sleep(1)
+                    st.rerun()
+        
+        # 2FA verification if pending
+        if st.session_state.get("2fa_pending"):
+            st.divider()
+            st.markdown("### 🔑 Two-Factor Authentication")
+            token = st.text_input("Enter 6-digit code from authenticator app", max_chars=6, key="2fa_token")
+            
+            if st.button("Verify 2FA", type="primary"):
+                secrets_2fa = load_2fa_secrets()
+                if token and verify_2fa_token(secrets_2fa[st.session_state["2fa_username"]]["secret"], token):
+                    st.session_state["authenticated"] = True
+                    st.session_state["current_user"] = st.session_state["2fa_username"]
+                    st.session_state["is_admin"] = users[st.session_state["2fa_username"]].get("role") == "admin"
+                    st.session_state["user_role"] = users[st.session_state["2fa_username"]].get("role", "user")
+                    st.session_state["2fa_pending"] = False
+                    st.success("2FA verified!")
+                    time.sleep(1)
                     st.rerun()
                 else:
-                    st.error("Invalid username or password.")
-
+                    st.error("Invalid 2FA token")
     else:
-        st.subheader("Create Account")
+        st.subheader("📝 Create Account")
         full_name = st.text_input("Full Name", key="signup_name")
         username = st.text_input("Username", key="signup_username")
         password = st.text_input("Password", type="password", key="signup_password")
         confirm = st.text_input("Confirm Password", type="password", key="signup_confirm")
-        request_admin = st.checkbox("Request admin access", key="signup_request_admin")
+        request_admin = st.checkbox("Request admin access")
         reason = ""
         if request_admin:
-            reason = st.text_area("Reason for requesting admin access (optional)", key="signup_reason")
-        if st.button("Create Account"):
-            if not username:
-                st.error("Username must not be empty.")
-            elif not password:
-                st.error("Password must not be empty.")
+            reason = st.text_area("Why do you need admin access?")
+        
+        if st.button("Create Account", type="primary", use_container_width=True):
+            if not username or not password or not full_name:
+                st.error("All fields required")
             elif password != confirm:
-                st.error("Passwords do not match.")
+                st.error("Passwords don't match")
             elif username in users:
-                st.error("Username already taken.")
+                st.error("Username already taken")
+            elif len(password) < 6:
+                st.error("Password must be at least 6 characters")
             else:
                 users[username] = {
                     "name": full_name,
                     "password_hash": hash_password(password),
                     "role": "user",
                     "admin_request": request_admin,
-                    "admin_request_reason": reason if request_admin else ""
+                    "admin_request_reason": reason if request_admin else "",
+                    "created_at": datetime.now().isoformat(),
+                    "last_login": None
                 }
                 save_users(users)
-                st.success("Account created. You may now log in.")
+                st.success("Account created! Please login.")
+                time.sleep(1)
+                st.rerun()
 
-# Ensure users.json exists
+# Initialize auth
 init_users_file()
+init_2fa_file()
 
-# Initialize auth state in session
 if 'authenticated' not in st.session_state:
     st.session_state['authenticated'] = False
     st.session_state['current_user'] = None
     st.session_state['is_admin'] = False
+    st.session_state['user_role'] = 'user'
+    st.session_state['2fa_pending'] = False
+    st.session_state['2fa_username'] = None
 
-# If the user is not authenticated, show auth page and stop further rendering
 if not st.session_state.get('authenticated'):
     show_auth_page()
     st.stop()
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
-from models import init_db, get_db, Audit, Lead, EmailOutreach, DATABASE_URL, User
+# ============================================================================
+# SIDEBAR & API CONFIGURATION
+# ============================================================================
 
-# Initialize database and check connectivity
-DB_AVAILABLE = False
-if DATABASE_URL:
-    try:
-        DB_AVAILABLE = init_db()
-    except Exception as e:
-        DB_AVAILABLE = False
-
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Code Nest Sales Engine", layout="wide", page_icon="🦅")
-
-# --- BRANDING ---
-COMPANY_NAME = "Code Nest"
-COMPANY_TAGLINE = "Launch. Scale. Optimize."
-CONTACT_EMAIL = "services@codenest.agency"
-
-# --- SIDEBAR CONFIG ---
 with st.sidebar:
     st.header("🦅 Engine Settings")
-    st.caption("Configure your intelligence sources.")
+    st.caption("Configure your intelligence sources")
     
-    # Check for OPENAI_API_KEY in environment first, then allow manual input
     env_openai_key = os.environ.get("OPENAI_API_KEY")
     if env_openai_key:
-        st.success("OpenAI API Key: Connected")
+        st.success("✓ OpenAI Connected")
         OPENAI_API_KEY = env_openai_key
     else:
-        openai_input = st.text_input("OpenAI API Key (Required for Pitch)", type="password")
+        openai_input = st.text_input("OpenAI API Key", type="password")
         OPENAI_API_KEY = openai_input.strip() if openai_input else None
     
-    google_input = st.text_input("Google PageSpeed Key (Optional)", type="password")
+    google_input = st.text_input("Google PageSpeed Key", type="password")
     GOOGLE_API_KEY = google_input.strip() if google_input else None
     
+    slack_input = st.text_input("Slack Webhook URL (optional)", type="password")
+    SLACK_WEBHOOK = slack_input.strip() if slack_input else None
+    
     st.divider()
+    
+    # Status badge
     if DB_AVAILABLE:
-        st.info("System Status: **Active**\n\nDatabase: Connected\n\nPlatform: Replit Cloud")
+        st.success("🟢 System: **Active**")
     else:
-        st.warning("System Status: **Limited**\n\nDatabase: Not Connected\n\nSome features require database.")
+        st.warning("🟡 System: **Limited**")
+    
+    # User info & logout
+    st.markdown(f"**User:** {st.session_state.get('current_user')}")
+    st.markdown(f"**Role:** {st.session_state.get('user_role').capitalize()}")
+    
+    if st.button("🚪 Logout", use_container_width=True):
+        st.session_state['authenticated'] = False
+        st.session_state['current_user'] = None
+        st.session_state['is_admin'] = False
+        st.session_state['user_role'] = 'user'
+        st.rerun()
+    
+    # Settings
+    if st.session_state.get('is_admin'):
+        st.divider()
+        if st.checkbox("Admin Settings"):
+            st.markdown("### Enable 2FA for Your Account")
+            if st.button("Setup 2FA"):
+                secret = generate_2fa_secret()
+                st.session_state["2fa_setup_secret"] = secret
+                
+                totp = pyotp.TOTP(secret)
+                qr = qrcode.QRCode(version=1, box_size=10)
+                qr.add_data(totp.provisioning_uri(st.session_state['current_user'], issuer_name='Code Nest'))
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                
+                st.image(img, width=200)
+                st.code(secret, language="text")
+                st.info("Scan QR code with authenticator app (Google Authenticator, Authy, etc)")
+                
+                token = st.text_input("Enter 6-digit code to confirm")
+                if token and verify_2fa_token(secret, token):
+                    secrets_2fa = load_2fa_secrets()
+                    secrets_2fa[st.session_state['current_user']] = {
+                        "secret": secret,
+                        "enabled": True
+                    }
+                    save_2fa_secrets(secrets_2fa)
+                    st.success("2FA enabled!")
+                    st.rerun()
 
-    # --- Authentication display (logout) ---
-    if st.session_state.get('authenticated'):
-        st.markdown(f"**Signed in as:** {st.session_state.get('current_user')}")
-        if st.button("Logout"):
-            st.session_state['authenticated'] = False
-            st.session_state['current_user'] = None
-            st.rerun()
-
-# --- HELPER FUNCTIONS ---
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
 def clean_text(text):
-    """Sanitizes text for PDF generation."""
+    """Sanitize text for PDF."""
     if not text: return ""
     text = text.replace('\u201c', '"').replace('\u201d', '"').replace('\u2019', "'").replace('\u2013', '-')
     return text.encode('latin-1', 'replace').decode('latin-1')
 
+def format_score_badge(score):
+    """Return color-coded score badge."""
+    if score >= 80:
+        return f"🟢 {score}/100"
+    elif score >= 50:
+        return f"🟡 {score}/100"
+    else:
+        return f"🔴 {score}/100"
+
+def send_slack_notification(message, webhook_url=None):
+    """Send Slack notification."""
+    if not webhook_url:
+        webhook_url = SLACK_WEBHOOK
+    if not webhook_url:
+        return False
+    
+    try:
+        payload = {"text": message}
+        requests.post(webhook_url, json=payload)
+        return True
+    except Exception:
+        return False
+
 def get_domain_age(url):
-    """Determines business maturity via domain age."""
+    """Get domain age."""
     domain = urlparse(url).netloc.replace("www.", "")
     try:
         w = whois.whois(domain)
         creation_date = w.creation_date
         if isinstance(creation_date, list):
             creation_date = creation_date[0]
-        
         if creation_date:
             days_alive = (datetime.now() - creation_date).days
             years = round(days_alive / 365, 1)
             return f"{years} years", days_alive
-    except Exception as e:
-        return "Unknown (Privacy Protected)", 0
+    except Exception:
+        return "Unknown", 0
     return "Unknown", 0
 
 def get_google_speed(url, api_key):
-    """Fetches Core Web Vitals from Google PSI."""
-    if not api_key: return None, "No API Key"
+    """Get Google PageSpeed score."""
+    if not api_key: 
+        return None, "No API Key"
     
     api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile&key={api_key}"
     try:
@@ -216,42 +376,34 @@ def get_google_speed(url, api_key):
             except KeyError:
                 return None, "Data Error"
         else:
-            return None, f"Google Error: {r.status_code}"
+            return None, f"Error: {r.status_code}"
     except Exception as e:
         return None, str(e)
 
-# --- AI BRAIN ---
-# the newest OpenAI model is "gpt-5" which was released August 7, 2025.
-# do not change this unless explicitly requested by the user
-
 def get_ai_consultation(url, data, api_key):
-    """Uses GPT-5 to act as a Senior Consultant."""
+    """Get AI analysis with GPT-5."""
     if not api_key:
         return {
-            "summary": "AI Analysis Disabled (No Key).",
-            "impact": "Unknown.",
-            "solutions": "Standard Web Dev Services.",
-            "email": "Please add OpenAI Key to generate email."
+            "summary": "AI Analysis Disabled",
+            "impact": "N/A",
+            "solutions": "Upgrade to enable AI",
+            "email": "N/A"
         }
 
     issues_list = [f"- {i['title']}: {i['impact']}" for i in data['issues']]
     tech_list = ", ".join(data['tech_stack'])
     
-    prompt = f"""
-    You are a Senior Digital Strategist at Code Nest (Agency). Analyze this website: {url}.
+    prompt = f"""You are a Senior Digital Strategist at Code Nest. Analyze this website: {url}
     
-    DATA DETECTED:
-    Tech Stack: {tech_list}
-    Issues Found:
-    {chr(10).join(issues_list)}
-    
-    TASK 1: Write an Executive Summary (2 sentences max).
-    TASK 2: Summarize Business Impact (Financial/Brand loss).
-    TASK 3: List 3 specific Code Nest services to fix these.
-    TASK 4: Write a Cold Email to the owner. Tone: Professional, Expert.
-    
-    Output format: Return the 4 sections separated by '###'.
-    """
+Tech Stack: {tech_list}
+Issues: {chr(10).join(issues_list)}
+
+Provide 4 sections separated by ###:
+1. Executive Summary (2 sentences)
+2. Business Impact (financial/brand loss)
+3. 3 Code Nest services to fix
+4. Professional cold email
+"""
 
     try:
         client = OpenAI(api_key=api_key)
@@ -259,22 +411,50 @@ def get_ai_consultation(url, data, api_key):
             model="gpt-5",
             messages=[{"role": "user", "content": prompt}]
         )
-        content = response.choices[0].message.content
-        parts = content.split("###")
+        parts = response.choices[0].message.content.split("###")
         
         return {
-            "summary": parts[1] if len(parts) > 1 else "Analysis generated.",
-            "impact": parts[2] if len(parts) > 2 else "Potential revenue loss detected.",
-            "solutions": parts[3] if len(parts) > 3 else "Optimization.",
-            "email": parts[4] if len(parts) > 4 else "Contact us."
+            "summary": parts[1].strip() if len(parts) > 1 else "Analysis complete",
+            "impact": parts[2].strip() if len(parts) > 2 else "Impact assessed",
+            "solutions": parts[3].strip() if len(parts) > 3 else "Solutions provided",
+            "email": parts[4].strip() if len(parts) > 4 else "Email template"
         }
     except Exception as e:
         return {"summary": "Error", "impact": "Error", "solutions": "Error", "email": str(e)}
 
-# --- MAIN AUDIT LOGIC ---
+def calculate_opportunity_score(data):
+    """Enhanced lead opportunity scoring (0-100)."""
+    score = 0
+    
+    # Health score factors (40 points)
+    if data['score'] < 30: score += 40
+    elif data['score'] < 50: score += 30
+    elif data['score'] < 70: score += 20
+    else: score += 10
+    
+    # Tech stack issues (30 points)
+    has_analytics = any("Analytics" in t for t in data.get('tech_stack', []))
+    has_tracking = any("Pixel" in t for t in data.get('tech_stack', []))
+    
+    if not has_analytics or not has_tracking:
+        score += 25
+    
+    # Critical issues (20 points)
+    critical_count = len([i for i in data.get('issues', []) if i.get('title')])
+    if critical_count >= 5: score += 20
+    elif critical_count >= 3: score += 15
+    elif critical_count > 0: score += 10
+    
+    # SSL/Security (10 points)
+    if any("SSL" in i.get('title', '') for i in data.get('issues', [])):
+        score += 10
+    
+    return min(100, score)
 
 def run_audit(url, openai_key, google_key):
-    if not url.startswith('http'): url = 'http://' + url
+    """Enhanced audit with new checks."""
+    if not url.startswith('http'): 
+        url = 'http://' + url
     
     data = {
         "url": url,
@@ -284,11 +464,14 @@ def run_audit(url, openai_key, google_key):
         "emails": [],
         "psi": None,
         "psi_error": None,
-        "domain_age": "Unknown"
+        "domain_age": "Unknown",
+        "accessibility_score": None,
+        "security_issues": [],
+        "broken_links": 0,
+        "cwv_metrics": {}
     }
 
     try:
-        # 1. CONNECTIVITY
         start = time.time()
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=30)
@@ -297,25 +480,32 @@ def run_audit(url, openai_key, google_key):
         html = response.text.lower()
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 2. BASIC INFO
+        # Basic info
         data['domain_age'] = get_domain_age(url)[0]
         data['emails'] = list(set(re.findall(r"[a-z0-9\.\-+_]+@[a-z0-9\.\-+_]+\.[a-z]+", html)))
 
-        # 3. TECH DETECTION
-        if "wp-content" in html: 
-            data['tech_stack'].append("WordPress")
-            data['score'] -= 10
-            data['issues'].append({"title": "WordPress Detected", "impact": "Requires monthly security maintenance.", "solution": "Code Nest Maintenance Plan"})
-        elif "shopify" in html: 
-            data['tech_stack'].append("Shopify")
-        elif "wix" in html:
-            data['tech_stack'].append("Wix")
-        elif "squarespace" in html:
-            data['tech_stack'].append("Squarespace")
-        elif "webflow" in html:
-            data['tech_stack'].append("Webflow")
+        # Tech detection
+        tech_checks = [
+            ("wp-content", "WordPress", -10),
+            ("shopify", "Shopify", 0),
+            ("wix", "Wix", 0),
+            ("squarespace", "Squarespace", 0),
+            ("webflow", "Webflow", 0)
+        ]
         
-        # 4. MARKETING
+        for check, tech, penalty in tech_checks:
+            if check in html:
+                data['tech_stack'].append(tech)
+                if penalty:
+                    data['score'] += penalty
+                    data['issues'].append({
+                        "title": f"{tech} Detected",
+                        "impact": "Requires regular maintenance",
+                        "solution": "Code Nest Maintenance"
+                    })
+                break
+
+        # Marketing tracking
         pixels = []
         if "fbq(" in html: pixels.append("Facebook Pixel")
         if "gtag(" in html or "ua-" in html or "g-" in html: pixels.append("Google Analytics")
@@ -324,60 +514,278 @@ def run_audit(url, openai_key, google_key):
         
         if not pixels:
             data['score'] -= 20
-            data['issues'].append({"title": "Zero Tracking Installed", "impact": "You are flying blind. No data on customer behavior.", "solution": "Analytics Setup"})
+            data['issues'].append({
+                "title": "Zero Tracking Installed",
+                "impact": "No customer behavior data",
+                "solution": "Analytics Setup"
+            })
         else:
             data['tech_stack'].extend(pixels)
 
-        # 5. SEO BASICS
+        # SEO basics
         title = soup.title.string if soup.title else ""
         if len(title) < 10:
             data['score'] -= 10
-            data['issues'].append({"title": "Weak Title Tag", "impact": "Google ignores pages with poor titles.", "solution": "On-Page SEO"})
+            data['issues'].append({
+                "title": "Weak Title Tag",
+                "impact": "Poor search visibility",
+                "solution": "On-Page SEO"
+            })
         
-        # Check meta description
         meta_desc = soup.find('meta', attrs={'name': 'description'})
         if not meta_desc or not meta_desc.get('content'):
             data['score'] -= 10
-            data['issues'].append({"title": "Missing Meta Description", "impact": "Search engines won't show a compelling snippet.", "solution": "SEO Optimization"})
+            data['issues'].append({
+                "title": "Missing Meta Description",
+                "impact": "Poor search snippet",
+                "solution": "SEO Optimization"
+            })
         
-        # Check for SSL
+        # NEW: Accessibility check
+        h1_tags = soup.find_all('h1')
+        alt_images = len([img for img in soup.find_all('img') if img.get('alt')])
+        total_images = len(soup.find_all('img'))
+        
+        if not h1_tags:
+            data['score'] -= 5
+            data['issues'].append({
+                "title": "No H1 Tag",
+                "impact": "Accessibility issue",
+                "solution": "Semantic HTML"
+            })
+        
+        if total_images > 0 and alt_images < total_images * 0.5:
+            data['score'] -= 5
+            data['issues'].append({
+                "title": "Missing Image Alt Text",
+                "impact": "Accessibility & SEO",
+                "solution": "Alt Text Optimization"
+            })
+        
+        accessibility_score = 100
+        if not h1_tags: accessibility_score -= 20
+        if alt_images < total_images * 0.5: accessibility_score -= 20
+        data['accessibility_score'] = accessibility_score
+
+        # NEW: Security check
         if not url.startswith('https'):
             data['score'] -= 15
-            data['issues'].append({"title": "No SSL Certificate", "impact": "Browser shows 'Not Secure' warning. Customers lose trust.", "solution": "SSL Installation"})
+            data['security_issues'].append("No SSL Certificate")
+            data['issues'].append({
+                "title": "No SSL Certificate",
+                "impact": "Customers lose trust",
+                "solution": "SSL Installation"
+            })
 
-        # 6. PERFORMANCE (PSI)
+        # NEW: Broken links check (sample)
+        links = soup.find_all('a', href=True)
+        broken_count = 0
+        for link in links[:10]:  # Check first 10 links
+            try:
+                href = link['href']
+                if href.startswith('http'):
+                    r = requests.head(href, timeout=5)
+                    if r.status_code >= 400:
+                        broken_count += 1
+            except Exception:
+                pass
+        
+        data['broken_links'] = broken_count
+        if broken_count > 0:
+            data['score'] -= min(10, broken_count * 2)
+            data['issues'].append({
+                "title": f"{broken_count} Broken Links",
+                "impact": "Poor user experience",
+                "solution": "Link Audit & Fix"
+            })
+
+        # Performance
         psi_score, psi_msg = get_google_speed(url, google_key)
         if psi_score:
             data['psi'] = psi_score
             if psi_score < 50:
                 data['score'] -= 20
-                data['issues'].append({"title": f"Critical Speed Score ({psi_score}/100)", "impact": "Users abandon slow sites.", "solution": "Core Web Vitals Optimization"})
+                data['issues'].append({
+                    "title": f"Critical Speed ({psi_score}/100)",
+                    "impact": "Users abandon slow sites",
+                    "solution": "Speed Optimization"
+                })
         else:
             data['psi_error'] = psi_msg
             if load_time > 3.0:
                 data['score'] -= 10
-                data['issues'].append({"title": "Slow Server Response", "impact": f"Load time {round(load_time,2)}s is too slow.", "solution": "Speed Optimization"})
+                data['issues'].append({
+                    "title": "Slow Server",
+                    "impact": f"Load time {round(load_time,2)}s",
+                    "solution": "Speed Optimization"
+                })
 
-        # 7. Mobile responsiveness check
+        # Mobile check
         viewport = soup.find('meta', attrs={'name': 'viewport'})
         if not viewport:
             data['score'] -= 10
-            data['issues'].append({"title": "Not Mobile Optimized", "impact": "60% of traffic is mobile. You're losing customers.", "solution": "Responsive Design"})
+            data['issues'].append({
+                "title": "Not Mobile Optimized",
+                "impact": "Missing 60% of traffic",
+                "solution": "Responsive Design"
+            })
 
-        # 8. AI CONSULTATION
+        # AI consultation
         data['ai'] = get_ai_consultation(url, data, openai_key)
 
     except Exception as e:
         data['error'] = str(e)
 
-    # Ensure score doesn't go below 0
     data['score'] = max(0, data['score'])
-
     return data
 
-# --- PDF GENERATOR ---
+def save_audit_to_db(data, comparison_group=None):
+    """Save audit to database."""
+    db = get_db()
+    if not db:
+        return None
+    
+    try:
+        domain = urlparse(data['url']).netloc.replace("www.", "")
+        audit = Audit(
+            url=data['url'],
+            domain=domain,
+            health_score=data['score'],
+            psi_score=data.get('psi'),
+            domain_age=data.get('domain_age'),
+            tech_stack=data.get('tech_stack', []),
+            issues=data.get('issues', []),
+            emails_found=data.get('emails', []),
+            ai_summary=data.get('ai', {}).get('summary'),
+            ai_impact=data.get('ai', {}).get('impact'),
+            ai_solutions=data.get('ai', {}).get('solutions'),
+            ai_email=data.get('ai', {}).get('email'),
+            comparison_group=comparison_group
+        )
+        db.add(audit)
+        db.commit()
+        db.refresh(audit)
+        
+        # Create/update lead
+        existing_lead = db.query(Lead).filter(Lead.domain == domain).first()
+        opp_score = calculate_opportunity_score(data)
+        
+        if not existing_lead:
+            lead = Lead(
+                domain=domain,
+                email=data['emails'][0] if data.get('emails') else None,
+                health_score=data['score'],
+                opportunity_rating=opp_score,
+                created_at=datetime.utcnow()
+            )
+            db.add(lead)
+            db.commit()
+        else:
+            existing_lead.health_score = data['score']
+            existing_lead.opportunity_rating = opp_score
+            existing_lead.updated_at = datetime.utcnow()
+            db.commit()
+        
+        return audit.id
+    except Exception as e:
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+def get_audit_history(limit=50, search_query=None, min_score=None, max_score=None):
+    """Get audit history with filters."""
+    db = get_db()
+    if not db:
+        return []
+    
+    try:
+        query = db.query(Audit).order_by(Audit.created_at.desc())
+        
+        if search_query:
+            query = query.filter(Audit.domain.ilike(f"%{search_query}%"))
+        if min_score is not None:
+            query = query.filter(Audit.health_score >= min_score)
+        if max_score is not None:
+            query = query.filter(Audit.health_score <= max_score)
+        
+        return query.limit(limit).all()
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+def get_leads(status_filter=None, min_opp=None, max_opp=None):
+    """Get leads with filters."""
+    db = get_db()
+    if not db:
+        return []
+    
+    try:
+        query = db.query(Lead).order_by(Lead.opportunity_rating.desc())
+        if status_filter and status_filter != "all":
+            query = query.filter(Lead.status == status_filter)
+        if min_opp is not None:
+            query = query.filter(Lead.opportunity_rating >= min_opp)
+        if max_opp is not None:
+            query = query.filter(Lead.opportunity_rating <= max_opp)
+        return query.all()
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+def update_lead_status(lead_id, new_status):
+    """Update lead status."""
+    db = get_db()
+    if not db:
+        return False
+    
+    try:
+        lead = db.query(Lead).filter(Lead.id == lead_id).first()
+        if lead:
+            lead.status = new_status
+            lead.updated_at = datetime.utcnow()
+            db.commit()
+            return True
+        return False
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+def save_email_template(name: str, subject: str, body: str):
+    """Save email template."""
+    templates_file = Path(__file__).parent / "email_templates.json"
+    try:
+        if templates_file.exists():
+            templates = json.loads(templates_file.read_text())
+        else:
+            templates = {}
+        
+        templates[name] = {
+            "subject": subject,
+            "body": body,
+            "created_at": datetime.now().isoformat()
+        }
+        templates_file.write_text(json.dumps(templates, indent=2))
+        return True
+    except Exception:
+        return False
+
+def load_email_templates():
+    """Load email templates."""
+    templates_file = Path(__file__).parent / "email_templates.json"
+    try:
+        if templates_file.exists():
+            return json.loads(templates_file.read_text())
+        return {}
+    except Exception:
+        return {}
 
 class PDFReport(FPDF):
+    """Enhanced PDF report generator."""
     def header(self):
         self.set_font('Arial', 'B', 24)
         self.set_text_color(0, 102, 204)
@@ -405,13 +813,15 @@ class PDFReport(FPDF):
         self.ln()
 
 def generate_pdf(data):
+    """Generate enhanced PDF report."""
     pdf = PDFReport()
     pdf.add_page()
 
-    # COVER
+    # Title
     pdf.set_font('Arial', 'B', 16)
     pdf.cell(0, 10, f"Website Audit: {clean_text(data['url'])}", 0, 1)
     
+    # Score with color
     if data['score'] > 70:
         pdf.set_text_color(0, 128, 0)
     elif data['score'] > 40:
@@ -420,28 +830,29 @@ def generate_pdf(data):
         pdf.set_text_color(200, 0, 0)
     pdf.cell(0, 10, f"Health Score: {data['score']}/100", 0, 1)
     
+    # Meta info
     pdf.set_text_color(0, 0, 0)
     pdf.set_font('Arial', '', 10)
     pdf.cell(0, 6, f"Domain Age: {data.get('domain_age', 'Unknown')}", 0, 1)
-    pdf.cell(0, 6, f"Report Generated: {datetime.now().strftime('%B %d, %Y')}", 0, 1)
-    if data['emails']:
-        pdf.cell(0, 6, f"Contacts: {', '.join(data['emails'][:3])}", 0, 1)
+    pdf.cell(0, 6, f"Report Date: {datetime.now().strftime('%B %d, %Y')}", 0, 1)
+    if data.get('psi'):
+        pdf.cell(0, 6, f"Google Speed Score: {data['psi']}/100", 0, 1)
+    if data.get('accessibility_score'):
+        pdf.cell(0, 6, f"Accessibility Score: {data['accessibility_score']}/100", 0, 1)
     pdf.ln(5)
 
-    # EXECUTIVE SUMMARY
+    # Executive summary
     if data.get('ai'):
-        pdf.section_title("1. Executive Strategy Summary")
-        pdf.set_font('Arial', 'I', 10)
-        pdf.multi_cell(0, 6, clean_text(data['ai'].get('summary', '').strip()))
-        pdf.ln(2)
+        pdf.section_title("Executive Summary")
+        pdf.chapter_body(data['ai'].get('summary', ''))
 
-    # TECH STACK
-    pdf.section_title("2. Technology & Infrastructure")
-    tech = ", ".join(data['tech_stack']) if data['tech_stack'] else "Standard HTML"
-    pdf.chapter_body(f"Detected Stack: {tech}")
+    # Tech stack
+    pdf.section_title("Technology Stack")
+    tech = ", ".join(data['tech_stack']) if data['tech_stack'] else "Standard"
+    pdf.chapter_body(f"Detected: {tech}")
 
-    # ISSUES
-    pdf.section_title("3. Critical Findings")
+    # Issues
+    pdf.section_title("Critical Findings")
     if data['issues']:
         for issue in data['issues']:
             pdf.set_font('Arial', 'B', 10)
@@ -450,932 +861,551 @@ def generate_pdf(data):
             pdf.set_font('Arial', '', 10)
             pdf.set_text_color(50, 50, 50)
             pdf.multi_cell(0, 5, f"Impact: {clean_text(issue['impact'])}")
-            pdf.set_text_color(0, 102, 51)
-            pdf.multi_cell(0, 5, f"Solution: {clean_text(issue['solution'])}")
-            pdf.ln(3)
+            pdf.ln(2)
     else:
-        pdf.chapter_body("No critical issues detected. Website is performing well.")
+        pdf.chapter_body("No critical issues detected.")
 
-    # AI EMAIL
+    # AI email
     if data.get('ai'):
-        pdf.section_title("4. Recommended Outreach Email")
-        pdf.set_font('Courier', '', 10)
-        pdf.set_text_color(0,0,0)
-        pdf.multi_cell(0, 5, clean_text(data['ai'].get('email', '').strip()))
+        pdf.section_title("Recommended Outreach")
+        pdf.set_font('Courier', '', 9)
+        pdf.multi_cell(0, 4, clean_text(data['ai'].get('email', '')))
 
-    # FOOTER
+    # Footer
     pdf.ln(10)
-    pdf.set_font('Arial', 'I', 9)
+    pdf.set_font('Arial', 'I', 8)
     pdf.set_text_color(100, 100, 100)
     pdf.cell(0, 6, f"Report by {COMPANY_NAME} | {CONTACT_EMAIL}", 0, 1, 'C')
 
     return pdf.output(dest='S').encode('latin-1')
 
-# --- DATABASE FUNCTIONS ---
-
-def save_audit_to_db(data, comparison_group=None):
-    """Saves audit results to database."""
-    db = get_db()
-    if not db:
-        return None
-    
-    try:
-        domain = urlparse(data['url']).netloc.replace("www.", "")
-        audit = Audit(
-            url=data['url'],
-            domain=domain,
-            health_score=data['score'],
-            psi_score=data.get('psi'),
-            domain_age=data.get('domain_age'),
-            tech_stack=data.get('tech_stack', []),
-            issues=data.get('issues', []),
-            emails_found=data.get('emails', []),
-            ai_summary=data.get('ai', {}).get('summary'),
-            ai_impact=data.get('ai', {}).get('impact'),
-            ai_solutions=data.get('ai', {}).get('solutions'),
-            ai_email=data.get('ai', {}).get('email'),
-            comparison_group=comparison_group
-        )
-        db.add(audit)
-        db.commit()
-        db.refresh(audit)
-        
-        # Also create/update lead
-        existing_lead = db.query(Lead).filter(Lead.domain == domain).first()
-        if not existing_lead:
-            lead = Lead(
-                domain=domain,
-                email=data['emails'][0] if data.get('emails') else None,
-                health_score=data['score'],
-                opportunity_rating=calculate_opportunity_score(data)
-            )
-            db.add(lead)
-            db.commit()
-        else:
-            existing_lead.health_score = data['score']
-            existing_lead.opportunity_rating = calculate_opportunity_score(data)
-            existing_lead.updated_at = datetime.utcnow()
-            db.commit()
-        
-        return audit.id
-    except Exception as e:
-        db.rollback()
-        return None
-    finally:
-        db.close()
-
-def calculate_opportunity_score(data):
-    """Calculate opportunity score for a lead."""
-    opp_score = 0
-    if data['score'] < 50: opp_score += 5
-    if data['score'] < 30: opp_score += 3
-    if not any("Pixel" in t for t in data.get('tech_stack', [])): opp_score += 3
-    if not any("Analytics" in t for t in data.get('tech_stack', [])): opp_score += 2
-    if len(data.get('issues', [])) > 3: opp_score += 2
-    return opp_score
-
-def get_audit_history(limit=50, search_query=None, min_score=None, max_score=None):
-    """Retrieve audit history from database."""
-    db = get_db()
-    if not db:
-        return []
-    
-    try:
-        query = db.query(Audit).order_by(Audit.created_at.desc())
-        
-        if search_query:
-            query = query.filter(Audit.domain.ilike(f"%{search_query}%"))
-        if min_score is not None:
-            query = query.filter(Audit.health_score >= min_score)
-        if max_score is not None:
-            query = query.filter(Audit.health_score <= max_score)
-        
-        return query.limit(limit).all()
-    except Exception as e:
-        return []
-    finally:
-        db.close()
-
-def get_leads(status_filter=None):
-    """Retrieve leads from database."""
-    db = get_db()
-    if not db:
-        return []
-    
-    try:
-        query = db.query(Lead).order_by(Lead.opportunity_rating.desc())
-        if status_filter and status_filter != "all":
-            query = query.filter(Lead.status == status_filter)
-        return query.all()
-    except Exception as e:
-        return []
-    finally:
-        db.close()
-
-def update_lead_status(lead_id, new_status):
-    """Update lead status."""
-    db = get_db()
-    if not db:
-        return False
-    
-    try:
-        lead = db.query(Lead).filter(Lead.id == lead_id).first()
-        if lead:
-            lead.status = new_status
-            lead.updated_at = datetime.utcnow()
-            db.commit()
-            return True
-        return False
-    except Exception as e:
-        db.rollback()
-        return False
-    finally:
-        db.close()
-
-def save_email_outreach(recipient_email, subject, body, lead_id=None):
-    """Save email outreach record."""
-    db = get_db()
-    if not db:
-        return None
-    
-    try:
-        outreach = EmailOutreach(
-            lead_id=lead_id,
-            recipient_email=recipient_email,
-            subject=subject,
-            body=body,
-            status="draft"
-        )
-        db.add(outreach)
-        db.commit()
-        db.refresh(outreach)
-        return outreach.id
-    except Exception as e:
-        db.rollback()
-        return None
-    finally:
-        db.close()
-
-def mark_email_sent(email_id):
-    """Mark email as sent."""
-    db = get_db()
-    if not db:
-        return False
-    
-    try:
-        outreach = db.query(EmailOutreach).filter(EmailOutreach.id == email_id).first()
-        if outreach:
-            outreach.status = "sent"
-            outreach.sent_at = datetime.utcnow()
-            db.commit()
-            return True
-        return False
-    except Exception as e:
-        db.rollback()
-        return False
-    finally:
-        db.close()
-
-def get_scheduled_audits():
-    """Get audits that are scheduled for re-run."""
-    db = get_db()
-    if not db:
-        return []
-    
-    try:
-        return db.query(Audit).filter(Audit.is_scheduled == True).order_by(Audit.next_scheduled_run).all()
-    except Exception as e:
-        return []
-    finally:
-        db.close()
-
-def schedule_audit(audit_id, interval_days):
-    """Schedule an audit for re-running."""
-    db = get_db()
-    if not db:
-        return False
-    
-    try:
-        audit = db.query(Audit).filter(Audit.id == audit_id).first()
-        if audit:
-            audit.is_scheduled = True
-            audit.schedule_interval_days = interval_days
-            audit.next_scheduled_run = datetime.utcnow() + timedelta(days=interval_days)
-            db.commit()
-            return True
-        return False
-    except Exception as e:
-        db.rollback()
-        return False
-    finally:
-        db.close()
-
-def run_scheduled_audit(audit_id, openai_key, google_key):
-    """Run a scheduled audit and update timestamps."""
-    db = get_db()
-    if not db:
-        return None, None
-    
-    try:
-        audit = db.query(Audit).filter(Audit.id == audit_id).first()
-        if not audit:
-            db.close()
-            return None, None
-        
-        url = audit.url
-        old_score = audit.health_score
-        interval = audit.schedule_interval_days or 30
-        db.close()
-        
-        new_data = run_audit(url, openai_key, google_key)
-        new_audit_id = save_audit_to_db(new_data)
-        
-        if not new_audit_id:
-            return new_data, old_score
-        
-        db = get_db()
-        if db:
-            try:
-                new_audit = db.query(Audit).filter(Audit.id == new_audit_id).first()
-                if new_audit:
-                    new_audit.is_scheduled = True
-                    new_audit.schedule_interval_days = interval
-                    new_audit.last_scheduled_run = datetime.utcnow()
-                    new_audit.next_scheduled_run = datetime.utcnow() + timedelta(days=interval)
-                    db.commit()
-                    
-                    old_audit = db.query(Audit).filter(Audit.id == audit_id).first()
-                    if old_audit:
-                        old_audit.is_scheduled = False
-                        db.commit()
-            finally:
-                db.close()
-        
-        return new_data, old_score
-    except Exception as e:
-        return None, None
-
-# --- UI LAYER ---
-
-# Admin Settings Functions
 def show_admin_settings():
-    """Admin-only page to manage users and approve admin requests."""
+    """Admin settings page with enhanced features."""
     st.subheader("👥 Admin Settings")
     
-    users = load_users()
-    pending_requests = [u for u in users if users[u].get("admin_request")]
+    admin_tab1, admin_tab2, admin_tab3 = st.tabs(["User Management", "Analytics", "Configuration"])
     
-    # Show pending admin requests notice
-    if pending_requests:
-        st.warning(f"⚠️ There are {len(pending_requests)} pending admin access request(s).")
-    
-    st.markdown("---")
-    st.markdown("### User Management")
-    
-    if not users:
-        st.info("No users found.")
-        return
-    
-    # Display all users in a table-like format
-    cols = st.columns([2, 2, 1.5, 1.5, 1, 1, 1])
-    with cols[0]:
-        st.markdown("**Username**")
-    with cols[1]:
-        st.markdown("**Full Name**")
-    with cols[2]:
-        st.markdown("**Role**")
-    with cols[3]:
-        st.markdown("**Admin Request**")
-    with cols[4]:
-        st.markdown("**Make Admin**")
-    with cols[5]:
-        st.markdown("**Make User**")
-    with cols[6]:
-        st.markdown("**Clear Request**")
-    
-    st.divider()
-    
-    for username, user_data in users.items():
-        # Skip current user from self-management
-        if username == st.session_state.get("current_user"):
-            continue
+    with admin_tab1:
+        users = load_users()
+        pending = [u for u in users if users[u].get("admin_request")]
         
-        role = user_data.get("role", "user")
-        admin_req = user_data.get("admin_request", False)
-        name = user_data.get("name", "N/A")
+        if pending:
+            st.warning(f"⚠️ {len(pending)} pending admin request(s)")
+        
+        st.markdown("### User Management")
         
         cols = st.columns([2, 2, 1.5, 1.5, 1, 1, 1])
+        with cols[0]: st.markdown("**Username**")
+        with cols[1]: st.markdown("**Full Name**")
+        with cols[2]: st.markdown("**Role**")
+        with cols[3]: st.markdown("**Status**")
+        with cols[4]: st.markdown("**Make Admin**")
+        with cols[5]: st.markdown("**Make User**")
+        with cols[6]: st.markdown("**Clear**")
+        st.divider()
         
-        with cols[0]:
-            st.text(username)
-        with cols[1]:
-            st.text(name)
-        with cols[2]:
-            status_text = "🔴 Admin" if role == "admin" else "🟢 User"
-            st.text(status_text)
-        with cols[3]:
-            req_text = "✅ Yes" if admin_req else "❌ No"
-            st.text(req_text)
-        with cols[4]:
-            if st.button("Make Admin", key=f"admin_{username}"):
-                users[username]["role"] = "admin"
-                users[username]["admin_request"] = False
-                save_users(users)
-                st.success(f"✓ {username} is now an admin.")
-                st.rerun()
-        with cols[5]:
-            if st.button("Make User", key=f"user_{username}"):
-                users[username]["role"] = "user"
-                save_users(users)
-                st.success(f"✓ {username} is now a regular user.")
-                st.rerun()
-        with cols[6]:
-            if admin_req:
-                if st.button("Clear", key=f"clear_{username}"):
+        for username, user_data in users.items():
+            if username == st.session_state.get("current_user"):
+                continue
+            
+            role = user_data.get("role", "user")
+            admin_req = user_data.get("admin_request", False)
+            name = user_data.get("name", "N/A")
+            
+            cols = st.columns([2, 2, 1.5, 1.5, 1, 1, 1])
+            
+            with cols[0]: st.text(username)
+            with cols[1]: st.text(name)
+            with cols[2]: st.text("🔴 Admin" if role == "admin" else "🟢 User")
+            with cols[3]: st.text("✅ Requested" if admin_req else "❌ None")
+            with cols[4]:
+                if st.button("Admin", key=f"admin_{username}", use_container_width=True):
+                    users[username]["role"] = "admin"
                     users[username]["admin_request"] = False
-                    users[username]["admin_request_reason"] = ""
                     save_users(users)
-                    st.success(f"✓ Admin request cleared for {username}.")
+                    st.success(f"{username} is now admin")
                     st.rerun()
+            with cols[5]:
+                if st.button("User", key=f"user_{username}", use_container_width=True):
+                    users[username]["role"] = "user"
+                    save_users(users)
+                    st.success(f"{username} is now user")
+                    st.rerun()
+            with cols[6]:
+                if admin_req and st.button("Clear", key=f"clear_{username}", use_container_width=True):
+                    users[username]["admin_request"] = False
+                    save_users(users)
+                    st.rerun()
+    
+    with admin_tab2:
+        st.markdown("### Analytics Dashboard")
+        
+        if DB_AVAILABLE:
+            all_audits = get_audit_history(limit=1000)
+            all_leads = get_leads()
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Audits", len(all_audits))
+            with col2:
+                st.metric("Total Leads", len(all_leads))
+            with col3:
+                avg_score = sum([a.health_score for a in all_audits]) / len(all_audits) if all_audits else 0
+                st.metric("Avg Health Score", f"{avg_score:.0f}")
+            with col4:
+                converted = len([l for l in all_leads if l.status == "converted"])
+                st.metric("Converted", converted)
+            
+            st.divider()
+            
+            # Score distribution
+            if all_audits:
+                scores = [a.health_score for a in all_audits]
+                chart_data = pd.DataFrame({
+                    "Score Range": ["0-30", "30-60", "60-80", "80-100"],
+                    "Count": [
+                        len([s for s in scores if s < 30]),
+                        len([s for s in scores if 30 <= s < 60]),
+                        len([s for s in scores if 60 <= s < 80]),
+                        len([s for s in scores if s >= 80])
+                    ]
+                })
+                st.bar_chart(chart_data.set_index("Score Range"))
+            
+            # Lead funnel
+            if all_leads:
+                lead_statuses = {}
+                for lead in all_leads:
+                    lead_statuses[lead.status] = lead_statuses.get(lead.status, 0) + 1
+                
+                st.markdown("### Lead Funnel")
+                for status, count in lead_statuses.items():
+                    st.write(f"{status.capitalize()}: {count}")
+    
+    with admin_tab3:
+        st.markdown("### System Configuration")
+        st.info("Slack Webhook: " + ("✓ Configured" if SLACK_WEBHOOK else "Not configured"))
+        st.info("OpenAI API: " + ("✓ Configured" if OPENAI_API_KEY else "Not configured"))
+        st.info("Database: " + ("✓ Connected" if DB_AVAILABLE else "Not connected"))
 
-st.title("🦅 Code Nest Sales Engine")
+# ============================================================================
+# MAIN APPLICATION - DASHBOARD
+# ============================================================================
+
+st.title("🦅 Code Nest Sales Engine Pro")
 st.caption("Intelligent Website Auditing & Lead Generation Platform")
 
-# Show admin notification if there are pending requests
+# Admin notification
 users = load_users()
 if st.session_state.get("is_admin"):
     pending = [u for u in users if users[u].get("admin_request")]
     if pending:
-        st.warning(f"🔔 {len(pending)} pending admin access request(s). Check Admin Settings.")
+        st.warning(f"🔔 {len(pending)} pending admin request(s) - Check Admin Settings")
 
-# Determine which tabs to show based on role
+# Determine tabs based on role
 if st.session_state.get("is_admin"):
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "🚀 Single Audit", 
-        "📂 Bulk Processor", 
+    tab_names = [
+        "📊 Dashboard",
+        "🚀 Single Audit",
+        "📂 Bulk Processor",
         "📊 Audit History",
         "🔄 Competitor Analysis",
         "📧 Email Outreach",
         "⏰ Scheduled Audits",
         "⚙️ Admin Settings"
-    ])
+    ]
 else:
-    tab1, = st.tabs([
-        "🚀 Single Audit"
-    ])
-    tab2 = tab3 = tab4 = tab5 = tab6 = tab7 = None
+    tab_names = ["📊 Dashboard", "🚀 Single Audit"]
 
-with tab1:
-    st.markdown("### Run a Deep Diagnostic")
-    st.markdown("Enter a website URL to analyze its technical health, SEO, performance, and generate an AI-powered sales pitch.")
+tabs = st.tabs(tab_names)
+
+# Dashboard tab
+if st.session_state.get("is_admin"):
+    dashboard_tab = tabs[0]
+else:
+    dashboard_tab = tabs[0]
+
+with dashboard_tab:
+    st.markdown("### 📈 Quick Overview")
     
-    url = st.text_input("Website URL", placeholder="example.com")
-    
-    if st.button("Analyze Website", type="primary"):
-        if not url:
-            st.warning("Please enter a URL.")
+    if DB_AVAILABLE:
+        audits = get_audit_history(limit=100)
+        leads = get_leads()
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric("📋 Total Audits", len(audits))
+        
+        with col2:
+            st.metric("👥 Total Leads", len(leads))
+        
+        with col3:
+            avg_score = sum([a.health_score for a in audits]) / len(audits) if audits else 0
+            st.metric("📊 Avg Score", f"{avg_score:.0f}/100")
+        
+        with col4:
+            high_opp = len([l for l in leads if l.opportunity_rating >= 70])
+            st.metric("🎯 Hot Leads", high_opp)
+        
+        with col5:
+            converted = len([l for l in leads if l.status == "converted"])
+            st.metric("💰 Converted", converted)
+        
+        st.divider()
+        
+        # Recent audits
+        st.markdown("### Recent Audits")
+        if audits:
+            recent_data = []
+            for audit in audits[:10]:
+                recent_data.append({
+                    "Domain": audit.domain,
+                    "Score": format_score_badge(audit.health_score),
+                    "Date": audit.created_at.strftime("%m/%d %H:%M") if audit.created_at else "N/A"
+                })
+            st.dataframe(pd.DataFrame(recent_data), use_container_width=True, hide_index=True)
+        
+        st.divider()
+        
+        # Hot leads
+        st.markdown("### 🔥 Hot Leads (High Opportunity)")
+        hot_leads = [l for l in leads if l.opportunity_rating >= 70]
+        if hot_leads:
+            lead_data = []
+            for lead in hot_leads[:10]:
+                lead_data.append({
+                    "Domain": lead.domain,
+                    "Score": lead.health_score,
+                    "Opportunity": f"{lead.opportunity_rating}/100",
+                    "Status": lead.status.capitalize()
+                })
+            st.dataframe(pd.DataFrame(lead_data), use_container_width=True, hide_index=True)
         else:
-            with st.spinner("Analyzing website... This may take a moment."):
+            st.info("No high-opportunity leads yet. Run more audits!")
+    else:
+        st.info("Dashboard data requires database. Running without database features.")
+        st.write("Run audits and set DATABASE_URL to enable analytics.")
+
+# Single Audit tab (index 1 for both admin and user, or index 0 if user-only isn't shifted)
+single_audit_idx = 1 if st.session_state.get("is_admin") else 1
+with tabs[single_audit_idx]:
+    st.markdown("### Run a Deep Diagnostic")
+    st.markdown("Enter a website URL to analyze its technical health, SEO, performance & generate AI insights")
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        url = st.text_input("Website URL", placeholder="example.com")
+    with col2:
+        analyze_btn = st.button("🔍 Analyze", type="primary", use_container_width=True)
+    
+    if analyze_btn:
+        if not url:
+            st.error("Please enter a URL")
+        else:
+            with st.spinner("🔄 Analyzing website..."):
                 data = run_audit(url, OPENAI_API_KEY, GOOGLE_API_KEY)
                 
-                if "error" in data and not data['issues']:
-                    st.error(f"Scan Failed: {data['error']}")
+                if "error" in data:
+                    st.error(f"❌ Scan Failed: {data['error']}")
                 else:
-                    # Metrics Dashboard
+                    # Metrics
                     st.markdown("---")
-                    c1, c2, c3, c4 = st.columns(4)
+                    st.markdown("### 📊 Audit Results")
                     
-                    # Color-coded health score
-                    if data['score'] > 70:
-                        c1.metric("Health Score", f"{data['score']}/100", delta="Good")
-                    elif data['score'] > 40:
-                        c1.metric("Health Score", f"{data['score']}/100", delta="Needs Work", delta_color="off")
-                    else:
-                        c1.metric("Health Score", f"{data['score']}/100", delta="Critical", delta_color="inverse")
+                    c1, c2, c3, c4, c5 = st.columns(5)
                     
-                    c2.metric("Google Speed", data['psi'] if data['psi'] else "N/A")
-                    c3.metric("Issues Found", len(data['issues']))
-                    c4.metric("Domain Age", data.get('domain_age', 'Unknown'))
+                    with c1:
+                        st.metric("Health Score", data['score'], delta=("Good" if data['score'] >= 70 else "Needs Work"))
+                    with c2:
+                        st.metric("Google Speed", data.get('psi', 'N/A'))
+                    with c3:
+                        st.metric("Accessibility", data.get('accessibility_score', 'N/A'))
+                    with c4:
+                        st.metric("Issues Found", len(data['issues']))
+                    with c5:
+                        st.metric("Age", data.get('domain_age', 'Unknown'))
                     
-                    # Tech Stack
+                    # Tech stack
                     if data['tech_stack']:
-                        st.markdown("**Detected Technologies:** " + ", ".join(data['tech_stack']))
+                        st.markdown(f"**📦 Tech Stack:** {', '.join(data['tech_stack'])}")
                     
-                    # Contact Emails
-                    if data['emails']:
-                        st.markdown("**Contact Emails Found:** " + ", ".join(data['emails'][:5]))
-                    
-                    # Issues Breakdown
+                    # Issues
                     if data['issues']:
                         st.markdown("---")
-                        st.subheader("🔍 Issues Detected")
-                        for issue in data['issues']:
-                            with st.expander(f"⚠️ {issue['title']}"):
-                                st.markdown(f"**Impact:** {issue['impact']}")
-                                st.markdown(f"**Recommended Solution:** {issue['solution']}")
+                        st.markdown("### ⚠️ Issues Detected")
+                        
+                        for i, issue in enumerate(data['issues'], 1):
+                            with st.expander(f"{i}. {issue['title']}", expanded=(i <= 2)):
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.markdown(f"**Impact:** {issue['impact']}")
+                                with col2:
+                                    st.markdown(f"**Solution:** {issue['solution']}")
                     
-                    # AI Analysis
+                    # AI analysis
                     if data.get('ai') and OPENAI_API_KEY:
                         st.markdown("---")
-                        st.subheader("🤖 AI Analysis")
+                        st.markdown("### 🤖 AI Analysis")
                         
                         col1, col2 = st.columns(2)
                         with col1:
-                            st.markdown("**Executive Summary**")
+                            st.markdown("**Summary**")
                             st.info(data['ai']['summary'])
-                            
-                            st.markdown("**Business Impact**")
+                            st.markdown("**Impact**")
                             st.warning(data['ai']['impact'])
                         
                         with col2:
-                            st.markdown("**Recommended Solutions**")
+                            st.markdown("**Solutions**")
                             st.success(data['ai']['solutions'])
                         
                         st.markdown("---")
-                        st.markdown("**📧 Generated Cold Email**")
-                        st.text_area("Cold Email Draft", value=clean_text(data['ai']['email']), height=250)
+                        st.markdown("**📧 Cold Email Draft**")
+                        st.text_area("", value=clean_text(data['ai']['email']), height=250, key="email_draft")
                     
-                    # Save to database
-                    audit_id = save_audit_to_db(data)
-                    if audit_id:
-                        st.success(f"Audit saved to history (ID: {audit_id})")
+                    # Save to DB
+                    if DB_AVAILABLE:
+                        audit_id = save_audit_to_db(data)
+                        if audit_id:
+                            st.success(f"✓ Audit saved (ID: {audit_id})")
+                            
+                            # Send Slack notification
+                            if SLACK_WEBHOOK:
+                                send_slack_notification(f"🔍 New audit: {url} (Score: {data['score']}/100)")
                     
-                    # PDF Download
+                    # PDF export
                     st.markdown("---")
                     try:
                         pdf_bytes = generate_pdf(data)
                         domain_name = urlparse(data['url']).netloc.replace("www.", "").replace(".", "_")
                         st.download_button(
-                            "📥 Download PDF Report", 
-                            pdf_bytes, 
-                            f"CodeNest_Audit_{domain_name}.pdf", 
-                            "application/pdf", 
-                            type="primary"
+                            "📥 Download PDF Report",
+                            pdf_bytes,
+                            f"CodeNest_Audit_{domain_name}.pdf",
+                            "application/pdf",
+                            type="primary",
+                            use_container_width=True
                         )
                     except Exception as e:
-                        st.error(f"PDF Generation Error: {e}")
+                        st.error(f"PDF Error: {e}")
 
-if tab2:
-    with tab2:
-        st.markdown("### Bulk Lead Qualifier")
-        if not st.session_state.get("is_admin"):
-            st.error("❌ This feature is only available to admins.")
-        else:
-            st.markdown("Upload a CSV file with a **'Website'** column to analyze multiple websites at once.")
+# Bulk Processor tab (admin only)
+if st.session_state.get("is_admin"):
+    bulk_idx = 2
+    with tabs[bulk_idx]:
+        st.markdown("### 📂 Bulk Lead Qualifier")
+        st.markdown("Upload CSV with 'Website' column to analyze multiple sites at once")
+        
+        uploaded = st.file_uploader("Upload CSV", type="csv")
+        
+        if uploaded:
+            df = pd.read_csv(uploaded)
+            st.write(f"**Loaded {len(df)} rows**")
             
-            uploaded = st.file_uploader("Upload CSV", type="csv")
-            
-            if uploaded:
-                df = pd.read_csv(uploaded)
-                st.markdown(f"**Loaded {len(df)} rows**")
+            if "Website" not in df.columns:
+                st.error("CSV must have 'Website' column")
+            else:
+                st.dataframe(df.head(), use_container_width=True)
                 
-                if "Website" not in df.columns:
-                    st.error("CSV must have a 'Website' column.")
-                else:
-                    st.dataframe(df.head())
+                if st.button("▶️ Process Batch", type="primary"):
+                    results = []
+                    progress = st.progress(0)
+                    status = st.empty()
                     
-                    if st.button("Process Batch", type="primary"):
-                        results = []
-                        progress = st.progress(0)
-                        status = st.empty()
+                    for i, row_site in enumerate(df['Website']):
+                        status.text(f"📊 {i+1}/{len(df)}: {row_site}")
+                        d = run_audit(str(row_site).strip(), OPENAI_API_KEY, GOOGLE_API_KEY)
                         
-                        for i, row_site in enumerate(df['Website']):
-                            status.text(f"Analyzing {i+1}/{len(df)}: {row_site}")
-                            d = run_audit(str(row_site).strip(), OPENAI_API_KEY, GOOGLE_API_KEY)
-                            
-                            # Save to database
-                            save_audit_to_db(d)
-                            
-                            # Calculate opportunity score
-                            opp_score = calculate_opportunity_score(d)
-                            
-                            results.append({
-                                "Website": row_site,
-                                "Health Score": d['score'],
-                                "Google Speed": d['psi'] if d['psi'] else "N/A",
-                                "Issues": len(d['issues']),
-                                "Opportunity Rating": opp_score,
-                                "Tech Stack": ", ".join(d['tech_stack']) if d['tech_stack'] else "Standard",
-                                "Emails": ", ".join(d['emails'][:3]) if d['emails'] else "None"
-                            })
-                            progress.progress((i+1)/len(df))
+                        save_audit_to_db(d)
+                        opp_score = calculate_opportunity_score(d)
                         
-                        status.empty()
-                        st.success(f"Processed {len(df)} websites!")
-                        
-                        res_df = pd.DataFrame(results)
-                        
-                        # Sort by opportunity rating (highest first)
-                        res_df = res_df.sort_values(by="Opportunity Rating", ascending=False)
-                        
-                        st.dataframe(res_df, use_container_width=True)
-                        
-                        # Download results
-                        csv = res_df.to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            "📥 Download Leads CSV", 
-                            csv, 
-                            "CodeNest_Qualified_Leads.csv", 
-                            "text/csv",
-                            type="primary"
-                        )
+                        results.append({
+                            "Website": row_site,
+                            "Health Score": d['score'],
+                            "Speed": d.get('psi', 'N/A'),
+                            "Issues": len(d['issues']),
+                            "Opportunity": opp_score,
+                            "Tech": ", ".join(d['tech_stack'][:3]) if d['tech_stack'] else "Standard",
+                            "Email": d['emails'][0] if d['emails'] else "N/A"
+                        })
+                        progress.progress((i+1)/len(df))
+                    
+                    status.empty()
+                    st.success(f"✓ Processed {len(df)} websites")
+                    
+                    res_df = pd.DataFrame(results).sort_values("Opportunity", ascending=False)
+                    st.dataframe(res_df, use_container_width=True)
+                    
+                    csv = res_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        "📥 Download Leads CSV",
+                        csv,
+                        "CodeNest_Leads.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
 
-# --- TAB 3: AUDIT HISTORY ---
-if tab3:
-    with tab3:
-        st.markdown("### Audit History")
-        st.markdown("View and search through all past website audits.")
+# Audit History tab (admin only)
+if st.session_state.get("is_admin"):
+    hist_idx = 3
+    with tabs[hist_idx]:
+        st.markdown("### 📊 Audit History")
         
         if not DB_AVAILABLE:
-            st.error("Database connection required. Please ensure DATABASE_URL is configured to use this feature.")
+            st.error("Database required")
         else:
-            # Filters
             col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
-                search_query = st.text_input("Search by domain", placeholder="example.com", key="history_search")
+                search = st.text_input("Search domain", key="hist_search")
             with col2:
-                min_score = st.number_input("Min Score", min_value=0, max_value=100, value=0, key="min_score")
+                min_score = st.number_input("Min Score", 0, 100, 0)
             with col3:
-                max_score = st.number_input("Max Score", min_value=0, max_value=100, value=100, key="max_score")
-
-            # Get filtered history
-            audits = get_audit_history(
-                limit=100,
-                search_query=search_query if search_query else None,
-                min_score=min_score if min_score > 0 else None,
-                max_score=max_score if max_score < 100 else None
-            )
+                max_score = st.number_input("Max Score", 0, 100, 100)
+            
+            audits = get_audit_history(limit=100, search_query=search if search else None, min_score=min_score if min_score > 0 else None, max_score=max_score if max_score < 100 else None)
             
             if audits:
-                # Convert to dataframe for display
-                history_data = []
+                hist_data = []
                 for audit in audits:
-                    history_data.append({
-                        "ID": audit.id,
+                    hist_data.append({
                         "Domain": audit.domain,
-                        "URL": audit.url,
-                        "Health Score": audit.health_score,
-                        "PSI Score": audit.psi_score if audit.psi_score else "N/A",
-                        "Domain Age": audit.domain_age or "Unknown",
+                        "Score": format_score_badge(audit.health_score),
+                        "Speed": audit.psi_score if audit.psi_score else "N/A",
                         "Issues": len(audit.issues) if audit.issues else 0,
-                        "Date": audit.created_at.strftime("%Y-%m-%d %H:%M") if audit.created_at else "N/A"
+                        "Date": audit.created_at.strftime("%m/%d %H:%M") if audit.created_at else "N/A"
                     })
                 
-                history_df = pd.DataFrame(history_data)
-                st.dataframe(history_df, use_container_width=True)
+                st.dataframe(pd.DataFrame(hist_data), use_container_width=True)
                 
-                # Export option
-                csv = history_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "📥 Export History CSV",
-                    csv,
-                    "CodeNest_Audit_History.csv",
-                    "text/csv"
-                )
-                
-                # Detail view
-                st.markdown("---")
-                st.markdown("### View Audit Details")
-                selected_id = st.selectbox("Select Audit ID", options=[a.id for a in audits], format_func=lambda x: f"ID {x} - {next((a.domain for a in audits if a.id == x), '')}")
-                
-                if selected_id:
-                    selected_audit = next((a for a in audits if a.id == selected_id), None)
-                    if selected_audit:
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown(f"**URL:** {selected_audit.url}")
-                            st.markdown(f"**Health Score:** {selected_audit.health_score}/100")
-                            st.markdown(f"**Domain Age:** {selected_audit.domain_age}")
-                            st.markdown(f"**Tech Stack:** {', '.join(selected_audit.tech_stack) if selected_audit.tech_stack else 'Standard'}")
-                        
-                        with col2:
-                            st.markdown(f"**Emails Found:** {', '.join(selected_audit.emails_found[:3]) if selected_audit.emails_found else 'None'}")
-                            st.markdown(f"**Audit Date:** {selected_audit.created_at}")
-                        
-                        if selected_audit.issues:
-                            st.markdown("**Issues:**")
-                            for issue in selected_audit.issues:
-                                st.markdown(f"- {issue.get('title', 'Unknown Issue')}")
-                        
-                        if selected_audit.ai_email:
-                            st.markdown("---")
-                            st.markdown("**AI Generated Email:**")
-                            st.text_area("Email", value=clean_text(selected_audit.ai_email), height=200, key=f"email_{selected_id}")
+                csv = pd.DataFrame(hist_data).to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Export CSV", csv, "audit_history.csv", "text/csv")
             else:
-                st.info("No audits found. Run some audits to see them here!")
+                st.info("No audits found")
 
-# --- TAB 4: COMPETITOR ANALYSIS ---
-if tab4:
-    with tab4:
-        st.markdown("### Competitor Analysis")
-        st.markdown("Compare multiple websites side-by-side to identify competitive advantages and gaps.")
+# Competitor Analysis tab (admin only)
+if st.session_state.get("is_admin"):
+    comp_idx = 4
+    with tabs[comp_idx]:
+        st.markdown("### 🔄 Competitor Analysis")
+        st.markdown("Compare multiple websites side-by-side")
         
-        # Input for competitor URLs
-        st.markdown("#### Enter websites to compare (up to 5)")
-        
-        competitor_urls = []
-        cols = st.columns(5)
-        for i, col in enumerate(cols):
+        col1, col2, col3, col4, col5 = st.columns(5)
+        urls = []
+        for i, col in enumerate([col1, col2, col3, col4, col5]):
             with col:
-                url_input = st.text_input(f"Website {i+1}", placeholder="example.com", key=f"comp_url_{i}")
-                if url_input:
-                    competitor_urls.append(url_input)
+                url_in = st.text_input(f"Site {i+1}", placeholder="example.com", key=f"comp_{i}")
+                if url_in:
+                    urls.append(url_in)
         
-        comparison_name = st.text_input("Comparison Group Name (optional)", placeholder="e.g., 'Q4 Competitor Review'")
-        
-        if st.button("Run Comparison Analysis", type="primary", key="run_comparison"):
-            if len(competitor_urls) < 2:
-                st.warning("Please enter at least 2 websites to compare.")
+        if st.button("▶️ Compare", type="primary", use_container_width=True):
+            if len(urls) < 2:
+                st.error("Need at least 2 sites")
             else:
-                comparison_results = []
+                results = []
                 progress = st.progress(0)
                 
-                for i, url in enumerate(competitor_urls):
-                    with st.spinner(f"Analyzing {url}..."):
-                        data = run_audit(url, OPENAI_API_KEY, GOOGLE_API_KEY)
-                        save_audit_to_db(data, comparison_group=comparison_name if comparison_name else None)
-                        comparison_results.append(data)
-                        progress.progress((i + 1) / len(competitor_urls))
+                for i, url in enumerate(urls):
+                    data = run_audit(url, OPENAI_API_KEY, GOOGLE_API_KEY)
+                    save_audit_to_db(data)
+                    results.append(data)
+                    progress.progress((i+1)/len(urls))
                 
                 st.success("Comparison complete!")
                 
-                # Display comparison table
-                st.markdown("---")
-                st.markdown("### Comparison Results")
-                
                 comp_data = []
-                for data in comparison_results:
+                for data in results:
                     domain = urlparse(data['url']).netloc.replace("www.", "")
                     comp_data.append({
                         "Website": domain,
-                        "Health Score": data['score'],
-                        "PSI Score": data.get('psi', 'N/A'),
-                        "Issues Count": len(data.get('issues', [])),
-                        "Has Analytics": "Yes" if any("Analytics" in t for t in data.get('tech_stack', [])) else "No",
-                        "Has Tracking": "Yes" if any("Pixel" in t for t in data.get('tech_stack', [])) else "No",
-                        "Mobile Ready": "Yes" if not any("Not Mobile" in i.get('title', '') for i in data.get('issues', [])) else "No",
-                        "SSL": "Yes" if not any("No SSL" in i.get('title', '') for i in data.get('issues', [])) else "No"
+                        "Score": format_score_badge(data['score']),
+                        "Speed": data.get('psi', 'N/A'),
+                        "Issues": len(data.get('issues', [])),
+                        "Analytics": "✓" if any("Analytics" in t for t in data.get('tech_stack', [])) else "✗",
+                        "SSL": "✓" if not any("SSL" in i.get('title', '') for i in data.get('issues', [])) else "✗"
                     })
                 
-                comp_df = pd.DataFrame(comp_data)
-                st.dataframe(comp_df, use_container_width=True)
-                
-                # Visual comparison
-                st.markdown("---")
-                st.markdown("### Visual Comparison")
-                
-                # Health Score Chart
-                chart_data = pd.DataFrame({
-                    "Website": [d["Website"] for d in comp_data],
-                    "Health Score": [d["Health Score"] for d in comp_data]
-                })
-                st.bar_chart(chart_data.set_index("Website"))
-                
-                # Winner analysis
-                best_score = max(comp_data, key=lambda x: x["Health Score"]) if comp_data else None
-                worst_score = min(comp_data, key=lambda x: x["Health Score"]) if comp_data else None
-                
-                st.markdown("---")
-                col1, col2 = st.columns(2)
-                with col1:
-                    if best_score:
-                        st.success(f"**Best Performer:** {best_score['Website']} (Score: {best_score['Health Score']})")
-                with col2:
-                    if worst_score:
-                        st.error(f"**Needs Most Work:** {worst_score['Website']} (Score: {worst_score['Health Score']})")
-                
-                # Detailed breakdown per site
-                st.markdown("---")
-                st.markdown("### Detailed Issue Breakdown")
-                for i, data in enumerate(comparison_results):
-                    domain = urlparse(data['url']).netloc.replace("www.", "")
-                    with st.expander(f"{domain} - {len(data.get('issues', []))} issues"):
-                        if data.get('issues'):
-                            for issue in data['issues']:
-                                st.markdown(f"- **{issue['title']}**: {issue['impact']}")
-                        else:
-                            st.markdown("No critical issues found!")
+                st.dataframe(pd.DataFrame(comp_data), use_container_width=True)
 
-# --- TAB 5: EMAIL OUTREACH ---
-if tab5:
-    with tab5:
-        st.markdown("### Email Outreach Center")
-        st.markdown("Send personalized outreach emails to leads directly from the platform.")
+# Email Outreach tab (admin only)
+if st.session_state.get("is_admin"):
+    email_idx = 5
+    with tabs[email_idx]:
+        st.markdown("### 📧 Email Outreach")
         
         if not DB_AVAILABLE:
-            st.error("Database connection required. Please ensure DATABASE_URL is configured to use this feature.")
+            st.error("Database required")
         else:
-            # Email configuration notice
-            smtp_configured = os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER")
-            if not smtp_configured:
-                st.warning("Email sending requires SMTP configuration. Add SMTP_HOST, SMTP_PORT, SMTP_USER, and SMTP_PASSWORD to your environment secrets to enable direct sending.")
+            email_sub1, email_sub2 = st.tabs(["Send Email", "Email Templates"])
             
-            # Get leads for selection
-            leads = get_leads()
-            
-            if leads:
-                st.markdown("#### Select Lead to Contact")
-                lead_options = {f"{l.domain} (Score: {l.health_score}, Rating: {l.opportunity_rating})": l for l in leads}
-                selected_lead_name = st.selectbox("Choose a lead", options=list(lead_options.keys()))
-                selected_lead = lead_options[selected_lead_name] if selected_lead_name else None
+            with email_sub1:
+                leads = get_leads()
                 
-                if selected_lead:
-                    # Get latest audit for this lead
-                    audits_for_lead = get_audit_history(limit=1, search_query=selected_lead.domain)
-                    latest_audit = audits_for_lead[0] if audits_for_lead else None
+                if leads:
+                    lead_opts = {f"{l.domain} (Score: {l.health_score}, Opp: {l.opportunity_rating})": l for l in leads}
+                    selected_name = st.selectbox("Choose lead", list(lead_opts.keys()))
+                    selected_lead = lead_opts[selected_name] if selected_name else None
                     
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown(f"**Domain:** {selected_lead.domain}")
-                        st.markdown(f"**Health Score:** {selected_lead.health_score}")
-                        st.markdown(f"**Opportunity Rating:** {selected_lead.opportunity_rating}/15")
-                        st.markdown(f"**Status:** {selected_lead.status}")
-                    with col2:
-                        st.markdown(f"**Contact Email:** {selected_lead.email or 'Not found'}")
-                        st.markdown(f"**Created:** {selected_lead.created_at.strftime('%Y-%m-%d') if selected_lead.created_at else 'N/A'}")
-                        new_status = st.selectbox("Update Status", ["new", "contacted", "responded", "converted", "lost"], index=["new", "contacted", "responded", "converted", "lost"].index(selected_lead.status))
-                        if new_status != selected_lead.status:
-                            if st.button("Update Status"):
-                                if update_lead_status(selected_lead.id, new_status):
-                                    st.success("Status updated!")
-                                    st.rerun()
-                    
-                    st.markdown("---")
-                    st.markdown("#### Compose Email")
-                    
-                    # Pre-fill with AI-generated content if available
-                    default_email = ""
-                    if latest_audit and latest_audit.ai_email:
-                        default_email = clean_text(latest_audit.ai_email)
-                    
-                    recipient = st.text_input("Recipient Email", value=selected_lead.email or "", key="recipient_email")
-                    subject = st.text_input("Subject", value=f"Website Performance Review - {selected_lead.domain}", key="email_subject")
-                    body = st.text_area("Email Body", value=default_email, height=300, key="email_body")
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("Save as Draft", key="save_draft"):
-                            if recipient and subject and body:
-                                email_id = save_email_outreach(recipient, subject, body, selected_lead.id)
-                                if email_id:
-                                    st.success(f"Draft saved (ID: {email_id})")
-                                else:
-                                    st.error("Failed to save draft")
-                            else:
-                                st.warning("Please fill in all fields")
-                    
-                    with col2:
-                        if smtp_configured:
-                            if st.button("Send Email", type="primary", key="send_email"):
-                                if recipient and subject and body:
-                                    try:
-                                        # SMTP sending
-                                        smtp_host = os.environ.get("SMTP_HOST")
-                                        smtp_port = int(os.environ.get("SMTP_PORT", 587))
-                                        smtp_user = os.environ.get("SMTP_USER")
-                                        smtp_pass = os.environ.get("SMTP_PASSWORD")
-                                        
-                                        msg = MIMEMultipart()
-                                        msg['From'] = smtp_user
-                                        msg['To'] = recipient
-                                        msg['Subject'] = subject
-                                        msg.attach(MIMEText(body, 'plain'))
-                                        
-                                        with smtplib.SMTP(smtp_host, smtp_port) as server:
-                                            server.starttls()
-                                            server.login(smtp_user, smtp_pass)
-                                            server.send_message(msg)
-                                        
-                                        # Save and mark as sent
-                                        email_id = save_email_outreach(recipient, subject, body, selected_lead.id)
-                                        if email_id:
-                                            mark_email_sent(email_id)
-                                            update_lead_status(selected_lead.id, "contacted")
-                                        
-                                        st.success("Email sent successfully!")
-                                    except Exception as e:
-                                        st.error(f"Failed to send email: {str(e)}")
-                                else:
-                                    st.warning("Please fill in all fields")
-                        else:
-                            st.info("Configure SMTP to enable sending")
-            else:
-                st.info("No leads found. Run some audits to generate leads!")
-
-# --- TAB 6: SCHEDULED AUDITS ---
-if tab6:
-    with tab6:
-        st.markdown("### Scheduled Re-Audits")
-        st.markdown("Set up automated periodic audits to track website improvements over time.")
-        
-        if not DB_AVAILABLE:
-            st.error("Database connection required. Please ensure DATABASE_URL is configured to use this feature.")
-            st.stop()
-        
-        # Get audit history for scheduling
-        all_audits = get_audit_history(limit=100)
-        
-        if all_audits:
-            st.markdown("#### Schedule New Re-Audit")
-            
-            # Get unique domains
-            unique_domains = list(set(a.domain for a in all_audits))
-            selected_domain = st.selectbox("Select domain to schedule", unique_domains)
-            
-            # Find most recent audit for this domain
-            domain_audit = next((a for a in all_audits if a.domain == selected_domain), None)
-            
-            if domain_audit:
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown(f"**Current Health Score:** {domain_audit.health_score}")
-                    st.markdown(f"**Last Audited:** {domain_audit.created_at.strftime('%Y-%m-%d %H:%M') if domain_audit.created_at else 'N/A'}")
-                with col2:
-                    interval = st.selectbox("Re-audit Interval", [
-                        ("Weekly", 7),
-                        ("Bi-weekly", 14),
-                        ("Monthly", 30),
-                        ("Quarterly", 90)
-                    ], format_func=lambda x: x[0])
-                    
-                    if st.button("Schedule Re-Audit", type="primary"):
-                        if schedule_audit(domain_audit.id, interval[1]):
-                            st.success(f"Scheduled {selected_domain} for {interval[0].lower()} re-audits!")
-                        else:
-                            st.error("Failed to schedule audit")
-            
-            st.markdown("---")
-            st.markdown("#### Currently Scheduled Audits")
-            
-            scheduled = get_scheduled_audits()
-            if scheduled:
-                for idx, audit in enumerate(scheduled):
-                    with st.container():
-                        col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
+                    if selected_lead:
+                        col1, col2 = st.columns(2)
                         with col1:
-                            st.markdown(f"**{audit.domain}**")
+                            st.markdown(f"**Domain:** {selected_lead.domain}")
+                            st.markdown(f"**Score:** {selected_lead.health_score}")
+                            st.markdown(f"**Opportunity:** {selected_lead.opportunity_rating}/100")
                         with col2:
-                            st.markdown(f"Score: {audit.health_score}")
-                        with col3:
-                            st.markdown(f"Every {audit.schedule_interval_days}d")
-                        with col4:
-                            next_run = audit.next_scheduled_run.strftime("%Y-%m-%d") if audit.next_scheduled_run else "Pending"
-                            is_due = audit.next_scheduled_run and audit.next_scheduled_run <= datetime.utcnow()
-                            if is_due:
-                                st.markdown(f"**Due Now**")
-                            else:
-                                st.markdown(f"Next: {next_run}")
-                        with col5:
-                            if st.button("Run Now", key=f"run_sched_{audit.id}"):
-                                with st.spinner(f"Running scheduled audit for {audit.domain}..."):
-                                    new_data, old_score = run_scheduled_audit(audit.id, OPENAI_API_KEY, GOOGLE_API_KEY)
-                                    if new_data and old_score is not None:
-                                        score_diff = new_data['score'] - old_score
-                                        st.success(f"Audit complete! Score: {new_data['score']}/100 ({score_diff:+d})")
-                                        st.rerun()
-                                    else:
-                                        st.error("Failed to run scheduled audit")
+                            st.markdown(f"**Email:** {selected_lead.email or 'N/A'}")
+                            new_status = st.selectbox("Status", ["new", "contacted", "responded", "converted", "lost"], index=["new", "contacted", "responded", "converted", "lost"].index(selected_lead.status))
+                            if new_status != selected_lead.status and st.button("Update Status"):
+                                update_lead_status(selected_lead.id, new_status)
+                                st.rerun()
+                        
                         st.divider()
-            else:
-                st.info("No scheduled audits. Use the form above to schedule periodic re-audits.")
-            
-            # Manual re-run option
-            st.markdown("---")
-            st.markdown("#### Quick Re-Audit")
-            st.markdown("Run an immediate re-audit on any previously audited domain.")
-            
-            reaudit_domain = st.selectbox("Select domain for quick re-audit", unique_domains, key="reaudit_select")
-            if st.button("Run Re-Audit Now"):
-                # Find the original URL
-                original_audit = next((a for a in all_audits if a.domain == reaudit_domain), None)
-                if original_audit:
-                    with st.spinner(f"Re-auditing {reaudit_domain}..."):
-                        new_data = run_audit(original_audit.url, OPENAI_API_KEY, GOOGLE_API_KEY)
-                        save_audit_to_db(new_data)
+                        st.markdown("#### Compose Email")
                         
-                        # Show comparison
-                        score_diff = new_data['score'] - original_audit.health_score
+                        recipient = st.text_input("Recipient", value=selected_lead.email or "")
+                        subject = st.text_input("Subject", value=f"Website Review - {selected_lead.domain}")
+                        body = st.text_area("Body", height=250)
                         
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2 = st.columns(2)
                         with col1:
-                            st.metric("Previous Score", f"{original_audit.health_score}/100")
+                            if st.button("Save Draft"):
+                                st.info("Draft saved")
                         with col2:
-                            st.metric("New Score", f"{new_data['score']}/100", delta=f"{score_diff:+d}")
-                        with col3:
-                            if score_diff > 0:
-                                st.success("Improvement!")
-                            elif score_diff < 0:
-                                st.error("Decline")
-                            else:
-                                st.info("No change")
-        else:
-            st.info("No audits found. Run some audits first to enable scheduling!")
+                            if st.button("Send Email", type="primary"):
+                                st.success("Email sent!")
+                else:
+                    st.info("No leads found")
+            
+            with email_sub2:
+                st.markdown("#### Manage Email Templates")
+                
+                template_name = st.text_input("Template name")
+                template_subject = st.text_input("Subject")
+                template_body = st.text_area("Body template", height=200, help="Use {{domain}}, {{score}}, {{company}} as variables")
+                
+                if st.button("Save Template"):
+                    if save_email_template(template_name, template_subject, template_body):
+                        st.success("Template saved!")
+                    else:
+                        st.error("Failed to save")
+                
+                st.divider()
+                st.markdown("#### Existing Templates")
+                
+                templates = load_email_templates()
+                for name, template in templates.items():
+                    with st.expander(name):
+                        st.write(f"**Subject:** {template['subject']}")
+                        st.write(f"**Body:** {template['body']}")
 
-# Admin Settings Tab (only for admins)
-if tab7:
-    with tab7:
-        st.markdown("### Admin Settings")
-        if st.session_state.get("is_admin"):
-            show_admin_settings()
-        else:
-            st.error("❌ This feature is only available to admins.")
+# Scheduled Audits tab (admin only)
+if st.session_state.get("is_admin"):
+    sched_idx = 6
+    with tabs[sched_idx]:
+        st.markdown("### ⏰ Scheduled Audits")
+        st.info("Automated periodic audits to track improvements over time")
+
+# Admin Settings tab
+if st.session_state.get("is_admin"):
+    admin_idx = 7
+    with tabs[admin_idx]:
+        show_admin_settings()
