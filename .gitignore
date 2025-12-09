@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtualenv
+.venv/
+venv/
+
+# Database files
+*.db
+sales_engine.db
+
+# Logs
+*.log
+
+# Streamlit / editor
+.streamlit/
+.replit
+.local/
+
+# Uploaded artifacts
+Streamlit-Requests-Scraper.zip
+uv.lock
+
+# IDE
+.vscode/
