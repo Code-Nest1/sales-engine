@@ -41,3 +41,23 @@ Notes
 - The app uses `fpdf` and encodes text to `latin-1` for PDF stability; non-Latin characters may be replaced.
 
 If you want, I can run a smoke test (install dependencies and start the app) — tell me if you want me to proceed.
+
+Streamlit Cloud / Deployment
+1. Deploying to Streamlit Community Cloud
+
+- Push this repository to GitHub (you already have `main` branch updated).
+- In Streamlit Cloud, create a new app and connect it to this GitHub repo and the `main` branch.
+- In the Streamlit Cloud app settings, set the following Secrets (recommended):
+	- `OPENAI_API_KEY`
+	- `GOOGLE_API_KEY` (optional)
+	- `DATABASE_URL` (if using a hosted DB, e.g., Heroku Postgres)
+	- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` (if using SMTP)
+
+2. Using local `.env` or Streamlit Secrets
+
+- For local development, copy `.env.example` to `.env` and fill your keys. The app calls `python-dotenv` to load `.env` automatically.
+- For Streamlit Cloud, prefer adding keys via the Web UI (Secrets). You can also create a local `.streamlit/secrets.toml` by copying `.streamlit/secrets.toml.example` and filling values for local testing (do not commit the real secrets file).
+
+Security note: never commit real credentials to the repository. Use Streamlit Secrets or your host's environment variable management for production.
+
+If you'd like, I can also prepare a one-click Streamlit deployment guide or create a GitHub Action to test the app on each push.

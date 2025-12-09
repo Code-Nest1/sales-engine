@@ -19,6 +19,9 @@ sales_engine.db
 .replit
 .local/
 
+# Local environment file
+.env
+
 # Uploaded artifacts
 Streamlit-Requests-Scraper.zip
 uv.lock

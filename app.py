@@ -10,6 +10,10 @@ import re
 import whois
 from openai import OpenAI
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from a local .env file if present
+load_dotenv()
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
