@@ -14,12 +14,111 @@ from dotenv import load_dotenv
 
 # Load environment variables from a local .env file if present
 load_dotenv()
+import json
+import hashlib
+from pathlib import Path
+
+# --- Simple file-based user store (users.json) ---
+USERS_PATH = Path(__file__).parent / "users.json"
+
+def init_users_file():
+    """Create an empty users.json file if it doesn't exist."""
+    if not USERS_PATH.exists():
+        USERS_PATH.write_text(json.dumps({"users": {}}, indent=2))
+
+def load_users():
+    """Return the users dict from users.json."""
+    init_users_file()
+    try:
+        data = json.loads(USERS_PATH.read_text())
+        return data.get("users", {})
+    except Exception:
+        return {}
+
+def save_users(users: dict):
+    """Save the users dict into users.json."""
+    data = {"users": users}
+    USERS_PATH.write_text(json.dumps(data, indent=2))
+
+def hash_password(password: str) -> str:
+    """Return a SHA-256 hex digest of the password (simple hashing).
+
+    Note: For production prefer bcrypt. This is a simple file-based example.
+    """
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    return hash_password(password) == stored_hash
+
+def show_auth_page():
+    """Render the login / signup UI. Sets st.session_state['authenticated']=True on success."""
+    st.title("🦅 Code Nest — Sign In")
+    st.write("Please login or create an account to continue.")
+
+    tab = st.radio("", ["Login", "Sign Up"], horizontal=True)
+
+    users = load_users()
+
+    if tab == "Login":
+        st.subheader("Login")
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login"):
+            if not username:
+                st.error("Username must not be empty.")
+            elif not password:
+                st.error("Password must not be empty.")
+            elif username not in users:
+                st.error("User not found. Please sign up first.")
+            else:
+                if verify_password(password, users[username]["password_hash"]):
+                    st.session_state["authenticated"] = True
+                    st.session_state["current_user"] = username
+                    st.success(f"Welcome, {users[username].get('name') or username}!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+
+    else:
+        st.subheader("Create Account")
+        full_name = st.text_input("Full Name", key="signup_name")
+        username = st.text_input("Username", key="signup_username")
+        password = st.text_input("Password", type="password", key="signup_password")
+        confirm = st.text_input("Confirm Password", type="password", key="signup_confirm")
+        if st.button("Create Account"):
+            if not username:
+                st.error("Username must not be empty.")
+            elif not password:
+                st.error("Password must not be empty.")
+            elif password != confirm:
+                st.error("Passwords do not match.")
+            elif username in users:
+                st.error("Username already taken.")
+            else:
+                users[username] = {
+                    "name": full_name,
+                    "password_hash": hash_password(password)
+                }
+                save_users(users)
+                st.success("Account created. You may now log in.")
+
+# Ensure users.json exists
+init_users_file()
+
+# Initialize auth state in session
+if 'authenticated' not in st.session_state:
+    st.session_state['authenticated'] = False
+    st.session_state['current_user'] = None
+
+# If the user is not authenticated, show auth page and stop further rendering
+if not st.session_state.get('authenticated'):
+    show_auth_page()
+    st.stop()
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 from models import init_db, get_db, Audit, Lead, EmailOutreach, DATABASE_URL, User
-from passlib.hash import bcrypt
 
 # Initialize database and check connectivity
 DB_AVAILABLE = False
@@ -60,97 +159,13 @@ with st.sidebar:
     else:
         st.warning("System Status: **Limited**\n\nDatabase: Not Connected\n\nSome features require database.")
 
-    # --- Authentication ---
-    if 'user_id' not in st.session_state:
-        st.session_state['user_id'] = None
-        st.session_state['username'] = None
-        st.session_state['is_authenticated'] = False
-
-    def hash_password(password: str) -> str:
-        return bcrypt.hash(password)
-
-    def verify_password(password: str, hashed: str) -> bool:
-        try:
-            return bcrypt.verify(password, hashed)
-        except Exception:
-            return False
-
-    def get_user_by_username(username: str):
-        db = get_db()
-        if not db:
-            return None
-        try:
-            return db.query(User).filter(User.username == username).first()
-        finally:
-            db.close()
-
-    def create_user(username: str, email: str, password: str):
-        db = get_db()
-        if not db:
-            return None
-        try:
-            existing = db.query(User).filter((User.username==username)|(User.email==email)).first()
-            if existing:
-                return None
-            user = User(username=username, email=email, password_hash=hash_password(password))
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-            return user
-        finally:
-            db.close()
-
-    def authenticate_user(username: str, password: str):
-        user = get_user_by_username(username)
-        if not user:
-            return None
-        if verify_password(password, user.password_hash):
-            return user
-        return None
-
-    # Show login/register depending on authentication state
-    if not st.session_state.get('is_authenticated'):
-        auth_tab = st.selectbox("Account", ["Login", "Register"], key="auth_mode")
-        if auth_tab == "Login":
-            with st.form(key="login_form"):
-                login_user = st.text_input("Username")
-                login_pass = st.text_input("Password", type="password")
-                submit_login = st.form_submit_button("Login")
-                if submit_login:
-                    user = authenticate_user(login_user, login_pass)
-                    if user:
-                        st.session_state['user_id'] = user.id
-                        st.session_state['username'] = user.username
-                        st.session_state['is_authenticated'] = True
-                        st.success(f"Welcome back, {user.username}!")
-                        st.experimental_rerun()
-                    else:
-                        st.error("Invalid username or password.")
-        else:
-            with st.form(key="register_form"):
-                reg_user = st.text_input("Choose a username")
-                reg_email = st.text_input("Email (optional)")
-                reg_pass = st.text_input("Choose a password", type="password")
-                reg_pass2 = st.text_input("Confirm password", type="password")
-                submit_reg = st.form_submit_button("Register")
-                if submit_reg:
-                    if not reg_user or not reg_pass:
-                        st.warning("Please choose a username and password.")
-                    elif reg_pass != reg_pass2:
-                        st.warning("Passwords do not match.")
-                    else:
-                        new_user = create_user(reg_user, reg_email or None, reg_pass)
-                        if new_user:
-                            st.success("Account created. You may now log in.")
-                        else:
-                            st.error("User already exists or registration failed.")
-    else:
-        st.markdown(f"**Signed in as:** {st.session_state.get('username')} ")
+    # --- Authentication display (logout) ---
+    if st.session_state.get('authenticated'):
+        st.markdown(f"**Signed in as:** {st.session_state.get('current_user')}")
         if st.button("Logout"):
-            st.session_state['user_id'] = None
-            st.session_state['username'] = None
-            st.session_state['is_authenticated'] = False
-            st.experimental_rerun()
+            st.session_state['authenticated'] = False
+            st.session_state['current_user'] = None
+            st.rerun()
 
 # --- HELPER FUNCTIONS ---
 
