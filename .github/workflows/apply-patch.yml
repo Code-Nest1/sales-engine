@@ -1,0 +1,58 @@
+name: Apply patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_url:
+        description: 'Raw URL to the patch file (e.g., raw Gist URL)'
+        required: true
+      target_branch:
+        description: 'Branch to apply the patch to (will be created if missing)'
+        required: true
+        default: 'auto/patch-applied'
+      commit_message:
+        description: 'Commit message'
+        required: false
+        default: 'Apply automated patch'
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure target branch exists
+        run: |
+          git fetch origin
+          if git ls-remote --exit-code --heads origin "${{ github.event.inputs.target_branch }}"; then
+            echo "Branch exists remotely"
+          else
+            git checkout -b ${{ github.event.inputs.target_branch }} || git checkout ${{ github.event.inputs.target_branch }}
+            git push -u origin ${{ github.event.inputs.target_branch }}
+          fi
+
+      - name: Switch to target branch
+        run: git checkout ${{ github.event.inputs.target_branch }}
+
+      - name: Download patch
+        run: |
+          echo "Downloading patch from ${{ github.event.inputs.patch_url }}"
+          curl -fsSL "${{ github.event.inputs.patch_url }}" -o /tmp/patch.diff
+          ls -lh /tmp/patch.diff
+
+      - name: Apply patch
+        run: |
+          set -e
+          git apply --index /tmp/patch.diff || ( echo "git apply failed. Showing first 200 lines:" && sed -n '1,200p' /tmp/patch.diff && exit 1 )
+          git add -A
+          git commit -m "${{ github.event.inputs.commit_message }}" || echo "No changes to commit"
+
+      - name: Push changes using BOT_TOKEN
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          git remote set-url origin "https://x-access-token:${BOT_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin ${{ github.event.inputs.target_branch }}
