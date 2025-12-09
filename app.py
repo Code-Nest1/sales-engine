@@ -96,6 +96,32 @@ def save_users(users: dict):
     data = {"users": users}
     USERS_PATH.write_text(json.dumps(data, indent=2))
 
+def get_user_api_permissions(username: str) -> dict:
+    """Get API permissions for a user."""
+    users = load_users()
+    if username not in users:
+        return {"openai": False, "google": False, "slack": False}
+    
+    return users[username].get("api_permissions", {"openai": False, "google": False, "slack": False})
+
+def set_user_api_permission(username: str, api_key: str, enabled: bool):
+    """Set API permission for a user."""
+    users = load_users()
+    if username not in users:
+        return False
+    
+    if "api_permissions" not in users[username]:
+        users[username]["api_permissions"] = {"openai": False, "google": False, "slack": False}
+    
+    users[username]["api_permissions"][api_key] = enabled
+    save_users(users)
+    return True
+
+def check_user_api_access(username: str, api_key: str) -> bool:
+    """Check if user has access to specific API."""
+    perms = get_user_api_permissions(username)
+    return perms.get(api_key, False)
+
 def load_2fa_secrets():
     """Load 2FA secrets."""
     init_2fa_file()
@@ -1383,18 +1409,98 @@ def show_admin_settings():
         if pending:
             st.warning(f"⚠️ {len(pending)} pending admin request(s)")
         
-        st.markdown("### User Management")
+        # Custom CSS for beautiful UI
+        st.markdown("""
+        <style>
+        .user-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 15px;
+            color: white;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .user-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+            padding-bottom: 10px;
+        }
+        .user-name {
+            font-size: 18px;
+            font-weight: bold;
+        }
+        .user-role {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .role-admin {
+            background-color: rgba(255, 107, 107, 0.8);
+            color: white;
+        }
+        .role-user {
+            background-color: rgba(100, 200, 100, 0.8);
+            color: white;
+        }
+        .api-controls {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .api-toggle {
+            background-color: rgba(255, 255, 255, 0.15);
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            text-align: center;
+        }
+        .api-toggle.enabled {
+            background-color: rgba(100, 200, 100, 0.3);
+            border-color: rgba(100, 200, 100, 0.6);
+        }
+        .api-label {
+            font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+        .btn-action {
+            flex: 1;
+            min-width: 100px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: none;
+            font-size: 12px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        </style>
+        """, unsafe_allow_html=True)
         
-        cols = st.columns([2, 2, 1.5, 1.5, 1, 1, 1])
-        with cols[0]: st.markdown("**Username**")
-        with cols[1]: st.markdown("**Full Name**")
-        with cols[2]: st.markdown("**Role**")
-        with cols[3]: st.markdown("**Status**")
-        with cols[4]: st.markdown("**Make Admin**")
-        with cols[5]: st.markdown("**Make User**")
-        with cols[6]: st.markdown("**Clear**")
+        st.markdown("### 📊 User Management & API Access Control")
+        st.markdown("Manage user roles and control their API access permissions below:")
         st.divider()
         
+        # Filter users
+        col1, col2 = st.columns(2)
+        with col1:
+            filter_role = st.selectbox("Filter by Role", ["All", "Admin", "User"])
+        with col2:
+            search_user = st.text_input("Search username")
+        
+        # Display users
         for username, user_data in users.items():
             if username == st.session_state.get("current_user"):
                 continue
@@ -1403,30 +1509,114 @@ def show_admin_settings():
             admin_req = user_data.get("admin_request", False)
             name = user_data.get("name", "N/A")
             
-            cols = st.columns([2, 2, 1.5, 1.5, 1, 1, 1])
+            # Apply filters
+            if filter_role != "All" and role.capitalize() != filter_role:
+                continue
+            if search_user and search_user.lower() not in username.lower():
+                continue
             
-            with cols[0]: st.text(username)
-            with cols[1]: st.text(name)
-            with cols[2]: st.text("🔴 Admin" if role == "admin" else "🟢 User")
-            with cols[3]: st.text("✅ Requested" if admin_req else "❌ None")
-            with cols[4]:
-                if st.button("Admin", key=f"admin_{username}", use_container_width=True):
-                    users[username]["role"] = "admin"
-                    users[username]["admin_request"] = False
-                    save_users(users)
-                    st.success(f"{username} is now admin")
-                    st.rerun()
-            with cols[5]:
-                if st.button("User", key=f"user_{username}", use_container_width=True):
-                    users[username]["role"] = "user"
-                    save_users(users)
-                    st.success(f"{username} is now user")
-                    st.rerun()
-            with cols[6]:
-                if admin_req and st.button("Clear", key=f"clear_{username}", use_container_width=True):
-                    users[username]["admin_request"] = False
-                    save_users(users)
-                    st.rerun()
+            # Get API permissions
+            api_perms = get_user_api_permissions(username)
+            
+            # Beautiful user card
+            with st.container():
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.markdown(f"""
+                    <div class="user-card">
+                        <div class="user-header">
+                            <div>
+                                <div class="user-name">👤 {name}</div>
+                                <div style="font-size: 12px; opacity: 0.8;">@{username}</div>
+                            </div>
+                            <div class="user-role role-{'admin' if role == 'admin' else 'user'}">
+                                {'👑 ADMIN' if role == 'admin' else '👤 USER'}
+                            </div>
+                        </div>
+                        
+                        <div class="api-controls">
+                            <div class="api-toggle {'enabled' if api_perms['openai'] else ''}">
+                                <div class="api-label">🤖 OpenAI</div>
+                                <div style="font-size: 11px;">{'✅ Enabled' if api_perms['openai'] else '❌ Disabled'}</div>
+                            </div>
+                            <div class="api-toggle {'enabled' if api_perms['google'] else ''}">
+                                <div class="api-label">🔍 Google</div>
+                                <div style="font-size: 11px;">{'✅ Enabled' if api_perms['google'] else '❌ Disabled'}</div>
+                            </div>
+                            <div class="api-toggle {'enabled' if api_perms['slack'] else ''}">
+                                <div class="api-label">📱 Slack</div>
+                                <div style="font-size: 11px;">{'✅ Enabled' if api_perms['slack'] else '❌ Disabled'}</div>
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2:
+                    # Action buttons
+                    st.markdown("**Actions:**")
+                    
+                    # Role management
+                    if role == "user":
+                        if st.button("👑 Make Admin", key=f"admin_{username}", use_container_width=True):
+                            users[username]["role"] = "admin"
+                            users[username]["admin_request"] = False
+                            save_users(users)
+                            st.success(f"✓ {username} is now admin")
+                            st.rerun()
+                    else:
+                        if st.button("👤 Make User", key=f"user_{username}", use_container_width=True):
+                            users[username]["role"] = "user"
+                            save_users(users)
+                            st.success(f"✓ {username} is now user")
+                            st.rerun()
+                    
+                    # Clear admin requests
+                    if admin_req:
+                        if st.button("❌ Clear Request", key=f"clear_{username}", use_container_width=True):
+                            users[username]["admin_request"] = False
+                            save_users(users)
+                            st.rerun()
+                
+                # API Access Control Section
+                st.markdown("**⚙️ API Access Control:**")
+                
+                col_api1, col_api2, col_api3 = st.columns(3)
+                
+                with col_api1:
+                    openai_access = st.checkbox(
+                        "🤖 Allow OpenAI Access",
+                        value=api_perms.get("openai", False),
+                        key=f"openai_{username}"
+                    )
+                    if openai_access != api_perms.get("openai", False):
+                        set_user_api_permission(username, "openai", openai_access)
+                        st.success("✓ OpenAI access updated")
+                        st.rerun()
+                
+                with col_api2:
+                    google_access = st.checkbox(
+                        "🔍 Allow Google PageSpeed",
+                        value=api_perms.get("google", False),
+                        key=f"google_{username}"
+                    )
+                    if google_access != api_perms.get("google", False):
+                        set_user_api_permission(username, "google", google_access)
+                        st.success("✓ Google access updated")
+                        st.rerun()
+                
+                with col_api3:
+                    slack_access = st.checkbox(
+                        "📱 Allow Slack Notifications",
+                        value=api_perms.get("slack", False),
+                        key=f"slack_{username}"
+                    )
+                    if slack_access != api_perms.get("slack", False):
+                        set_user_api_permission(username, "slack", slack_access)
+                        st.success("✓ Slack access updated")
+                        st.rerun()
+                
+                st.divider()
     
     with admin_tab2:
         st.markdown("### Analytics Dashboard")
