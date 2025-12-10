@@ -62,8 +62,7 @@ COLORS = {
     "primary": "#0066CC",
     "neutral": "#666666"
 }
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-        
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Initialize database
 DB_AVAILABLE = False
@@ -2227,10 +2226,10 @@ def show_single_audit():
                     st.session_state.OPENAI_API_KEY,
                     st.session_state.GOOGLE_API_KEY,
                     error_message="Audit failed"
-                
-                                progress_bar.progress(100)
-                                status_text.text("✅ Audit complete!")
                 )
+                
+                progress_bar.progress(100)
+                status_text.text("✅ Audit complete!")
                 
                 if not success or "error" in data:
                     error_msg = data.get('error', 'Unknown error during audit')
