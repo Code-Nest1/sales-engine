@@ -1320,8 +1320,8 @@ def get_user_api_keys(username: str) -> dict:
             return {"openai": "", "google": "", "slack": ""}
         
         api_keys = user.api_keys or {}
-        # Decrypt keys when retrieving
-        decrypted = {}
+        # Decrypt keys when retrieving - always return all three keys
+        decrypted = {"openai": "", "google": "", "slack": ""}
         for key_name, encrypted_value in api_keys.items():
             try:
                 decrypted[key_name] = decrypt_key(encrypted_value)
@@ -1354,6 +1354,10 @@ def save_user_api_key(username: str, key_name: str, key_value: str):
         user.api_keys[key_name] = encrypt_key(key_value)
         user.api_keys_updated_at = datetime.utcnow()
         
+        # Force SQLAlchemy to detect the change in JSON column
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(user, "api_keys")
+        
         db.commit()
         db.close()
         return True
@@ -1379,6 +1383,11 @@ def delete_user_api_key(username: str, key_name: str):
         if user.api_keys and key_name in user.api_keys:
             del user.api_keys[key_name]
             user.api_keys_updated_at = datetime.utcnow()
+            
+            # Force SQLAlchemy to detect the change in JSON column
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(user, "api_keys")
+            
             db.commit()
             db.close()
             return True
