@@ -1390,6 +1390,10 @@ def show_auth_page():
                         st.session_state["current_user"] = username
                         st.session_state["is_admin"] = user_role == "admin"
                         st.session_state["user_role"] = user_role
+                        
+                        # Reload API keys from user account after login
+                        reload_user_api_keys()
+                        
                         st.success(f"Welcome, {users[username].get('name') or username}!")
                         time.sleep(1)
                         st.rerun()
@@ -1413,6 +1417,10 @@ def show_auth_page():
                     st.session_state["is_admin"] = user_role == "admin"
                     st.session_state["user_role"] = user_role
                     st.session_state["2fa_pending"] = False
+                    
+                    # Reload API keys from user account after login
+                    reload_user_api_keys()
+                    
                     st.success("2FA verified!")
                     time.sleep(1)
                     st.rerun()
@@ -1508,6 +1516,9 @@ if 'session_token' in query_params:
             st.session_state['user_role'] = session_info['role']
             st.session_state['2fa_pending'] = False
             st.session_state['2fa_username'] = None
+            
+            # Reload API keys from user account after session restore
+            reload_user_api_keys()
     except Exception as e:
         pass  # Session token invalid or expired, continue to login page
 
@@ -1525,6 +1536,22 @@ if 'current_section' not in st.session_state:
     st.session_state.current_section = 'Single Audit'
 
 # Store API keys in session state (from session or temporary input)
+# This function reloads API keys from user account after login
+def reload_user_api_keys():
+    """Reload API keys from user account (call after login)."""
+    if st.session_state.get("current_user"):
+        user_keys = get_user_api_keys(st.session_state.get("current_user"))
+        
+        # Check environment variables first (highest priority)
+        env_openai = os.environ.get("OPENAI_API_KEY")
+        env_google = os.environ.get("GOOGLE_API_KEY")
+        env_slack = os.environ.get("SLACK_WEBHOOK")
+        
+        # Set from env or user account
+        st.session_state.OPENAI_API_KEY = env_openai or user_keys.get("openai", "")
+        st.session_state.GOOGLE_API_KEY = env_google or user_keys.get("google", "")
+        st.session_state.SLACK_WEBHOOK = env_slack or user_keys.get("slack", "")
+
 if 'OPENAI_API_KEY' not in st.session_state:
     # Try environment variable first, then user's saved key
     env_key = os.environ.get("OPENAI_API_KEY")
