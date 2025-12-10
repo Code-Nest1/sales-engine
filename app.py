@@ -1309,10 +1309,17 @@ def decrypt_key(encrypted_key: str) -> str:
         return ""
 
 def get_user_api_keys(username: str) -> dict:
-    """Get API keys for a user."""
-    users = load_users()
-    if username in users:
-        api_keys = users[username].get("api_keys", {})
+    """Get API keys for a user from database."""
+    try:
+        db = get_db()
+        if not db:
+            return {"openai": "", "google": "", "slack": ""}
+        
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            return {"openai": "", "google": "", "slack": ""}
+        
+        api_keys = user.api_keys or {}
         # Decrypt keys when retrieving
         decrypted = {}
         for key_name, encrypted_value in api_keys.items():
@@ -1320,35 +1327,126 @@ def get_user_api_keys(username: str) -> dict:
                 decrypted[key_name] = decrypt_key(encrypted_value)
             except:
                 decrypted[key_name] = ""
+        
+        db.close()
         return decrypted
-    return {"openai": "", "google": "", "slack": ""}
+    except Exception as e:
+        logger = logging.getLogger("sales_engine")
+        logger.error(f"Error loading API keys for {username}: {str(e)}")
+        return {"openai": "", "google": "", "slack": ""}
 
 def save_user_api_key(username: str, key_name: str, key_value: str):
-    """Save API key for a user (encrypted)."""
-    users = load_users()
-    if username not in users:
+    """Save API key for a user to database (encrypted)."""
+    try:
+        db = get_db()
+        if not db:
+            return False
+        
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            db.close()
+            return False
+        
+        if not user.api_keys:
+            user.api_keys = {}
+        
+        # Encrypt key before saving
+        user.api_keys[key_name] = encrypt_key(key_value)
+        user.api_keys_updated_at = datetime.utcnow()
+        
+        db.commit()
+        db.close()
+        return True
+    except Exception as e:
+        logger = logging.getLogger("sales_engine")
+        logger.error(f"Error saving API key for {username}: {str(e)}")
+        if db:
+            db.close()
         return False
-    
-    if "api_keys" not in users[username]:
-        users[username]["api_keys"] = {}
-    
-    # Encrypt key before saving
-    users[username]["api_keys"][key_name] = encrypt_key(key_value)
-    users[username]["api_keys_updated"] = datetime.now().isoformat()
-    save_users(users)
-    return True
 
 def delete_user_api_key(username: str, key_name: str):
-    """Delete API key for a user."""
-    users = load_users()
-    if username not in users:
+    """Delete API key for a user from database."""
+    try:
+        db = get_db()
+        if not db:
+            return False
+        
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            db.close()
+            return False
+        
+        if user.api_keys and key_name in user.api_keys:
+            del user.api_keys[key_name]
+            user.api_keys_updated_at = datetime.utcnow()
+            db.commit()
+            db.close()
+            return True
+        
+        db.close()
         return False
-    
-    if "api_keys" in users[username] and key_name in users[username]["api_keys"]:
-        del users[username]["api_keys"][key_name]
-        save_users(users)
+    except Exception as e:
+        logger = logging.getLogger("sales_engine")
+        logger.error(f"Error deleting API key for {username}: {str(e)}")
+        if db:
+            db.close()
+        return False
+
+def migrate_api_keys_from_json_to_db():
+    """Migrate API keys from users.json to database (one-time migration)."""
+    logger = logging.getLogger("sales_engine")
+    try:
+        users_json = load_users()
+        db = get_db()
+        if not db:
+            return
+        
+        for username, user_data in users_json.items():
+            if "api_keys" in user_data and user_data["api_keys"]:
+                # Find or create user in database
+                db_user = db.query(User).filter(User.username == username).first()
+                if db_user:
+                    # Only migrate if database user doesn't have keys yet
+                    if not db_user.api_keys:
+                        db_user.api_keys = user_data["api_keys"]
+                        db_user.api_keys_updated_at = datetime.utcnow()
+                        db.commit()
+                        logger.info(f"Migrated API keys for user: {username}")
+        
+        db.close()
+    except Exception as e:
+        logger.error(f"Error during API key migration: {str(e)}")
+
+def ensure_user_in_database(username: str, password_hash: str, is_admin: bool = False):
+    """Ensure a user exists in the database (called during login for JSON-only users)."""
+    logger = logging.getLogger("sales_engine")
+    try:
+        db = get_db()
+        if not db:
+            return False
+        
+        # Check if user already exists in database
+        existing_user = db.query(User).filter(User.username == username).first()
+        if existing_user:
+            db.close()
+            return True
+        
+        # Create new user in database
+        new_user = User(
+            username=username,
+            password_hash=password_hash,
+            is_admin=is_admin
+        )
+        db.add(new_user)
+        db.commit()
+        db.close()
+        logger.info(f"Synced JSON user to database: {username}")
         return True
-    return False
+    except Exception as e:
+        logger.error(f"Error syncing user {username} to database: {str(e)}")
+        if db:
+            db.close()
+        return False
 
 def load_2fa_secrets():
     """Load 2FA secrets."""
@@ -1387,7 +1485,7 @@ def verify_2fa_token(secret: str, token: str) -> bool:
         return False
 
 def reload_user_api_keys():
-    """Reload API keys from user account (call after login)."""
+    """Reload API keys from database (called after login or session restore)."""
     if st.session_state.get("current_user"):
         user_keys = get_user_api_keys(st.session_state.get("current_user"))
         
@@ -1396,7 +1494,7 @@ def reload_user_api_keys():
         env_google = os.environ.get("GOOGLE_API_KEY")
         env_slack = os.environ.get("SLACK_WEBHOOK")
         
-        # Set from env or user account
+        # Set from env or user account (env overrides user keys)
         st.session_state.OPENAI_API_KEY = env_openai or user_keys.get("openai", "")
         st.session_state.GOOGLE_API_KEY = env_google or user_keys.get("google", "")
         st.session_state.SLACK_WEBHOOK = env_slack or user_keys.get("slack", "")
@@ -1444,6 +1542,10 @@ def show_auth_page():
                     # Successful login - clear attempts
                     clear_login_attempts(username)
                     
+                    # Ensure user exists in database (for users who only exist in JSON)
+                    user_role = users[username].get("role", "user")
+                    ensure_user_in_database(username, users[username]["password_hash"], is_admin=(user_role == "admin"))
+                    
                     # Check if 2FA is enabled
                     secrets_2fa = load_2fa_secrets()
                     if username in secrets_2fa and secrets_2fa[username].get("enabled"):
@@ -1452,7 +1554,6 @@ def show_auth_page():
                         st.rerun()
                     else:
                         # Create persistent session
-                        user_role = users[username].get("role", "user")
                         session_token = create_session(username, user_role)
                         st.experimental_set_query_params(session_token=session_token)
                         st.session_state["authenticated"] = True
@@ -1479,6 +1580,10 @@ def show_auth_page():
                     # Create persistent session
                     username_2fa = st.session_state["2fa_username"]
                     user_role = users[username_2fa].get("role", "user")
+                    
+                    # Ensure user exists in database (for users who only exist in JSON)
+                    ensure_user_in_database(username_2fa, users[username_2fa]["password_hash"], is_admin=(user_role == "admin"))
+                    
                     session_token = create_session(username_2fa, user_role)
                     st.experimental_set_query_params(session_token=session_token)
                     st.session_state["authenticated"] = True
@@ -1545,6 +1650,24 @@ def show_auth_page():
                                 "last_login": None
                             }
                             save_users(users)
+                            
+                            # Also create user in database
+                            if DB_AVAILABLE:
+                                try:
+                                    db = get_db()
+                                    if db:
+                                        new_user = User(
+                                            username=username_clean,
+                                            password_hash=hash_password(password),
+                                            is_admin=(request_admin and "admin" in reason_clean.lower())
+                                        )
+                                        db.add(new_user)
+                                        db.commit()
+                                        db.close()
+                                        logger.info(f"New database user created: {username_clean}")
+                                except Exception as e:
+                                    logger.error(f"Error creating database user for {username_clean}: {str(e)}")
+                            
                             logger.info(f"New account created: {username_clean}")
                             st.success("✅ Account created! Please login.")
                             time.sleep(1)
@@ -1552,7 +1675,6 @@ def show_auth_page():
                         except Exception as e:
                             logger.error(f"Error creating account for {username_clean}: {str(e)}", exc_info=True)
                             st.error("❌ Failed to create account. Please try again.")
-
 # Initialize auth
 init_users_file()
 init_2fa_file()
@@ -1561,6 +1683,11 @@ init_login_attempts_file()
 
 # Initialize encryption key (will be created if not exists)
 get_encryption_key()
+
+# Migrate API keys from JSON to database (one-time operation)
+if not st.session_state.get("_api_keys_migrated"):
+    migrate_api_keys_from_json_to_db()
+    st.session_state["_api_keys_migrated"] = True
 
 # Initialize authentication state first
 if 'authenticated' not in st.session_state:
@@ -1605,40 +1732,31 @@ if 'current_section' not in st.session_state:
     st.session_state.current_section = 'Single Audit'
 
 # Store API keys in session state (from session or temporary input)
+# IMPORTANT: Always reload from database if user is logged in to ensure fresh data
 
-if 'OPENAI_API_KEY' not in st.session_state:
-    # Try environment variable first, then user's saved key
-    env_key = os.environ.get("OPENAI_API_KEY")
-    if env_key:
-        st.session_state.OPENAI_API_KEY = env_key
-    elif st.session_state.get("current_user"):
-        # Load from user's saved keys if logged in
-        user_keys = get_user_api_keys(st.session_state.get("current_user"))
-        st.session_state.OPENAI_API_KEY = user_keys.get("openai", "")
-    else:
-        st.session_state.OPENAI_API_KEY = ""
-
-if 'GOOGLE_API_KEY' not in st.session_state:
-    env_key = os.environ.get("GOOGLE_API_KEY")
-    if env_key:
-        st.session_state.GOOGLE_API_KEY = env_key
-    elif st.session_state.get("current_user"):
-        # Load from user's saved keys if logged in
-        user_keys = get_user_api_keys(st.session_state.get("current_user"))
-        st.session_state.GOOGLE_API_KEY = user_keys.get("google", "")
-    else:
-        st.session_state.GOOGLE_API_KEY = ""
-
-if 'SLACK_WEBHOOK' not in st.session_state:
-    env_key = os.environ.get("SLACK_WEBHOOK")
-    if env_key:
-        st.session_state.SLACK_WEBHOOK = env_key
-    elif st.session_state.get("current_user"):
-        # Load from user's saved keys if logged in
-        user_keys = get_user_api_keys(st.session_state.get("current_user"))
-        st.session_state.SLACK_WEBHOOK = user_keys.get("slack", "")
-    else:
-        st.session_state.SLACK_WEBHOOK = ""
+if st.session_state.get("current_user"):
+    # User is logged in - always reload from database to ensure we have latest keys
+    user_keys = get_user_api_keys(st.session_state.get("current_user"))
+    
+    # Check environment variables first (highest priority)
+    env_openai = os.environ.get("OPENAI_API_KEY")
+    env_google = os.environ.get("GOOGLE_API_KEY")
+    env_slack = os.environ.get("SLACK_WEBHOOK")
+    
+    # Set from env or user account (env overrides user keys)
+    st.session_state.OPENAI_API_KEY = env_openai or user_keys.get("openai", "")
+    st.session_state.GOOGLE_API_KEY = env_google or user_keys.get("google", "")
+    st.session_state.SLACK_WEBHOOK = env_slack or user_keys.get("slack", "")
+else:
+    # User is not logged in - initialize from environment variables only
+    if 'OPENAI_API_KEY' not in st.session_state:
+        st.session_state.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+    
+    if 'GOOGLE_API_KEY' not in st.session_state:
+        st.session_state.GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+    
+    if 'SLACK_WEBHOOK' not in st.session_state:
+        st.session_state.SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "")
 
 # Get current API keys from session
 OPENAI_API_KEY = st.session_state.OPENAI_API_KEY

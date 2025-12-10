@@ -111,6 +111,9 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=True)
     password_hash = Column(String(255), nullable=False)
     is_admin = Column(Boolean, default=False)
+    # API Keys stored in encrypted format
+    api_keys = Column(JSON, default=dict)  # {"openai": "encrypted_key", "google": "...", "slack": "..."}
+    api_keys_updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 def init_db():
@@ -119,8 +122,36 @@ def init_db():
         Base.metadata.create_all(bind=engine)
         # Migrate existing tables to add missing columns
         migrate_leads_table()
+        migrate_users_table()
         return True
     return False
+
+def migrate_users_table():
+    """Add api_keys and api_keys_updated_at columns to users table if they don't exist."""
+    if not engine:
+        return
+    
+    inspector = __import__('sqlalchemy').inspect(engine)
+    if 'users' not in inspector.get_table_names():
+        return
+    
+    users_columns = [c['name'] for c in inspector.get_columns('users')]
+    
+    # Add api_keys column if it doesn't exist
+    with engine.connect() as conn:
+        if 'api_keys' not in users_columns:
+            try:
+                conn.execute(__import__('sqlalchemy').text('ALTER TABLE users ADD COLUMN api_keys JSON DEFAULT "{}"'))
+                conn.commit()
+            except Exception:
+                pass
+        
+        if 'api_keys_updated_at' not in users_columns:
+            try:
+                conn.execute(__import__('sqlalchemy').text('ALTER TABLE users ADD COLUMN api_keys_updated_at DATETIME'))
+                conn.commit()
+            except Exception:
+                pass
 
 def migrate_leads_table():
     """Add missing columns to leads table if they don't exist."""
