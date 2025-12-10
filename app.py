@@ -62,6 +62,8 @@ COLORS = {
     "primary": "#0066CC",
     "neutral": "#666666"
 }
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+        
 
 # Initialize database
 DB_AVAILABLE = False
@@ -2212,13 +2214,22 @@ def show_single_audit():
         else:
             logger.info(f"Starting audit for URL: {url_sanitized}")
             
-            with st.spinner("🔄 Analyzing website..."):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            status_text.text("⚡ Starting audit...")
+            progress_bar.progress(10)
+            
+            with st.spinner("🔍 Analyzing website (typically 10-25 seconds)..."):
                 success, data = safe_execute(
                     run_audit,
                     url_sanitized,
                     st.session_state.OPENAI_API_KEY,
                     st.session_state.GOOGLE_API_KEY,
                     error_message="Audit failed"
+                
+                                progress_bar.progress(100)
+                                status_text.text("✅ Audit complete!")
                 )
                 
                 if not success or "error" in data:
@@ -3660,7 +3671,7 @@ def get_google_speed(url, api_key):
     
     api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile&key={api_key}"
     try:
-        r = requests.get(api_url, timeout=60)
+        r = requests.get(api_url, timeout=15)  # Reduced from 60s to 15s for faster audits
         if r.status_code == 200:
             data = r.json()
             try:
@@ -4205,8 +4216,10 @@ def run_audit(url, openai_key, google_key):
         html = response.text.lower()
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Basic info
-        data['domain_age'] = get_domain_age(url)[0]
+        # Start domain age lookup in background (slow WHOIS operation)
+        executor = ThreadPoolExecutor(max_workers=1)
+        domain_age_future = executor.submit(get_domain_age, url)
+        
         data['emails'] = list(set(re.findall(r"[a-z0-9\.\-+_]+@[a-z0-9\.\-+_]+\.[a-z]+", html)))
 
         # Tech detection
@@ -4305,11 +4318,11 @@ def run_audit(url, openai_key, google_key):
         # NEW: Broken links check (sample)
         links = soup.find_all('a', href=True)
         broken_count = 0
-        for link in links[:10]:  # Check first 10 links
+        for link in links[:5]:  # Check first 5 links (reduced for speed)
             try:
                 href = link['href']
                 if href.startswith('http'):
-                    r = requests.head(href, timeout=5)
+                    r = requests.head(href, timeout=2)  # Reduced from 5s to 2s
                     if r.status_code >= 400:
                         broken_count += 1
             except Exception:
@@ -4324,8 +4337,20 @@ def run_audit(url, openai_key, google_key):
                 "solution": "Link Audit & Fix"
             })
 
-        # Performance
-        psi_score, psi_msg = get_google_speed(url, google_key)
+        # Get domain age result from background thread
+        try:
+            data['domain_age'] = domain_age_future.result(timeout=3)[0]
+        except Exception:
+            data['domain_age'] = "Unknown"
+        finally:
+            executor.shutdown(wait=False)
+        
+        # Performance (PageSpeed API - can be slow)
+        try:
+            psi_score, psi_msg = get_google_speed(url, google_key)
+        except Exception as e:
+            psi_score, psi_msg = None, f"API Error: {str(e)}"
+        
         if psi_score:
             data['psi'] = psi_score
             if psi_score < 50:
@@ -4355,8 +4380,20 @@ def run_audit(url, openai_key, google_key):
                 "solution": "Responsive Design"
             })
 
-        # AI consultation
-        data['ai'] = get_ai_consultation(url, data, openai_key)
+        # AI consultation (with timeout to prevent hanging)
+        ai_executor = ThreadPoolExecutor(max_workers=1)
+        ai_future = ai_executor.submit(get_ai_consultation, url, data, openai_key)
+        try:
+            data['ai'] = ai_future.result(timeout=12)  # 12s timeout for AI
+        except Exception as e:
+            data['ai'] = {
+                "summary": "AI analysis timed out or failed",
+                "impact": "Manual review recommended",
+                "solutions": "Contact support if issue persists",
+                "email": f"Error: {str(e)}"
+            }
+        finally:
+            ai_executor.shutdown(wait=False)
 
     except Exception as e:
         data['error'] = str(e)
