@@ -16,6 +16,9 @@ import hashlib
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import smtplib
 from io import BytesIO
 from cryptography.fernet import Fernet
 import logging
@@ -371,6 +374,105 @@ def send_email(recipient_email, subject, html_body):
     except Exception as e:
         logger.error(f"Error sending email: {str(e)}")
         return False, f"Error: {str(e)}"
+
+def send_email_with_pdf(to_email: str, subject: str, body: str, pdf_bytes: bytes, filename: str = "audit_report.pdf") -> tuple[bool, str]:
+    """
+    Send email with PDF attachment using SMTP configuration.
+    
+    Args:
+        to_email: Recipient email address
+        subject: Email subject line
+        body: Plain text email body
+        pdf_bytes: PDF file as bytes
+        filename: Name for the PDF attachment
+    
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    try:
+        config = load_email_config()
+        
+        # Validate configuration
+        if not config.get("enabled"):
+            return False, "Email notifications are disabled. Go to API Settings to enable."
+        
+        if not config.get("smtp_server") or not config.get("sender_email") or not config.get("sender_password"):
+            return False, "SMTP not configured. Go to API Settings to configure SMTP first."
+        
+        # Validate recipient email
+        is_valid, error_msg = validate_email(to_email)
+        if not is_valid:
+            return False, f"Invalid recipient email: {error_msg}"
+        
+        # Create message
+        msg = MIMEMultipart()
+        msg["Subject"] = subject
+        msg["From"] = f"{config.get('from_name', 'Code Nest')} <{config['sender_email']}>"
+        msg["To"] = to_email
+        if config.get("reply_to"):
+            msg["Reply-To"] = config["reply_to"]
+        
+        # Attach body as plain text
+        msg.attach(MIMEText(body, "plain"))
+        
+        # Attach PDF
+        if pdf_bytes:
+            pdf_attachment = MIMEBase("application", "pdf")
+            pdf_attachment.set_payload(pdf_bytes)
+            encoders.encode_base64(pdf_attachment)
+            pdf_attachment.add_header(
+                "Content-Disposition",
+                f"attachment; filename={filename}"
+            )
+            msg.attach(pdf_attachment)
+        
+        # Connect and send
+        smtp_port = config.get("smtp_port", 587)
+        smtp_server = config["smtp_server"]
+        
+        if smtp_port == 465:
+            # SSL connection
+            server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
+        else:
+            # TLS connection (port 587)
+            server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
+            server.starttls()
+        
+        server.login(config["sender_email"], config["sender_password"])
+        server.sendmail(config["sender_email"], to_email, msg.as_string())
+        server.quit()
+        
+        # Log the notification
+        log_notification(to_email, subject, "sent_with_pdf")
+        logger.info(f"Email with PDF sent to {to_email}: {subject}")
+        
+        return True, f"Email sent successfully to {to_email}"
+        
+    except smtplib.SMTPAuthenticationError:
+        logger.error("SMTP authentication failed")
+        return False, "Authentication failed - check your SMTP credentials in API Settings"
+    except smtplib.SMTPConnectError:
+        logger.error("SMTP connection failed")
+        return False, "Could not connect to SMTP server - check host and port in API Settings"
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error: {str(e)}")
+        return False, f"Email service error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Error sending email with PDF: {str(e)}")
+        return False, f"Error: {str(e)}"
+
+def is_smtp_configured() -> bool:
+    """Check if SMTP is properly configured."""
+    try:
+        config = load_email_config()
+        return bool(
+            config.get("enabled") and 
+            config.get("smtp_server") and 
+            config.get("sender_email") and 
+            config.get("sender_password")
+        )
+    except Exception:
+        return False
 
 def log_notification(recipient, subject, status):
     """Log sent notifications."""
@@ -2185,6 +2287,179 @@ def show_api_settings():
     if username in users and "api_keys_updated" in users[username]:
         last_updated = users[username]["api_keys_updated"]
         st.caption(f"Last updated: {last_updated}")
+    
+    # =========================================================================
+    # SMTP CONFIGURATION FOR EMAIL OUTREACH
+    # =========================================================================
+    st.markdown("---")
+    st.markdown("## 📧 SMTP Email Configuration")
+    st.markdown("Configure your Hostinger SMTP settings to send audit reports and cold emails directly from the app.")
+    
+    # Load current SMTP config
+    smtp_config = load_email_config()
+    
+    # Status indicator
+    if is_smtp_configured():
+        st.success("✅ SMTP is configured and ready to send emails")
+    else:
+        st.warning("⚠️ SMTP not fully configured. Fill in all fields below to enable email sending.")
+    
+    with st.expander("📋 Hostinger SMTP Setup Guide", expanded=False):
+        st.markdown("""
+        ### Quick Setup for Hostinger Email
+        
+        **SMTP Configuration for Hostinger:**
+        - **SMTP Server:** `smtp.hostinger.com`
+        - **SMTP Port:** `465` (SSL) or `587` (TLS)
+        - **Username:** Your full Hostinger email address
+        - **Password:** Your Hostinger email password
+        
+        **Steps:**
+        1. Log in to Hostinger Control Panel
+        2. Go to **Email** → Your email account
+        3. Copy the email address and password
+        4. Fill in the form below
+        """)
+    
+    with st.form("smtp_config_form"):
+        st.markdown("### SMTP Server Settings")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            smtp_enabled = st.checkbox(
+                "Enable Email Sending",
+                value=smtp_config.get("enabled", True),
+                help="Turn on/off email functionality"
+            )
+        with col2:
+            auto_send = st.checkbox(
+                "Auto-send Reports",
+                value=smtp_config.get("auto_send_reports", False),
+                help="Automatically send reports when emails are found"
+            )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            smtp_host = st.text_input(
+                "SMTP Host",
+                value=smtp_config.get("smtp_server", "smtp.hostinger.com"),
+                placeholder="smtp.hostinger.com",
+                help="Your email provider's SMTP server"
+            )
+        with col2:
+            smtp_port = st.selectbox(
+                "SMTP Port",
+                options=[465, 587, 25],
+                index=0 if smtp_config.get("smtp_port", 465) == 465 else (1 if smtp_config.get("smtp_port") == 587 else 2),
+                help="465 for SSL, 587 for TLS"
+            )
+        
+        st.markdown("### Authentication")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            smtp_username = st.text_input(
+                "SMTP Username (Email)",
+                value=smtp_config.get("sender_email", ""),
+                placeholder="contact@yourdomain.com",
+                help="Your full email address for login"
+            )
+        with col2:
+            smtp_password = st.text_input(
+                "SMTP Password",
+                value=smtp_config.get("sender_password", ""),
+                type="password",
+                placeholder="Your email password",
+                help="Password for SMTP authentication"
+            )
+        
+        st.markdown("### Display Settings")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            from_name = st.text_input(
+                "From Name",
+                value=smtp_config.get("from_name", "Code Nest"),
+                placeholder="Code Nest",
+                help="Name that appears in emails"
+            )
+        with col2:
+            reply_to = st.text_input(
+                "Reply-To Email",
+                value=smtp_config.get("reply_to", smtp_config.get("sender_email", "")),
+                placeholder="contact@yourdomain.com",
+                help="Email address for replies"
+            )
+        
+        st.markdown("---")
+        col1, col2, col3 = st.columns([2, 2, 1])
+        
+        with col1:
+            save_smtp = st.form_submit_button("💾 Save SMTP Settings", type="primary", use_container_width=True)
+        
+        with col2:
+            test_email_addr = st.text_input(
+                "Test Email Address",
+                placeholder="test@example.com",
+                help="Enter an email to send a test",
+                label_visibility="collapsed"
+            )
+        
+        with col3:
+            send_test = st.form_submit_button("📧 Test", use_container_width=True)
+        
+        if save_smtp:
+            new_smtp_config = {
+                "enabled": smtp_enabled,
+                "smtp_server": smtp_host,
+                "smtp_port": smtp_port,
+                "sender_email": smtp_username,
+                "sender_password": smtp_password,
+                "from_name": from_name,
+                "reply_to": reply_to or smtp_username,
+                "auto_send_reports": auto_send,
+                "notifications": smtp_config.get("notifications", {
+                    "audit_complete": True,
+                    "report_sent": True,
+                    "permission_change": True,
+                    "admin_alert": True
+                })
+            }
+            success, message = save_email_config(new_smtp_config)
+            if success:
+                st.success("✅ SMTP settings saved successfully!")
+                st.rerun()
+            else:
+                st.error(f"❌ Failed to save: {message}")
+        
+        if send_test and test_email_addr:
+            if not smtp_username or not smtp_password:
+                st.error("Please fill in SMTP username and password first")
+            else:
+                # Temporarily save config for testing
+                test_config = {
+                    "enabled": True,
+                    "smtp_server": smtp_host,
+                    "smtp_port": smtp_port,
+                    "sender_email": smtp_username,
+                    "sender_password": smtp_password,
+                    "from_name": from_name,
+                    "reply_to": reply_to or smtp_username,
+                }
+                save_email_config(test_config)
+                
+                # Send test email
+                success, message = send_email_with_pdf(
+                    test_email_addr,
+                    "Test Email from Code Nest Sales Engine",
+                    "This is a test email to verify your SMTP configuration is working correctly.\n\nIf you received this, your email settings are configured properly!\n\n- Code Nest Team",
+                    None,  # No PDF attachment for test
+                    ""
+                )
+                if success:
+                    st.success(f"✅ Test email sent to {test_email_addr}!")
+                else:
+                    st.error(f"❌ Test failed: {message}")
 
 def show_single_audit():
     """Single website audit page."""
@@ -2299,50 +2574,167 @@ def show_single_audit():
             st.markdown("---")
             st.markdown("### 🤖 AI Analysis")
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Summary**")
-                st.info(data['ai'].get('summary', 'No summary available'))
-                st.markdown("**Impact**")
-                st.warning(data['ai'].get('impact', 'No impact assessment available'))
+            # Check if we have structured insights
+            insights = data['ai'].get('insights')
             
-            with col2:
-                st.markdown("**Solutions**")
-                st.success(data['ai'].get('solutions', 'No solutions available'))
+            if insights:
+                # Display structured AI insights
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Snapshot Summary
+                    st.markdown("**📸 Snapshot Summary**")
+                    for bullet in insights.get('snapshot_summary', []):
+                        st.markdown(f"• {bullet}")
+                    
+                    # Top 3 Issues
+                    st.markdown("**🚨 Top 3 Issues Hurting You Most**")
+                    for item in insights.get('top_3_issues', []):
+                        st.markdown(f"**{item.get('issue', '')}**")
+                        st.caption(f"↳ {item.get('impact', '')}")
+                
+                with col2:
+                    # Quick Wins
+                    st.markdown("**⚡ Quick Wins (Next 30 Days)**")
+                    for idx, win in enumerate(insights.get('quick_wins', []), 1):
+                        st.markdown(f"{idx}. {win}")
+                    
+                    # Code Nest Services
+                    st.markdown("**🛠️ How Code Nest Can Help**")
+                    for item in insights.get('code_nest_services', []):
+                        st.markdown(f"• **{item.get('issue', '')}** → {item.get('service', '')}")
+                
+                # Suggested Next Step
+                if insights.get('next_step'):
+                    st.info(f"**📞 Next Step:** {insights['next_step']}")
+            else:
+                # Fallback to legacy display
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Summary**")
+                    st.info(data['ai'].get('summary', 'No summary available'))
+                    st.markdown("**Impact**")
+                    st.warning(data['ai'].get('impact', 'No impact assessment available'))
+                
+                with col2:
+                    st.markdown("**Solutions**")
+                    st.success(data['ai'].get('solutions', 'No solutions available'))
             
+            # =========================================================================
+            # EMAIL OUTREACH SECTION
+            # =========================================================================
             st.markdown("---")
-            st.markdown("**📧 Cold Email Draft**")
-            st.text_area("", value=clean_text(data['ai']['email']), height=250, key="email_draft")
+            st.markdown("### 📧 Send Email Outreach")
             
-            # Auto-send audit report to contact email
-            st.markdown("---")
-            st.markdown("### 📤 Send Audit Report")
+            # Check SMTP configuration
+            if not is_smtp_configured():
+                st.warning("⚠️ **SMTP not configured.** Go to **API Settings** to configure your Hostinger SMTP settings before sending emails.")
+            else:
+                st.success("✅ SMTP configured and ready")
             
-            # Try to extract email from OpenAI data
-            extracted_email = extract_email_from_data(data)
+            # Get domain for email personalization
+            domain = urlparse(data.get('url', '')).netloc.replace("www.", "")
+            
+            # Pre-fill email from audit data
+            emails_found = data.get('emails', [])
+            default_email = emails_found[0] if emails_found else ""
+            
+            # Email subject - use AI generated or default
+            default_subject = data['ai'].get('email_subject', f"quick idea for {domain}")
+            
+            # Email body - use AI generated cold email
+            default_body = data['ai'].get('email', '')
             
             col1, col2 = st.columns([2, 1])
+            
             with col1:
-                recipient_email = st.text_input(
-                    "Send report to (contact email)",
-                    value=extracted_email or "",
-                    placeholder="contact@website.com",
-                    help="Email will be sent with detailed audit report"
+                to_email = st.text_input(
+                    "📬 To Email",
+                    value=default_email,
+                    placeholder="contact@theirsite.com",
+                    help="Recipient email address - pre-filled if found during audit"
                 )
             
             with col2:
-                if st.button("📧 Send Report", type="secondary", use_container_width=True):
-                    if recipient_email:
-                        with st.spinner("Sending report..."):
-                            success, message = send_audit_report_email(recipient_email, data)
-                            if success:
-                                st.success(f"✅ {message}")
-                                logger.info(f"Audit report sent to {recipient_email}")
-                            else:
-                                st.error(f"❌ {message}")
-                                logger.error(f"Failed to send report to {recipient_email}: {message}")
+                email_subject = st.text_input(
+                    "📝 Subject",
+                    value=default_subject,
+                    placeholder="quick idea for domain.com",
+                    help="Short, cold-email-style subject (3-5 words)"
+                )
+            
+            email_body = st.text_area(
+                "✉️ Email Body",
+                value=default_body,
+                height=200,
+                help="Personalized cold email - edit as needed"
+            )
+            
+            # Attach PDF checkbox
+            attach_pdf = st.checkbox("📎 Attach PDF Audit Report", value=True, help="Include the full audit report as a PDF attachment")
+            
+            col1, col2, col3 = st.columns([2, 1, 1])
+            
+            with col1:
+                send_email_btn = st.button("📤 Send Email", type="primary", use_container_width=True, disabled=not is_smtp_configured())
+            
+            with col2:
+                if st.button("🔄 Regenerate Email", use_container_width=True):
+                    if st.session_state.OPENAI_API_KEY:
+                        with st.spinner("Generating new email..."):
+                            new_ai = get_ai_consultation(data['url'], data, st.session_state.OPENAI_API_KEY)
+                            data['ai'] = new_ai
+                            st.session_state.current_audit_data = data
+                            st.rerun()
                     else:
-                        st.warning("⚠️ Please enter a recipient email address")
+                        st.error("OpenAI API key required")
+            
+            with col3:
+                st.download_button(
+                    "📋 Copy Email",
+                    f"Subject: {email_subject}\n\n{email_body}",
+                    file_name="cold_email.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+            
+            if send_email_btn:
+                if not to_email:
+                    st.error("❌ Please enter a recipient email address")
+                elif not email_subject:
+                    st.error("❌ Please enter an email subject")
+                elif not email_body:
+                    st.error("❌ Please enter an email body")
+                else:
+                    with st.spinner("Sending email..."):
+                        # Generate PDF if checkbox is checked
+                        pdf_bytes = None
+                        pdf_filename = ""
+                        
+                        if attach_pdf:
+                            try:
+                                pdf_bytes = generate_pdf(data)
+                                pdf_filename = f"CodeNest_Audit_{domain.replace('.', '_')}.pdf"
+                            except Exception as e:
+                                st.warning(f"Could not generate PDF: {e}")
+                                pdf_bytes = None
+                        
+                        # Send email
+                        success, message = send_email_with_pdf(
+                            to_email=to_email,
+                            subject=email_subject,
+                            body=email_body,
+                            pdf_bytes=pdf_bytes,
+                            filename=pdf_filename
+                        )
+                        
+                        if success:
+                            st.success(f"✅ {message}")
+                            st.balloons()
+                            logger.info(f"Cold email sent to {to_email} for {domain}")
+                        else:
+                            st.error(f"❌ {message}")
+                            logger.error(f"Failed to send email to {to_email}: {message}")
         
         # Save to DB (only if not already saved)
         audit_id = data.get('audit_id')
@@ -3684,46 +4076,153 @@ def get_google_speed(url, api_key):
         return None, str(e)
 
 def get_ai_consultation(url, data, api_key):
-    """Get AI analysis with GPT-5."""
+    """Get AI analysis with structured insights for PDF and email outreach."""
     if not api_key:
         return {
             "summary": "AI Analysis Disabled",
             "impact": "N/A",
             "solutions": "Upgrade to enable AI",
-            "email": "N/A"
+            "email": "N/A",
+            "insights": None
         }
 
-    issues_list = [f"- {i['title']}: {i['impact']}" for i in data['issues']]
-    tech_list = ", ".join(data['tech_stack'])
+    domain = urlparse(url).netloc.replace("www.", "")
+    issues_list = [f"- {i['title']}: {i['impact']}" for i in data.get('issues', [])]
+    tech_list = ", ".join(data.get('tech_stack', []))
+    health_score = data.get('score', 0)
+    psi_score = data.get('psi', 'N/A')
     
-    prompt = f"""You are a Senior Digital Strategist at Code Nest. Analyze this website: {url}
-    
-Tech Stack: {tech_list}
-Issues: {chr(10).join(issues_list)}
+    # Structured insights prompt
+    insights_prompt = f"""You are a Senior Digital Strategist at Code Nest agency. Analyze this website audit data and provide structured insights.
 
-Provide 4 sections separated by ###:
-1. Executive Summary (2 sentences)
-2. Business Impact (financial/brand loss)
-3. 3 Code Nest services to fix
-4. Professional cold email
-"""
+WEBSITE: {url}
+DOMAIN: {domain}
+HEALTH SCORE: {health_score}/100
+PAGESPEED SCORE: {psi_score}
+TECH STACK: {tech_list}
+ISSUES FOUND:
+{chr(10).join(issues_list) if issues_list else "No critical issues detected"}
+
+Respond in EXACTLY this JSON format (no markdown, just valid JSON):
+{{
+    "snapshot_summary": [
+        "bullet 1 (max 15 words)",
+        "bullet 2 (max 15 words)",
+        "bullet 3 (max 15 words)"
+    ],
+    "top_3_issues": [
+        {{"issue": "Issue name", "impact": "One-line business impact"}},
+        {{"issue": "Issue name", "impact": "One-line business impact"}},
+        {{"issue": "Issue name", "impact": "One-line business impact"}}
+    ],
+    "quick_wins": [
+        "Action 1 (achievable in 30 days)",
+        "Action 2",
+        "Action 3",
+        "Action 4 (optional)",
+        "Action 5 (optional)"
+    ],
+    "code_nest_services": [
+        {{"issue": "Problem area", "service": "Our service that solves it"}},
+        {{"issue": "Problem area", "service": "Our service that solves it"}},
+        {{"issue": "Problem area", "service": "Our service that solves it"}}
+    ],
+    "next_step": "1-2 line clear CTA to review audit or schedule a call"
+}}
+
+Be specific, data-driven, and focus on business impact. If health score is above 70, focus on optimization opportunities rather than critical issues."""
+
+    # Cold email prompt (separate for better quality)
+    email_prompt = f"""Write a cold outreach email for {domain} based on this audit:
+
+HEALTH SCORE: {health_score}/100
+TOP ISSUES: {', '.join([i['title'] for i in data.get('issues', [])[:3]]) if data.get('issues') else 'Minor optimizations needed'}
+
+RULES:
+- 75-150 words maximum
+- Lowercase subject line, 3-5 words (e.g., "quick idea for {domain}")
+- Personalized opening that shows you visited their site
+- 2-3 bullets about specific issues/opportunities from the audit
+- Single clear CTA: reply or schedule a 15-min call
+- Sign off as "Code Nest Team"
+- NO fluff, NO generic phrases like "I hope this finds you well"
+
+Format:
+SUBJECT: [subject line]
+---
+[email body]"""
 
     try:
         client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-5",
-            messages=[{"role": "user", "content": prompt}]
+        
+        # Get structured insights
+        insights_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": insights_prompt}],
+            temperature=0.7
         )
-        parts = response.choices[0].message.content.split("###")
+        insights_text = insights_response.choices[0].message.content.strip()
+        
+        # Parse JSON insights
+        try:
+            # Clean up potential markdown code blocks
+            if insights_text.startswith("```"):
+                insights_text = insights_text.split("```")[1]
+                if insights_text.startswith("json"):
+                    insights_text = insights_text[4:]
+            insights = json.loads(insights_text)
+        except json.JSONDecodeError:
+            insights = None
+        
+        # Get cold email
+        email_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": email_prompt}],
+            temperature=0.8
+        )
+        email_parts = email_response.choices[0].message.content.strip().split("---")
+        
+        email_subject = ""
+        email_body = ""
+        if len(email_parts) >= 2:
+            subject_line = email_parts[0].strip()
+            if "SUBJECT:" in subject_line.upper():
+                email_subject = subject_line.split(":", 1)[1].strip()
+            else:
+                email_subject = subject_line
+            email_body = email_parts[1].strip()
+        else:
+            email_body = email_response.choices[0].message.content.strip()
+            email_subject = f"quick idea for {domain}"
+        
+        # Build legacy format for backward compatibility
+        summary = ""
+        impact = ""
+        solutions = ""
+        
+        if insights:
+            summary = " ".join(insights.get("snapshot_summary", []))
+            impact = "; ".join([f"{i['issue']}: {i['impact']}" for i in insights.get("top_3_issues", [])])
+            solutions = "; ".join(insights.get("quick_wins", []))
         
         return {
-            "summary": parts[1].strip() if len(parts) > 1 else "Analysis complete",
-            "impact": parts[2].strip() if len(parts) > 2 else "Impact assessed",
-            "solutions": parts[3].strip() if len(parts) > 3 else "Solutions provided",
-            "email": parts[4].strip() if len(parts) > 4 else "Email template"
+            "summary": summary or "Analysis complete",
+            "impact": impact or "Impact assessed",
+            "solutions": solutions or "Solutions provided",
+            "email": email_body,
+            "email_subject": email_subject,
+            "insights": insights
         }
     except Exception as e:
-        return {"summary": "Error", "impact": "Error", "solutions": "Error", "email": str(e)}
+        logger.error(f"AI consultation error: {str(e)}")
+        return {
+            "summary": "AI analysis encountered an error",
+            "impact": "Manual review recommended",
+            "solutions": "Contact support for assistance",
+            "email": f"Error generating email: {str(e)}",
+            "email_subject": f"quick idea for {domain}",
+            "insights": None
+        }
 
 def calculate_opportunity_score(data):
     """Enhanced lead opportunity scoring (0-100)."""
@@ -4591,7 +5090,7 @@ class PDFReport(FPDF):
         self.ln()
 
 def generate_pdf(data):
-    """Generate enhanced PDF report."""
+    """Generate enhanced PDF report with AI Insights page."""
     pdf = PDFReport()
     pdf.add_page()
 
@@ -4620,11 +5119,6 @@ def generate_pdf(data):
     pdf.cell(0, 6, f"Audit ID: {data.get('audit_id', 'N/A')}", 0, 1)
     pdf.ln(5)
 
-    # Executive summary
-    if data.get('ai'):
-        pdf.section_title("Executive Summary")
-        pdf.chapter_body(data['ai'].get('summary', ''))
-
     # Tech stack
     pdf.section_title("Technology Stack")
     tech = ", ".join(data['tech_stack']) if data['tech_stack'] else "Standard"
@@ -4644,11 +5138,101 @@ def generate_pdf(data):
     else:
         pdf.chapter_body("No critical issues detected.")
 
-    # AI email
-    if data.get('ai'):
-        pdf.section_title("Recommended Outreach")
-        pdf.set_font('Courier', '', 9)
-        pdf.multi_cell(0, 4, clean_text(data['ai'].get('email', '')))
+    # =========================================================================
+    # AI INSIGHTS PAGE
+    # =========================================================================
+    if data.get('ai') and data['ai'].get('insights'):
+        pdf.add_page()
+        
+        # AI Insights header
+        pdf.set_font('Arial', 'B', 18)
+        pdf.set_text_color(0, 102, 204)
+        pdf.cell(0, 12, "AI-Powered Insights", 0, 1, 'C')
+        pdf.set_draw_color(0, 102, 204)
+        pdf.line(60, pdf.get_y(), 150, pdf.get_y())
+        pdf.ln(8)
+        
+        insights = data['ai']['insights']
+        
+        # Snapshot Summary
+        if insights.get('snapshot_summary'):
+            pdf.set_font('Arial', 'B', 12)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(0, 8, "Snapshot Summary", 0, 1)
+            pdf.set_font('Arial', '', 10)
+            pdf.set_text_color(50, 50, 50)
+            for bullet in insights['snapshot_summary']:
+                pdf.cell(5, 5, chr(149), 0, 0)  # Bullet point
+                pdf.multi_cell(0, 5, f" {clean_text(bullet)}")
+            pdf.ln(4)
+        
+        # Top 3 Issues
+        if insights.get('top_3_issues'):
+            pdf.set_font('Arial', 'B', 12)
+            pdf.set_text_color(180, 0, 0)
+            pdf.cell(0, 8, "Top 3 Issues Hurting You Most", 0, 1)
+            pdf.set_text_color(50, 50, 50)
+            for item in insights['top_3_issues']:
+                pdf.set_font('Arial', 'B', 10)
+                pdf.cell(5, 5, chr(149), 0, 0)
+                pdf.cell(0, 5, f" {clean_text(item.get('issue', ''))}", 0, 1)
+                pdf.set_font('Arial', 'I', 9)
+                pdf.cell(10, 5, "", 0, 0)  # Indent
+                pdf.multi_cell(0, 4, f"Impact: {clean_text(item.get('impact', ''))}")
+            pdf.ln(4)
+        
+        # Quick Wins
+        if insights.get('quick_wins'):
+            pdf.set_font('Arial', 'B', 12)
+            pdf.set_text_color(0, 128, 0)
+            pdf.cell(0, 8, "Quick Wins (Next 30 Days)", 0, 1)
+            pdf.set_font('Arial', '', 10)
+            pdf.set_text_color(50, 50, 50)
+            for idx, win in enumerate(insights['quick_wins'], 1):
+                pdf.cell(0, 5, f"{idx}. {clean_text(win)}", 0, 1)
+            pdf.ln(4)
+        
+        # How Code Nest Can Help
+        if insights.get('code_nest_services'):
+            pdf.set_font('Arial', 'B', 12)
+            pdf.set_text_color(0, 102, 204)
+            pdf.cell(0, 8, "How Code Nest Can Help", 0, 1)
+            pdf.set_text_color(50, 50, 50)
+            for item in insights['code_nest_services']:
+                pdf.set_font('Arial', 'B', 10)
+                pdf.cell(5, 5, chr(149), 0, 0)
+                pdf.cell(0, 5, f" {clean_text(item.get('issue', ''))}", 0, 1)
+                pdf.set_font('Arial', '', 9)
+                pdf.cell(10, 5, "", 0, 0)  # Indent
+                pdf.set_text_color(0, 102, 204)
+                pdf.multi_cell(0, 4, f"-> {clean_text(item.get('service', ''))}")
+                pdf.set_text_color(50, 50, 50)
+            pdf.ln(4)
+        
+        # Suggested Next Step
+        if insights.get('next_step'):
+            pdf.set_font('Arial', 'B', 12)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_fill_color(240, 248, 255)
+            pdf.cell(0, 8, "Suggested Next Step", 0, 1, fill=True)
+            pdf.set_font('Arial', '', 11)
+            pdf.set_text_color(0, 102, 204)
+            pdf.ln(2)
+            pdf.multi_cell(0, 6, clean_text(insights['next_step']))
+            pdf.ln(4)
+    
+    # Legacy AI summary (for backward compatibility)
+    elif data.get('ai') and data['ai'].get('summary'):
+        pdf.section_title("Executive Summary")
+        pdf.chapter_body(data['ai'].get('summary', ''))
+        
+        if data['ai'].get('impact'):
+            pdf.section_title("Business Impact")
+            pdf.chapter_body(data['ai'].get('impact', ''))
+        
+        if data['ai'].get('solutions'):
+            pdf.section_title("Recommended Solutions")
+            pdf.chapter_body(data['ai'].get('solutions', ''))
 
     # Footer
     pdf.ln(10)
