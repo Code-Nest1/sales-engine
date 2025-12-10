@@ -2077,3 +2077,32 @@ def show_admin_settings():
         st.info("Slack Webhook: " + ("✓ Configured" if SLACK_WEBHOOK else "Not configured"))
         st.info("OpenAI API: " + ("✓ Configured" if OPENAI_API_KEY else "Not configured"))
         st.info("Database: " + ("✓ Connected" if DB_AVAILABLE else "Not connected"))
+
+
+# ============================================================================
+# MAIN ROUTING & CONTENT DISPATCHER
+# ============================================================================
+
+# Main content area routing
+current_section = st.session_state.current_section
+
+if current_section == "Single Audit":
+    show_single_audit()
+elif current_section == "Audit History":
+    show_audit_history()
+elif current_section == "Bulk Audit":
+    show_bulk_audit()
+elif current_section == "Competitor Analysis":
+    show_competitor_analysis()
+elif current_section == "Email Outreach":
+    show_email_outreach()
+elif current_section == "Scheduled Audits":
+    show_scheduled_audits()
+elif current_section == "API Settings":
+    show_api_settings()
+elif current_section == "Admin Settings":
+    show_admin_settings()
+else:
+    # Default to Single Audit
+    st.session_state.current_section = "Single Audit"
+    show_single_audit()
