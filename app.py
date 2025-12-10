@@ -2626,6 +2626,9 @@ def show_single_audit():
             st.markdown("---")
             st.markdown("### 📧 Send Email Outreach")
             
+            # Premium format info note
+            st.caption("✨ _This message was generated using Code Nest LLC's premium outreach format, covering Website Optimization, SEO, Social Media Management, PPC, and paid ad strategy._")
+            
             # Check SMTP configuration
             if not is_smtp_configured():
                 st.warning("⚠️ **SMTP not configured.** Go to **API Settings** to configure your Hostinger SMTP settings before sending emails.")
@@ -2639,8 +2642,8 @@ def show_single_audit():
             emails_found = data.get('emails', [])
             default_email = emails_found[0] if emails_found else ""
             
-            # Email subject - use AI generated or default
-            default_subject = data['ai'].get('email_subject', f"quick idea for {domain}")
+            # Email subject - use AI generated or default (ensure lowercase)
+            default_subject = data['ai'].get('email_subject', f"quick note about {domain}").lower()
             
             # Email body - use AI generated cold email
             default_body = data['ai'].get('email', '')
@@ -2659,15 +2662,15 @@ def show_single_audit():
                 email_subject = st.text_input(
                     "📝 Subject",
                     value=default_subject,
-                    placeholder="quick idea for domain.com",
-                    help="Short, cold-email-style subject (3-5 words)"
+                    placeholder="quick note about domain.com",
+                    help="Lowercase, 3-5 words, personalized to their domain"
                 )
             
             email_body = st.text_area(
                 "✉️ Email Body",
                 value=default_body,
-                height=200,
-                help="Personalized cold email - edit as needed"
+                height=280,
+                help="Premium agency-level cold email - edit as needed"
             )
             
             # Attach PDF checkbox
@@ -4132,25 +4135,95 @@ Respond in EXACTLY this JSON format (no markdown, just valid JSON):
 
 Be specific, data-driven, and focus on business impact. If health score is above 70, focus on optimization opportunities rather than critical issues."""
 
-    # Cold email prompt (separate for better quality)
-    email_prompt = f"""Write a cold outreach email for {domain} based on this audit:
+    # Premium Agency-Level Cold Email Prompt
+    # Build dynamic issue bullets from audit data
+    issue_bullets = []
+    for issue in data.get('issues', [])[:3]:
+        title = issue.get('title', '')
+        if 'speed' in title.lower() or 'slow' in title.lower():
+            issue_bullets.append(f"Site speed issues affecting user experience and conversions")
+        elif 'seo' in title.lower() or 'meta' in title.lower() or 'title' in title.lower():
+            issue_bullets.append(f"SEO gaps limiting organic visibility and traffic")
+        elif 'mobile' in title.lower() or 'responsive' in title.lower():
+            issue_bullets.append(f"Mobile optimization needed (60%+ of traffic is mobile)")
+        elif 'ssl' in title.lower() or 'security' in title.lower():
+            issue_bullets.append(f"Security concerns impacting trust and rankings")
+        elif 'analytics' in title.lower() or 'pixel' in title.lower() or 'tracking' in title.lower():
+            issue_bullets.append(f"Missing tracking/pixels limiting ad performance data")
+        elif 'wordpress' in title.lower() or 'plugin' in title.lower():
+            issue_bullets.append(f"WordPress/CMS optimization opportunities")
+        elif 'broken' in title.lower() or 'link' in title.lower():
+            issue_bullets.append(f"Broken links hurting UX and SEO authority")
+        else:
+            issue_bullets.append(f"{title}")
+    
+    # Ensure we have at least 2 bullets
+    if len(issue_bullets) < 2:
+        if health_score < 50:
+            issue_bullets.append("Overall site performance below industry standards")
+        if psi_score and psi_score != 'N/A' and int(psi_score) < 60:
+            issue_bullets.append("Page speed scores impacting bounce rates")
+        if not any('seo' in b.lower() for b in issue_bullets):
+            issue_bullets.append("SEO structure improvements for better rankings")
+    
+    issue_bullets = issue_bullets[:3]  # Max 3 bullets
+    issue_bullets_text = chr(10).join([f"• {b}" for b in issue_bullets])
+    
+    email_prompt = f"""You are a senior strategist at Code Nest LLC, a US-registered digital agency in New Mexico. Write a premium cold outreach email for {domain}.
 
-HEALTH SCORE: {health_score}/100
-TOP ISSUES: {', '.join([i['title'] for i in data.get('issues', [])[:3]]) if data.get('issues') else 'Minor optimizations needed'}
+AUDIT DATA:
+- Domain: {domain}
+- Health Score: {health_score}/100
+- PageSpeed: {psi_score}
+- Key Issues Found: {', '.join([i['title'] for i in data.get('issues', [])[:3]]) if data.get('issues') else 'Optimization opportunities identified'}
+
+STRICT EMAIL STRUCTURE (follow exactly):
+
+1. SUBJECT LINE:
+   - Lowercase only
+   - 3-5 words maximum
+   - Personalized to their domain
+   - Example: "quick note about {domain}"
+
+2. GREETING:
+   - Simple, professional (e.g., "Hi there," or "Hi [Team],")
+
+3. PERSONALIZED OPENER (1 sentence):
+   - Mention you reviewed their website
+   - Reference their domain by name
+
+4. KEY FINDINGS (2-3 short bullets):
+{issue_bullets_text}
+
+5. BUSINESS IMPACT (1 sentence):
+   - Explain how fixing these improves leads, visibility, or conversions
+
+6. CREDIBILITY STATEMENT (use exactly):
+   "For context, I'm reaching out from Code Nest LLC (New Mexico), where we help businesses improve website performance, SEO visibility, social media presence, and paid ad results through data-backed optimization across Web Development, SEO, Social Media Management, and PPC campaigns."
+
+7. SINGLE CTA:
+   - Either ask them to reply OR schedule a 10-15 min call
+   - Only ONE call to action
+
+8. SIGNATURE (use exactly):
+Best regards,
+Code Nest Team
+Code Nest LLC – New Mexico
+Contact@codenest.us.com
+www.codenest.us.com
 
 RULES:
-- 75-150 words maximum
-- Lowercase subject line, 3-5 words (e.g., "quick idea for {domain}")
-- Personalized opening that shows you visited their site
-- 2-3 bullets about specific issues/opportunities from the audit
-- Single clear CTA: reply or schedule a 15-min call
-- Sign off as "Code Nest Team"
-- NO fluff, NO generic phrases like "I hope this finds you well"
+- Total email: 85-130 words (excluding signature)
+- High-trust, consulting tone
+- NO fluff phrases like "I hope this finds you well"
+- NO multiple CTAs
+- Sound like a professional US agency, not a freelancer
+- Focus on client outcomes: visibility, leads, conversions
 
-Format:
-SUBJECT: [subject line]
+Format your response as:
+SUBJECT: [lowercase subject]
 ---
-[email body]"""
+[complete email body with signature]"""
 
     try:
         client = OpenAI(api_key=api_key)
@@ -4174,26 +4247,56 @@ SUBJECT: [subject line]
         except json.JSONDecodeError:
             insights = None
         
-        # Get cold email
+        # Get premium cold email
         email_response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": email_prompt}],
-            temperature=0.8
+            temperature=0.7
         )
-        email_parts = email_response.choices[0].message.content.strip().split("---")
+        email_content = email_response.choices[0].message.content.strip()
         
+        # Parse email response
         email_subject = ""
         email_body = ""
-        if len(email_parts) >= 2:
+        
+        if "---" in email_content:
+            email_parts = email_content.split("---", 1)
             subject_line = email_parts[0].strip()
             if "SUBJECT:" in subject_line.upper():
-                email_subject = subject_line.split(":", 1)[1].strip()
+                email_subject = subject_line.split(":", 1)[1].strip().lower()
             else:
-                email_subject = subject_line
+                email_subject = subject_line.strip().lower()
             email_body = email_parts[1].strip()
         else:
-            email_body = email_response.choices[0].message.content.strip()
-            email_subject = f"quick idea for {domain}"
+            email_body = email_content
+            email_subject = f"quick note about {domain}"
+        
+        # Ensure signature is present, add if missing
+        signature = """Best regards,
+Code Nest Team
+Code Nest LLC – New Mexico
+Contact@codenest.us.com
+www.codenest.us.com"""
+        
+        if "Code Nest LLC" not in email_body or "Contact@codenest.us.com" not in email_body:
+            email_body = email_body.rstrip() + "\n\n" + signature
+        
+        # Fallback if email is malformed or too short
+        if len(email_body) < 100:
+            email_body = f"""Hi there,
+
+I recently reviewed {domain} and noticed a few areas where improvements could drive better results:
+
+{issue_bullets_text}
+
+These quick fixes can significantly improve your site's visibility, user experience, and conversion rates.
+
+For context, I'm reaching out from Code Nest LLC (New Mexico), where we help businesses improve website performance, SEO visibility, social media presence, and paid ad results through data-backed optimization across Web Development, SEO, Social Media Management, and PPC campaigns.
+
+Would you be open to a quick 10-15 minute call to discuss?
+
+{signature}"""
+            email_subject = f"quick note about {domain}"
         
         # Build legacy format for backward compatibility
         summary = ""
