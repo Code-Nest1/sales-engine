@@ -2692,24 +2692,26 @@ def show_audit_history():
         }
         </style>''', unsafe_allow_html=True)
     st.markdown('<div class="sticky-bar">', unsafe_allow_html=True)
-    # Date filtering row
-    col_date1, col_date2, col_date3, col_date4 = st.columns([2, 2, 1, 1])
+    # Date filtering row with calendar
+    col_date1, col_date2, col_date3 = st.columns([2, 2, 2])
     with col_date1:
         time_filter = st.selectbox(
             "📅 Time Period",
-            ["All Time", "Today", "Yesterday", "This Week", "This Month", "Last 30 Days", "Custom Range"],
+            ["All Time", "Today", "Yesterday", "This Week", "This Month", "Last 30 Days", "Select Specific Date", "Custom Range"],
             help="Filter audits by time period"
         )
     with col_date2:
-        if time_filter == "Custom Range":
+        if time_filter == "Select Specific Date":
+            selected_date = st.date_input("📆 Pick a Date", value=datetime.now(), key="hist_calendar_date", help="Click to select a specific date from calendar")
+        elif time_filter == "Custom Range":
             date_from = st.date_input("From Date", value=datetime.now() - timedelta(days=30), key="hist_date_from")
         else:
             st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
     with col_date3:
         if time_filter == "Custom Range":
             date_to = st.date_input("To Date", value=datetime.now(), key="hist_date_to")
-    with col_date4:
-        pass
+        else:
+            st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
     
     # Search and score filters row
     col1, col2, col3 = st.columns([2, 1, 1])
@@ -2721,7 +2723,9 @@ def show_audit_history():
         max_score = st.number_input("Max Score", 0, 100, 100, help="Show audits with score below this value")
     # Show active filters as chips
     active_filters = []
-    if time_filter != "All Time":
+    if time_filter == "Select Specific Date":
+        active_filters.append(f"Time: <span class='active-filter'>{selected_date.strftime('%B %d, %Y')}</span>")
+    elif time_filter != "All Time":
         active_filters.append(f"Time: <span class='active-filter'>{time_filter}</span>")
     if search:
         active_filters.append(f"Domain: <span class='active-filter'>{search}</span>")
@@ -2773,6 +2777,11 @@ def show_audit_history():
                         continue
                 elif time_filter == "Last 30 Days":
                     if audit_date < (now - timedelta(days=30)):
+                        continue
+                elif time_filter == "Select Specific Date":
+                    selected_date_start = datetime.combine(selected_date, datetime.min.time())
+                    selected_date_end = datetime.combine(selected_date, datetime.max.time())
+                    if audit_date < selected_date_start or audit_date > selected_date_end:
                         continue
                 elif time_filter == "Custom Range":
                     date_from_dt = datetime.combine(date_from, datetime.min.time())
