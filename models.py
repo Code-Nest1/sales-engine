@@ -103,8 +103,51 @@ def init_db():
     """Initialize database tables."""
     if engine:
         Base.metadata.create_all(bind=engine)
+        # Migrate existing tables to add missing columns
+        migrate_leads_table()
         return True
     return False
+
+def migrate_leads_table():
+    """Add missing columns to leads table if they don't exist."""
+    if not engine:
+        return
+    
+    inspector = __import__('sqlalchemy').inspect(engine)
+    leads_columns = [c['name'] for c in inspector.get_columns('leads')] if 'leads' in inspector.get_table_names() else []
+    
+    # List of columns that should exist
+    required_columns = {
+        'phone': 'ALTER TABLE leads ADD COLUMN phone VARCHAR(20)',
+        'address': 'ALTER TABLE leads ADD COLUMN address TEXT',
+        'place_id': 'ALTER TABLE leads ADD COLUMN place_id VARCHAR(500)',
+        'city': 'ALTER TABLE leads ADD COLUMN city VARCHAR(100)',
+        'state': 'ALTER TABLE leads ADD COLUMN state VARCHAR(100)',
+        'zipcode': 'ALTER TABLE leads ADD COLUMN zipcode VARCHAR(20)',
+        'latitude': 'ALTER TABLE leads ADD COLUMN latitude FLOAT',
+        'longitude': 'ALTER TABLE leads ADD COLUMN longitude FLOAT',
+        'industry': 'ALTER TABLE leads ADD COLUMN industry VARCHAR(100)',
+        'company_size': 'ALTER TABLE leads ADD COLUMN company_size VARCHAR(50)',
+        'estimated_revenue': 'ALTER TABLE leads ADD COLUMN estimated_revenue VARCHAR(50)',
+        'services_needed': 'ALTER TABLE leads ADD COLUMN services_needed JSON',
+        'service_priorities': 'ALTER TABLE leads ADD COLUMN service_priorities JSON',
+        'status': 'ALTER TABLE leads ADD COLUMN status VARCHAR(50) DEFAULT "new"',
+        'notes': 'ALTER TABLE leads ADD COLUMN notes TEXT',
+        'ai_enrichment': 'ALTER TABLE leads ADD COLUMN ai_enrichment JSON',
+        'opportunity_rating': 'ALTER TABLE leads ADD COLUMN opportunity_rating INTEGER DEFAULT 0',
+        'updated_at': 'ALTER TABLE leads ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP',
+    }
+    
+    # Add missing columns
+    with engine.connect() as conn:
+        for col_name, sql in required_columns.items():
+            if col_name not in leads_columns:
+                try:
+                    conn.execute(__import__('sqlalchemy').text(sql))
+                    conn.commit()
+                except Exception as e:
+                    # Column might already exist or be incompatible, continue
+                    pass
 
 def get_db():
     """Get database session."""
