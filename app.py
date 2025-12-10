@@ -2690,7 +2690,7 @@ def show_audit_history():
             .sticky-bar {padding: 0.2rem 0; font-size: 0.95em;}
             .sidebar-content {font-size: 0.95em;}
         }
-        </style>", unsafe_allow_html=True)
+        </style>''', unsafe_allow_html=True)
     st.markdown('<div class="sticky-bar">', unsafe_allow_html=True)
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
