@@ -2876,14 +2876,15 @@ def show_audit_history():
                         "text/csv",
                         key="audit_bulk_csv_btn"
                     )
-            # Show a header row with status icon, tags, and checkbox
-            st.markdown("<div style='font-weight:600;'>Select | <span title='Audit status: ✅ Passed, 🟡 Review, ❌ Needs Attention'>Status</span> | Domain | <span title='Audit health score out of 100'>Score</span> | <span title='Google PageSpeed score'>Speed</span> | <span title='Number of issues found'>Issues</span> | Date | Tags</div>", unsafe_allow_html=True)
-            # Side panel/modal for audit details
-            if 'audit_details_id' not in st.session_state:
-                st.session_state.audit_details_id = None
+            # Display data with clickable details
+            st.markdown("### 📋 Audit List")
+            st.markdown("Click on any audit below to view full details. Hover over icons and actions for tips.")
+            
             for item in paginated_data:
+                # Find corresponding audit object
                 audit = next((a for a in audits if a.id == item["ID"]), None)
                 if audit:
+                    # Status icon based on score
                     score = audit.health_score
                     if score is not None:
                         if score >= 85:
@@ -2894,61 +2895,9 @@ def show_audit_history():
                             status_icon = "❌"
                     else:
                         status_icon = "❓"
-                    col_cb, col_btn, col_tag = st.columns([1,10,3])
-                    with col_cb:
-                        checked = item["ID"] in st.session_state.audit_bulk_selected
-                        if st.checkbox("", value=checked, key=f"audit_bulk_cb_{item['ID']}", help="Select audit for bulk actions", args=(), kwargs={}, disabled=False):
-                            st.session_state.audit_bulk_selected.add(item["ID"])
-                        else:
-                            st.session_state.audit_bulk_selected.discard(item["ID"])
-                    with col_btn:
-                        label = f"{status_icon} {audit.domain} - Score: {audit.health_score}/100 - {audit.created_at.strftime('%m/%d/%Y %H:%M') if audit.created_at else 'N/A'}"
-                        st.markdown(f'<button aria-label="View details for {audit.domain}" tabindex="0" style="width:100%;text-align:left;" onclick="window.dispatchEvent(new Event(\'audit_details_btn_{audit.id}\'))">{label}</button>', unsafe_allow_html=True)
-                        if st.button(label, key=f"audit_details_btn_{audit.id}"):
-                            st.session_state.audit_details_id = audit.id
-                    with col_tag:
-                        tags = st.session_state.audit_tags.get(audit.id, [])
-                        new_tag = st.text_input("Add tag", value="", key=f"audit_tag_input_{audit.id}", label_visibility="collapsed", placeholder="Add tag...")
-                        if st.button("Add", key=f"audit_tag_btn_{audit.id}") and new_tag:
-                            if audit.id not in st.session_state.audit_tags:
-                                st.session_state.audit_tags[audit.id] = []
-                            if new_tag not in st.session_state.audit_tags[audit.id]:
-                                st.session_state.audit_tags[audit.id].append(new_tag)
-                                st.rerun()
-                        if tags:
-                            st.markdown(" ".join([f"<span style='background:#e0e0e0;border-radius:4px;padding:2px 6px;margin:2px;font-size:0.9em;'>{t}</span>" for t in tags]), unsafe_allow_html=True)
-
-            # Show audit details in sidebar/modal if selected
-            if st.session_state.audit_details_id:
-                audit_ids = [item["ID"] for item in hist_data]
-                idx = audit_ids.index(st.session_state.audit_details_id) if st.session_state.audit_details_id in audit_ids else -1
-                audit = next((a for a in audits if a.id == st.session_state.audit_details_id), None)
-                if audit:
-                    with st.sidebar:
-                        st.markdown(f"## Audit Details: {audit.domain}")
-                        st.markdown(f"**Score:** {audit.health_score}/100")
-                        st.markdown(f"**Date:** {audit.created_at.strftime('%m/%d/%Y %H:%M') if audit.created_at else 'N/A'}")
-                        st.markdown(f"**Status:** {status_icon}")
-                        st.markdown(f"**Tags:** {' '.join(st.session_state.audit_tags.get(audit.id, []))}")
-                        # Copy to clipboard buttons
-                        st.text_input("Domain", value=audit.domain, key=f"audit_details_domain_{audit.id}", disabled=True)
-                        st.button("Copy Domain", key=f"copy_domain_{audit.id}", on_click=st.session_state.update, args=({},), help="Copy domain to clipboard")
-                        if audit.ai_email:
-                            st.text_area("Email Draft", value=audit.ai_email, key=f"audit_details_email_{audit.id}", height=100, disabled=True)
-                            st.button("Copy Email Draft", key=f"copy_email_{audit.id}", on_click=st.session_state.update, args=({},), help="Copy email draft to clipboard")
-                        nav_col1, nav_col2, nav_col3 = st.columns([1,2,1])
-                        with nav_col1:
-                            if idx > 0 and st.button("⬅️ Prev", key="audit_details_prev"):
-                                st.session_state.audit_details_id = audit_ids[idx-1]
-                                st.experimental_rerun()
-                        with nav_col2:
-                            if st.button("Close Details", key="close_audit_details"):
-                                st.session_state.audit_details_id = None
-                                st.experimental_rerun()
-                        with nav_col3:
-                            if idx < len(audit_ids)-1 and st.button("Next ➡️", key="audit_details_next"):
-                                st.session_state.audit_details_id = audit_ids[idx+1]
-                                st.experimental_rerun()
+                    
+                    # Create expander for each audit with summary info
+                    with st.expander(f"{status_icon} {audit.domain} - Score: {audit.health_score}/100 - {audit.created_at.strftime('%m/%d/%Y %H:%M') if audit.created_at else 'N/A'}"):
                         # Convert audit object to data dict format (same as single audit)
                         data = {
                             'url': audit.url,
