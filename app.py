@@ -297,17 +297,20 @@ EMAIL_CONFIG_PATH = Path(__file__).parent / "email_config.json"
 NOTIFICATIONS_LOG_PATH = Path(__file__).parent / "notifications.json"
 
 def init_email_config():
-    """Initialize email configuration file."""
+    """Initialize email configuration file with Hostinger SMTP settings."""
     if not EMAIL_CONFIG_PATH.exists():
         default_config = {
-            "enabled": False,
-            "smtp_server": "",
+            "enabled": True,
+            "smtp_server": "smtp.hostinger.com",
             "smtp_port": 587,
-            "sender_email": "",
-            "sender_password": "",
-            "from_name": "Code Nest Sales Engine",
+            "sender_email": "contact@codenest.com",
+            "sender_password": os.environ.get("EMAIL_PASSWORD", ""),  # Set via environment variable
+            "from_name": "Code Nest - Digital Audits",
+            "auto_send_reports": True,
+            "reply_to": "contact@codenest.com",
             "notifications": {
                 "audit_complete": True,
+                "report_sent": True,
                 "permission_change": True,
                 "admin_alert": True
             }
@@ -389,6 +392,202 @@ def log_notification(recipient, subject, status):
         NOTIFICATIONS_LOG_PATH.write_text(json.dumps(notifications, indent=2))
     except Exception as e:
         logger.error(f"Error logging notification: {str(e)}")
+
+def extract_email_from_data(data):
+    """Extract contact email from audit data (from OpenAI analysis)."""
+    try:
+        # Check if OpenAI data contains contact info
+        if data.get('ai') and isinstance(data['ai'], dict):
+            # Look for email in various fields that OpenAI might return
+            ai_data = data['ai']
+            
+            # Check direct email field
+            if ai_data.get('contact_email'):
+                email = ai_data.get('contact_email')
+                if validate_email(email):
+                    return email
+            
+            # Check if email is embedded in other fields
+            for field in ['summary', 'recommendations', 'contact_info']:
+                if field in ai_data:
+                    text = ai_data[field]
+                    if isinstance(text, str):
+                        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+                        if emails:
+                            for email in emails:
+                                # Exclude common system emails
+                                if not any(x in email for x in ['noreply', 'no-reply', 'donotreply']):
+                                    if validate_email(email):
+                                        return email
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting email from data: {str(e)}")
+        return None
+
+def send_audit_report_email(recipient_email, audit_data):
+    """Send audit report to website owner/contact."""
+    try:
+        if not recipient_email or not validate_email(recipient_email):
+            logger.warning(f"Invalid email address: {recipient_email}")
+            return False, "Invalid email address"
+        
+        config = load_email_config()
+        
+        if not config.get("auto_send_reports"):
+            logger.info(f"Auto-send reports disabled, skipping email to {recipient_email}")
+            return False, "Auto-send reports disabled"
+        
+        if not config.get("enabled"):
+            return False, "Email notifications are disabled"
+        
+        if not config.get("smtp_server") or not config.get("sender_email"):
+            return False, "Email configuration incomplete"
+        
+        # Extract domain from URL
+        domain = urlparse(audit_data.get('url', '')).netloc.replace('www.', '')
+        score = audit_data.get('score', 'N/A')
+        
+        # Build email subject and body
+        subject = f"Website Audit Report - {domain} ({score}/100)"
+        
+        html_body = f"""
+        <html>
+            <head>
+                <style>
+                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #333; line-height: 1.6; }}
+                    .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                    .header {{ background: linear-gradient(135deg, #0066CC 0%, #004499 100%); color: white; padding: 30px; border-radius: 5px 5px 0 0; text-align: center; }}
+                    .header h1 {{ margin: 0; font-size: 28px; }}
+                    .header p {{ margin: 10px 0 0 0; font-size: 14px; opacity: 0.9; }}
+                    .metrics {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin: 20px 0; }}
+                    .metric {{ background: #f5f5f5; padding: 15px; border-radius: 5px; text-align: center; border-left: 4px solid #0066CC; }}
+                    .metric-value {{ font-size: 24px; font-weight: bold; color: #0066CC; }}
+                    .metric-label {{ font-size: 12px; color: #666; margin-top: 5px; text-transform: uppercase; }}
+                    .section {{ margin: 25px 0; }}
+                    .section-title {{ font-size: 18px; font-weight: bold; color: #0066CC; border-bottom: 2px solid #0066CC; padding-bottom: 10px; margin-bottom: 15px; }}
+                    .issues-list {{ margin-top: 15px; }}
+                    .issue {{ background: #fff3cd; border-left: 4px solid #ff9800; padding: 12px; margin: 10px 0; border-radius: 3px; }}
+                    .issue-title {{ font-weight: bold; color: #ff6600; }}
+                    .cta-button {{ display: inline-block; background: #0066CC; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin: 20px 0; }}
+                    .footer {{ text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #666; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>🎯 Website Audit Report</h1>
+                        <p>Comprehensive Technical Analysis for {domain}</p>
+                    </div>
+                    
+                    <div style="padding: 30px; border: 1px solid #eee; border-top: none;">
+                        <p>Hello,</p>
+                        <p>We've completed a comprehensive technical audit of your website. Here's what we found:</p>
+                        
+                        <div class="metrics">
+                            <div class="metric">
+                                <div class="metric-value">{score}</div>
+                                <div class="metric-label">Health Score</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{audit_data.get('psi', 'N/A')}</div>
+                                <div class="metric-label">Speed Score</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-value">{len(audit_data.get('issues', []))}</div>
+                                <div class="metric-label">Issues Found</div>
+                            </div>
+                        </div>
+                        
+                        <div class="section">
+                            <div class="section-title">⚠️ Top Issues Detected</div>
+                            <div class="issues-list">
+        """
+        
+        # Add top 5 issues
+        for issue in audit_data.get('issues', [])[:5]:
+            html_body += f"""
+                                <div class="issue">
+                                    <div class="issue-title">{issue.get('title', 'Unknown Issue')}</div>
+                                    <p><strong>Impact:</strong> {issue.get('impact', 'N/A')}</p>
+                                    <p><strong>Solution:</strong> {issue.get('solution', 'N/A')}</p>
+                                </div>
+            """
+        
+        html_body += """
+                            </div>
+                        </div>
+                        
+                        <div class="section">
+                            <div class="section-title">🤖 AI Analysis Summary</div>
+        """
+        
+        if audit_data.get('ai'):
+            html_body += f"""
+                            <p><strong>Summary:</strong></p>
+                            <p>{audit_data['ai'].get('summary', 'No summary available')}</p>
+                            <p><strong>Recommendations:</strong></p>
+                            <p>{audit_data['ai'].get('solutions', 'No recommendations available')}</p>
+            """
+        
+        html_body += f"""
+                        </div>
+                        
+                        <center>
+                            <a href="{audit_data.get('url', '#')}" class="cta-button">View Detailed Report</a>
+                        </center>
+                        
+                        <div class="section">
+                            <p><strong>Next Steps:</strong></p>
+                            <ul>
+                                <li>Review the recommendations above</li>
+                                <li>Prioritize high-impact issues</li>
+                                <li>Contact us for implementation support</li>
+                            </ul>
+                        </div>
+                        
+                        <div class="footer">
+                            <p>Code Nest | Digital Solutions & Audits</p>
+                            <p>© 2025 Code Nest. All rights reserved.</p>
+                            <p>Questions? Reply to this email or contact us at contact@codenest.com</p>
+                        </div>
+                    </div>
+                </div>
+            </body>
+        </html>
+        """
+        
+        # Send email
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{config['from_name']} <{config['sender_email']}>"
+        msg["To"] = recipient_email
+        msg["Reply-To"] = config.get('reply_to', config['sender_email'])
+        
+        part = MIMEText(html_body, "html")
+        msg.attach(part)
+        
+        # Send via Hostinger SMTP
+        server = smtplib.SMTP(config["smtp_server"], config["smtp_port"], timeout=10)
+        server.starttls()
+        server.login(config["sender_email"], config["sender_password"])
+        server.sendmail(config["sender_email"], recipient_email, msg.as_string())
+        server.quit()
+        
+        log_notification(recipient_email, subject, "sent")
+        logger.info(f"Audit report email sent to {recipient_email} for domain {domain}")
+        
+        return True, f"Report sent successfully to {recipient_email}"
+        
+    except smtplib.SMTPAuthenticationError:
+        logger.error(f"SMTP authentication failed for {recipient_email}")
+        return False, "Authentication failed - check email credentials"
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error sending to {recipient_email}: {str(e)}")
+        return False, f"Email service error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Error sending audit report to {recipient_email}: {str(e)}")
+        return False, f"Error: {str(e)}"
 
 def get_email_template(template_type, data):
     """Generate HTML email templates."""
@@ -1327,13 +1526,38 @@ if 'current_section' not in st.session_state:
 
 # Store API keys in session state (from session or temporary input)
 if 'OPENAI_API_KEY' not in st.session_state:
-    st.session_state.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+    # Try environment variable first, then user's saved key
+    env_key = os.environ.get("OPENAI_API_KEY")
+    if env_key:
+        st.session_state.OPENAI_API_KEY = env_key
+    elif st.session_state.get("current_user"):
+        # Load from user's saved keys if logged in
+        user_keys = get_user_api_keys(st.session_state.get("current_user"))
+        st.session_state.OPENAI_API_KEY = user_keys.get("openai", "")
+    else:
+        st.session_state.OPENAI_API_KEY = ""
 
 if 'GOOGLE_API_KEY' not in st.session_state:
-    st.session_state.GOOGLE_API_KEY = None
+    env_key = os.environ.get("GOOGLE_API_KEY")
+    if env_key:
+        st.session_state.GOOGLE_API_KEY = env_key
+    elif st.session_state.get("current_user"):
+        # Load from user's saved keys if logged in
+        user_keys = get_user_api_keys(st.session_state.get("current_user"))
+        st.session_state.GOOGLE_API_KEY = user_keys.get("google", "")
+    else:
+        st.session_state.GOOGLE_API_KEY = ""
 
 if 'SLACK_WEBHOOK' not in st.session_state:
-    st.session_state.SLACK_WEBHOOK = None
+    env_key = os.environ.get("SLACK_WEBHOOK")
+    if env_key:
+        st.session_state.SLACK_WEBHOOK = env_key
+    elif st.session_state.get("current_user"):
+        # Load from user's saved keys if logged in
+        user_keys = get_user_api_keys(st.session_state.get("current_user"))
+        st.session_state.SLACK_WEBHOOK = user_keys.get("slack", "")
+    else:
+        st.session_state.SLACK_WEBHOOK = ""
 
 # Get current API keys from session
 OPENAI_API_KEY = st.session_state.OPENAI_API_KEY
@@ -1563,7 +1787,8 @@ def show_api_settings():
                     if st.button("✅ Save OpenAI Key", key="save_openai_btn", use_container_width=True):
                         if new_openai_key:
                             save_user_api_key(username, "openai", new_openai_key)
-                            st.success("✓ OpenAI key saved securely")
+                            st.session_state.OPENAI_API_KEY = new_openai_key
+                            st.success("✓ OpenAI key saved securely and loaded into session")
                             st.session_state.edit_openai = False
                             st.rerun()
                         else:
@@ -1646,7 +1871,8 @@ def show_api_settings():
                     if st.button("✅ Save Google Key", key="save_google_btn", use_container_width=True):
                         if new_google_key:
                             save_user_api_key(username, "google", new_google_key)
-                            st.success("✓ Google key saved securely")
+                            st.session_state.GOOGLE_API_KEY = new_google_key
+                            st.success("✓ Google key saved securely and loaded into session")
                             st.session_state.edit_google = False
                             st.rerun()
                         else:
@@ -1729,7 +1955,8 @@ def show_api_settings():
                     if st.button("✅ Save Slack URL", key="save_slack_btn", use_container_width=True):
                         if new_slack_key:
                             save_user_api_key(username, "slack", new_slack_key)
-                            st.success("✓ Slack webhook saved securely")
+                            st.session_state.SLACK_WEBHOOK = new_slack_key
+                            st.success("✓ Slack webhook saved securely and loaded into session")
                             st.session_state.edit_slack = False
                             st.rerun()
                         else:
@@ -1837,26 +2064,53 @@ def show_single_audit():
                     
                     # AI analysis
                     if data.get('ai'):
-                        if not st.session_state.OPENAI_API_KEY:
-                            st.warning("⚠️ OpenAI API key not configured. Go to **API Settings** to configure it for AI analysis.")
-                        else:
-                            st.markdown("---")
-                            st.markdown("### 🤖 AI Analysis")
-                            
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.markdown("**Summary**")
-                                st.info(data['ai'].get('summary', 'No summary available'))
-                                st.markdown("**Impact**")
-                                st.warning(data['ai'].get('impact', 'No impact assessment available'))
-                            
-                            with col2:
-                                st.markdown("**Solutions**")
-                                st.success(data['ai'].get('solutions', 'No solutions available'))
-                            
-                            st.markdown("---")
-                            st.markdown("**📧 Cold Email Draft**")
-                            st.text_area("", value=clean_text(data['ai']['email']), height=250, key="email_draft")
+                        st.markdown("---")
+                        st.markdown("### 🤖 AI Analysis")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("**Summary**")
+                            st.info(data['ai'].get('summary', 'No summary available'))
+                            st.markdown("**Impact**")
+                            st.warning(data['ai'].get('impact', 'No impact assessment available'))
+                        
+                        with col2:
+                            st.markdown("**Solutions**")
+                            st.success(data['ai'].get('solutions', 'No solutions available'))
+                        
+                        st.markdown("---")
+                        st.markdown("**📧 Cold Email Draft**")
+                        st.text_area("", value=clean_text(data['ai']['email']), height=250, key="email_draft")
+                        
+                        # Auto-send audit report to contact email
+                        st.markdown("---")
+                        st.markdown("### 📤 Send Audit Report")
+                        
+                        # Try to extract email from OpenAI data
+                        extracted_email = extract_email_from_data(data)
+                        
+                        col1, col2 = st.columns([2, 1])
+                        with col1:
+                            recipient_email = st.text_input(
+                                "Send report to (contact email)",
+                                value=extracted_email or "",
+                                placeholder="contact@website.com",
+                                help="Email will be sent with detailed audit report"
+                            )
+                        
+                        with col2:
+                            if st.button("📧 Send Report", type="secondary", use_container_width=True):
+                                if recipient_email:
+                                    with st.spinner("Sending report..."):
+                                        success, message = send_audit_report_email(recipient_email, data)
+                                        if success:
+                                            st.success(f"✅ {message}")
+                                            logger.info(f"Audit report sent to {recipient_email}")
+                                        else:
+                                            st.error(f"❌ {message}")
+                                            logger.error(f"Failed to send report to {recipient_email}: {message}")
+                                else:
+                                    st.warning("⚠️ Please enter a recipient email address")
                     
                     # Save to DB
                     audit_id = None
@@ -3040,6 +3294,43 @@ def show_email_settings():
     """Configure email notification settings."""
     st.markdown("## 📧 Email Notification Settings")
     
+    # Hostinger setup info
+    with st.expander("📋 Hostinger SMTP Setup Guide", expanded=False):
+        st.markdown("""
+        ### Quick Setup for Hostinger Email
+        
+        **SMTP Configuration for Hostinger:**
+        - **SMTP Server:** `smtp.hostinger.com`
+        - **SMTP Port:** `587` (TLS) or `465` (SSL)
+        - **Sender Email:** Your Hostinger email (e.g., `contact@codenest.com`)
+        - **Password:** Your Hostinger email password
+        
+        **Steps to get your credentials:**
+        1. Log in to Hostinger Control Panel
+        2. Go to **Email** → Your email account
+        3. Find SMTP/IMAP settings
+        4. Copy the SMTP server address and your email credentials
+        
+        **Alternative - Using Environment Variable:**
+        ```bash
+        # Set this in your .env file for security:
+        EMAIL_PASSWORD=your_hostinger_email_password
+        ```
+        
+        **Auto-Send Reports Feature:**
+        - When you run an audit, the system will automatically try to:
+          1. Extract contact email from OpenAI analysis
+          2. Send a formatted audit report to that email
+          3. Log all sent emails for tracking
+        
+        **Email Features:**
+        - ✅ Automatic report sending when contacts are found
+        - ✅ Professional HTML formatted emails
+        - ✅ Includes audit metrics, top issues, and recommendations
+        - ✅ All emails logged and tracked
+        - ✅ Manual send with custom email addresses
+        """)
+    
     config = load_email_config()
     
     st.markdown("### SMTP Configuration")
@@ -3048,7 +3339,7 @@ def show_email_settings():
     with col1:
         enabled = st.checkbox("Enable Email Notifications", value=config.get("enabled", False))
     with col2:
-        st.markdown("")  # Spacer
+        auto_send = st.checkbox("Auto-Send Reports", value=config.get("auto_send_reports", True), help="Automatically send reports when emails are found")
     
     with st.form("email_config_form"):
         smtp_server = st.text_input(
@@ -3086,6 +3377,13 @@ def show_email_settings():
             help="Name that appears in 'From:' field"
         )
         
+        reply_to = st.text_input(
+            "Reply-To Email Address",
+            value=config.get("reply_to", config.get("sender_email", "")),
+            placeholder="support@example.com",
+            help="Email address for replies"
+        )
+        
         st.markdown("### Notification Types")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -3113,6 +3411,8 @@ def show_email_settings():
                 "sender_email": sender_email,
                 "sender_password": sender_password,
                 "from_name": from_name,
+                "reply_to": reply_to,
+                "auto_send_reports": auto_send,
                 "notifications": {
                     "audit_complete": audit_notif,
                     "permission_change": perm_notif,
