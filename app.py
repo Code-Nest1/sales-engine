@@ -389,7 +389,7 @@ init_users_file()
 init_2fa_file()
 init_sessions_file()
 
-# Initialize authentication state
+# Initialize authentication state first
 if 'authenticated' not in st.session_state:
     st.session_state['authenticated'] = False
     st.session_state['current_user'] = None
@@ -398,20 +398,24 @@ if 'authenticated' not in st.session_state:
     st.session_state['2fa_pending'] = False
     st.session_state['2fa_username'] = None
 
-# --- Session restoration from query params (ALWAYS CHECK FIRST) ---
+# --- Try to restore session from query params ---
 query_params = st.experimental_get_query_params()
-if 'session_token' in query_params and not st.session_state.get('authenticated'):
-    token = query_params['session_token'][0]
-    session_info = validate_session(token)
-    if session_info:
-        st.session_state['session_token'] = token
-        st.session_state['authenticated'] = True
-        st.session_state['current_user'] = session_info['username']
-        st.session_state['is_admin'] = session_info['role'] == 'admin'
-        st.session_state['user_role'] = session_info['role']
-        st.session_state['2fa_pending'] = False
-        st.session_state['2fa_username'] = None
+if 'session_token' in query_params:
+    try:
+        token = query_params['session_token'][0]
+        session_info = validate_session(token)
+        if session_info:
+            st.session_state['session_token'] = token
+            st.session_state['authenticated'] = True
+            st.session_state['current_user'] = session_info['username']
+            st.session_state['is_admin'] = session_info['role'] == 'admin'
+            st.session_state['user_role'] = session_info['role']
+            st.session_state['2fa_pending'] = False
+            st.session_state['2fa_username'] = None
+    except Exception as e:
+        pass  # Session token invalid or expired, continue to login page
 
+# Check authentication
 if not st.session_state.get('authenticated'):
     show_auth_page()
     st.stop()
@@ -483,16 +487,21 @@ with st.sidebar:
     st.markdown(f"**Role:** {st.session_state.get('user_role').capitalize()}")
     
     if st.button("🚪 Logout", use_container_width=True):
+        # Destroy session token
+        if 'session_token' in st.session_state:
+            destroy_session(st.session_state['session_token'])
+            del st.session_state['session_token']
+        
+        # Clear authentication
         st.session_state['authenticated'] = False
         st.session_state['current_user'] = None
         st.session_state['is_admin'] = False
         st.session_state['user_role'] = 'user'
         st.session_state.current_section = 'Single Audit'
-        # Destroy session token
-        if 'session_token' in st.session_state:
-            destroy_session(st.session_state['session_token'])
-            del st.session_state['session_token']
-        # Clear query params to complete logout
+        st.session_state['2fa_pending'] = False
+        st.session_state['2fa_username'] = None
+        
+        # Clear query params to remove session token from URL
         st.experimental_set_query_params()
         st.rerun()
     
