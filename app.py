@@ -1332,6 +1332,21 @@ def verify_2fa_token(secret: str, token: str) -> bool:
     except Exception:
         return False
 
+def reload_user_api_keys():
+    """Reload API keys from user account (call after login)."""
+    if st.session_state.get("current_user"):
+        user_keys = get_user_api_keys(st.session_state.get("current_user"))
+        
+        # Check environment variables first (highest priority)
+        env_openai = os.environ.get("OPENAI_API_KEY")
+        env_google = os.environ.get("GOOGLE_API_KEY")
+        env_slack = os.environ.get("SLACK_WEBHOOK")
+        
+        # Set from env or user account
+        st.session_state.OPENAI_API_KEY = env_openai or user_keys.get("openai", "")
+        st.session_state.GOOGLE_API_KEY = env_google or user_keys.get("google", "")
+        st.session_state.SLACK_WEBHOOK = env_slack or user_keys.get("slack", "")
+
 def show_auth_page():
     """Enhanced login/signup UI with 2FA support."""
     st.markdown("""
@@ -1536,21 +1551,6 @@ if 'current_section' not in st.session_state:
     st.session_state.current_section = 'Single Audit'
 
 # Store API keys in session state (from session or temporary input)
-# This function reloads API keys from user account after login
-def reload_user_api_keys():
-    """Reload API keys from user account (call after login)."""
-    if st.session_state.get("current_user"):
-        user_keys = get_user_api_keys(st.session_state.get("current_user"))
-        
-        # Check environment variables first (highest priority)
-        env_openai = os.environ.get("OPENAI_API_KEY")
-        env_google = os.environ.get("GOOGLE_API_KEY")
-        env_slack = os.environ.get("SLACK_WEBHOOK")
-        
-        # Set from env or user account
-        st.session_state.OPENAI_API_KEY = env_openai or user_keys.get("openai", "")
-        st.session_state.GOOGLE_API_KEY = env_google or user_keys.get("google", "")
-        st.session_state.SLACK_WEBHOOK = env_slack or user_keys.get("slack", "")
 
 if 'OPENAI_API_KEY' not in st.session_state:
     # Try environment variable first, then user's saved key
