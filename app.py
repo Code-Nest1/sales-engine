@@ -2912,6 +2912,7 @@ def show_audit_history():
                             deleted_audits.append({
                                 'id': audit_to_delete.id,
                                 'domain': audit_to_delete.domain,
+                                'url': audit_to_delete.url,
                                 'health_score': audit_to_delete.health_score,
                                 'psi_score': audit_to_delete.psi_score,
                                 'issues': audit_to_delete.issues,
@@ -2937,30 +2938,42 @@ def show_audit_history():
                 if st.session_state.get('recently_deleted_audits') and st.session_state.get('undo_delete_time'):
                     if time.time() - st.session_state['undo_delete_time'] < 10:
                         if st.button("Undo Delete", key="undo_bulk_delete"):
-                            db = get_db()
-                            for audit_data in st.session_state['recently_deleted_audits']:
-                                new_audit = Audit(
-                                    id=audit_data['id'],
-                                    domain=audit_data['domain'],
-                                    health_score=audit_data['health_score'],
-                                    psi_score=audit_data['psi_score'],
-                                    issues=audit_data['issues'],
-                                    created_at=datetime.fromisoformat(audit_data['created_at']) if audit_data['created_at'] else None,
-                                    ai_summary=audit_data['ai_summary'],
-                                    ai_impact=audit_data['ai_impact'],
-                                    ai_solutions=audit_data['ai_solutions'],
-                                    ai_email=audit_data['ai_email'],
-                                    emails_found=audit_data['emails_found'],
-                                    domain_age=audit_data['domain_age'],
-                                    tech_stack=audit_data['tech_stack']
-                                )
-                                db.add(new_audit)
-                            db.commit()
-                            db.close()
-                            st.session_state.recently_deleted_audits = []
-                            st.session_state.undo_delete_time = None
-                            st.toast("Undo successful. Audits restored.")
-                            st.rerun()
+                            try:
+                                db = get_db()
+                                restored = 0
+                                for audit_data in st.session_state['recently_deleted_audits']:
+                                    # Check if audit already exists (in case of duplicate undo)
+                                    existing = db.query(Audit).filter(Audit.id == audit_data['id']).first()
+                                    if not existing:
+                                        # Create new audit without specifying ID (let DB auto-generate)
+                                        new_audit = Audit(
+                                            domain=audit_data['domain'],
+                                            url=audit_data.get('url', f"https://{audit_data['domain']}"),
+                                            health_score=audit_data['health_score'],
+                                            psi_score=audit_data['psi_score'],
+                                            issues=audit_data['issues'],
+                                            created_at=datetime.fromisoformat(audit_data['created_at']) if audit_data['created_at'] else None,
+                                            ai_summary=audit_data['ai_summary'],
+                                            ai_impact=audit_data['ai_impact'],
+                                            ai_solutions=audit_data['ai_solutions'],
+                                            ai_email=audit_data['ai_email'],
+                                            emails_found=audit_data['emails_found'],
+                                            domain_age=audit_data['domain_age'],
+                                            tech_stack=audit_data['tech_stack']
+                                        )
+                                        db.add(new_audit)
+                                        restored += 1
+                                db.commit()
+                                db.close()
+                                st.session_state.recently_deleted_audits = []
+                                st.session_state.undo_delete_time = None
+                                st.toast(f"Undo successful. {restored} audits restored.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Undo failed: {str(e)}")
+                                if 'db' in locals():
+                                    db.rollback()
+                                    db.close()
             with col_bulk3:
                 if st.button("📥 Export Selected as CSV", key="audit_bulk_export") and st.session_state.audit_bulk_selected:
                     selected_data = [item for item in hist_data if item["ID"] in st.session_state.audit_bulk_selected]
