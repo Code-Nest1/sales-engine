@@ -2890,19 +2890,22 @@ def show_audit_history():
             if 'audit_bulk_selected' not in st.session_state:
                 st.session_state.audit_bulk_selected = set()
             st.markdown("### 📋 Audit List")
-            st.markdown("Click on any audit below to view full details. Hover over icons and actions for help.")
+            st.markdown(f"Click on any audit below to view full details. **{len(st.session_state.audit_bulk_selected)} selected**")
             # Bulk action controls
-            col_bulk1, col_bulk2, col_bulk3 = st.columns([2,1,1])
+            col_bulk1, col_bulk2, col_bulk3, col_bulk4 = st.columns([1.5,1.5,1.5,1.5])
             with col_bulk1:
-                if st.button("Select All on Page", key="audit_bulk_all"):
-                    for item in paginated_data:
-                        st.session_state.audit_bulk_selected.add(item["ID"])
-                if st.button("Clear Selection", key="audit_bulk_clear"):
-                    st.session_state.audit_bulk_selected.clear()
+                if st.button("✅ Select All Visible", key="audit_bulk_all", use_container_width=True):
+                    for audit in audits:
+                        st.session_state.audit_bulk_selected.add(audit.id)
+                    st.rerun()
             with col_bulk2:
+                if st.button("❌ Clear Selection", key="audit_bulk_clear", use_container_width=True):
+                    st.session_state.audit_bulk_selected.clear()
+                    st.rerun()
+            with col_bulk3:
                 if 'recently_deleted_audits' not in st.session_state:
                     st.session_state.recently_deleted_audits = []
-                if st.button("🗑️ Bulk Delete", key="audit_bulk_delete") and st.session_state.audit_bulk_selected:
+                if st.button("🗑️ Bulk Delete", key="audit_bulk_delete", use_container_width=True) and st.session_state.audit_bulk_selected:
                     db = get_db()
                     deleted = 0
                     deleted_audits = []
@@ -2974,8 +2977,8 @@ def show_audit_history():
                                 if 'db' in locals():
                                     db.rollback()
                                     db.close()
-            with col_bulk3:
-                if st.button("📥 Export Selected as CSV", key="audit_bulk_export") and st.session_state.audit_bulk_selected:
+            with col_bulk4:
+                if st.button("📥 Export CSV", key="audit_bulk_export", use_container_width=True) and st.session_state.audit_bulk_selected:
                     selected_data = [item for item in hist_data if item["ID"] in st.session_state.audit_bulk_selected]
                     csv = pd.DataFrame(selected_data).drop(columns=["ID"]).to_csv(index=False).encode('utf-8')
                     st.download_button(
@@ -2985,9 +2988,6 @@ def show_audit_history():
                         "text/csv",
                         key="audit_bulk_csv_btn"
                     )
-            # Display data with clickable details grouped by time period
-            st.markdown("### 📋 Audit List")
-            st.markdown("Click on any audit below to view full details. Hover over icons and actions for tips.")
             
             # Show summary of audits by time period
             period_counts = {
@@ -3020,10 +3020,6 @@ def show_audit_history():
                 # Create collapsible section for each time period
                 with st.expander(f"📁 {period_name} ({len(period_audits)} audits)", expanded=(period_name == "Today")):
                     for audit in period_audits:
-                        # Find item in paginated_data
-                        item = next((i for i in paginated_data if i["ID"] == audit.id), None)
-                        if not item:
-                            continue
                         # Status icon based on score
                         score = audit.health_score
                         if score is not None:
@@ -3036,10 +3032,20 @@ def show_audit_history():
                         else:
                             status_icon = "❓"
                         
-                        # Create expander for each audit with summary info
-                        with st.expander(f"{status_icon} {audit.domain} - Score: {audit.health_score}/100 - {audit.created_at.strftime('%m/%d/%Y %H:%M') if audit.created_at else 'N/A'}"):
-                            # Convert audit object to data dict format (same as single audit)
-                            data = {
+                        # Checkbox and expander for each audit
+                        col_check, col_expand = st.columns([0.5, 11.5])
+                        with col_check:
+                            is_selected = audit.id in st.session_state.audit_bulk_selected
+                            if st.checkbox("", value=is_selected, key=f"audit_check_{audit.id}", label_visibility="collapsed"):
+                                st.session_state.audit_bulk_selected.add(audit.id)
+                            else:
+                                st.session_state.audit_bulk_selected.discard(audit.id)
+                        
+                        with col_expand:
+                            # Create expander for each audit with summary info
+                            with st.expander(f"{status_icon} {audit.domain} - Score: {audit.health_score}/100 - {audit.created_at.strftime('%m/%d/%Y %H:%M') if audit.created_at else 'N/A'}"):
+                                # Convert audit object to data dict format (same as single audit)
+                                data = {
                                 'url': audit.url,
                                 'domain': audit.domain,
                                 'score': audit.health_score,
