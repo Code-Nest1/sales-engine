@@ -52,20 +52,66 @@ st.set_page_config(
 if 'user_theme' not in st.session_state:
     st.session_state.user_theme = 'light'
 
-# Branding
-COMPANY_NAME = "Code Nest"
-COMPANY_TAGLINE = "Launch. Scale. Optimize."
-CONTACT_EMAIL = "services@codenest.agency"
+# ============================================================================
+# CODE NEST BRANDING SYSTEM (CENTRALIZED)
+# ============================================================================
 
-# Color scheme
-COLORS = {
-    "success": "#00D084",
+# Company Information
+COMPANY_NAME = "Code Nest LLC"
+COMPANY_TAGLINE = "Launch. Scale. Optimize."
+COMPANY_WEBSITE = "https://www.codenest.agency"
+CONTACT_EMAIL = "services@codenest.agency"
+COMPANY_LOCATION = "New Mexico, USA"
+
+# Brand Colors
+BRAND_COLORS = {
+    # Primary Brand Colors
+    "primary_dark_green": "#0c3740",      # Primary Dark Green
+    "accent_light_green": "#2b945f",      # Accent Light Green  
+    "branding_grey": "#5a5a5a",           # Branding Grey
+    "white": "#feffff",                   # Brand White
+    
+    # UI Colors (for app interface)
+    "success": "#2b945f",                 # Use accent green for success
     "warning": "#FFA500",
     "danger": "#FF6B6B",
-    "info": "#0066CC",
-    "primary": "#0066CC",
-    "neutral": "#666666"
+    "info": "#0c3740",                    # Use primary dark green
+    "primary": "#0c3740",
+    "neutral": "#5a5a5a"
 }
+
+# Legacy COLORS dict for backward compatibility
+COLORS = {
+    "success": BRAND_COLORS["success"],
+    "warning": BRAND_COLORS["warning"],
+    "danger": BRAND_COLORS["danger"],
+    "info": BRAND_COLORS["info"],
+    "primary": BRAND_COLORS["primary"],
+    "neutral": BRAND_COLORS["neutral"]
+}
+
+# Brand Assets Paths
+ASSETS_DIR = Path(__file__).parent / "assets"
+PDF_LOGO_PATH = ASSETS_DIR / "codenest-logo.png"
+EMAIL_LOGO_URL = "https://www.codenest.agency/logo.png"  # Update with actual hosted URL
+
+# Ensure assets directory exists
+ASSETS_DIR.mkdir(exist_ok=True)
+
+def check_brand_assets():
+    """Check if required brand assets exist and print messages if missing."""
+    missing_assets = []
+    
+    if not PDF_LOGO_PATH.exists():
+        missing_assets.append(f"Please upload: {PDF_LOGO_PATH}")
+    
+    return missing_assets
+
+# Check for missing assets at startup
+_missing_assets = check_brand_assets()
+if _missing_assets:
+    for msg in _missing_assets:
+        print(f"⚠️ BRANDING: {msg}")
 
 # Initialize database
 DB_AVAILABLE = False
@@ -473,6 +519,222 @@ def is_smtp_configured() -> bool:
         )
     except Exception:
         return False
+
+# ============================================================================
+# BRANDED HTML EMAIL TEMPLATE
+# ============================================================================
+
+def build_branded_email_html(content_text: str, subject: str = "") -> str:
+    """
+    Wrap AI-generated email content in a professional branded HTML template.
+    
+    Uses inline CSS only for maximum email client compatibility.
+    Tested for: Gmail, Outlook, Apple Mail, Yahoo Mail.
+    
+    Args:
+        content_text: The AI-generated email body text (plain text)
+        subject: Optional subject for internal reference
+    
+    Returns:
+        Complete HTML email string ready to send
+    """
+    # Convert plain text to HTML paragraphs
+    # Split by double newlines for paragraphs, single newlines for line breaks
+    paragraphs = content_text.strip().split('\n\n')
+    html_content = ""
+    
+    for para in paragraphs:
+        # Handle line breaks within paragraphs
+        para_html = para.replace('\n', '<br>')
+        # Handle bullet points (lines starting with - or •)
+        lines = para_html.split('<br>')
+        formatted_lines = []
+        for line in lines:
+            line = line.strip()
+            if line.startswith('- ') or line.startswith('• '):
+                # Format as bullet point
+                bullet_text = line[2:].strip()
+                formatted_lines.append(f'<span style="color: {BRAND_COLORS["accent_light_green"]};">•</span> {bullet_text}')
+            elif line.startswith('* '):
+                bullet_text = line[2:].strip()
+                formatted_lines.append(f'<span style="color: {BRAND_COLORS["accent_light_green"]};">•</span> {bullet_text}')
+            else:
+                formatted_lines.append(line)
+        
+        para_html = '<br>'.join(formatted_lines)
+        html_content += f'<p style="margin: 0 0 16px 0; line-height: 1.6;">{para_html}</p>'
+    
+    # Build the complete HTML email
+    html_template = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{COMPANY_NAME}</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: Arial, Helvetica, sans-serif; background-color: #f4f4f4;">
+    <!-- Main Container -->
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color: #f4f4f4;">
+        <tr>
+            <td style="padding: 20px 0;">
+                <!-- Email Content Container -->
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="600" style="margin: 0 auto; max-width: 600px;">
+                    
+                    <!-- Header Section - Dark Green Background -->
+                    <tr>
+                        <td style="background-color: {BRAND_COLORS['primary_dark_green']}; padding: 25px 30px; text-align: center; border-radius: 8px 8px 0 0;">
+                            <!-- Logo placeholder - Update EMAIL_LOGO_URL with actual hosted logo -->
+                            <img src="{EMAIL_LOGO_URL}" alt="{COMPANY_NAME}" width="180" style="max-width: 180px; height: auto; display: block; margin: 0 auto;" onerror="this.style.display='none'">
+                            <h1 style="color: {BRAND_COLORS['white']}; font-size: 24px; font-weight: bold; margin: 15px 0 5px 0;">{COMPANY_NAME}</h1>
+                            <p style="color: {BRAND_COLORS['accent_light_green']}; font-size: 14px; margin: 0; font-style: italic;">{COMPANY_TAGLINE}</p>
+                        </td>
+                    </tr>
+                    
+                    <!-- Accent Line -->
+                    <tr>
+                        <td style="background-color: {BRAND_COLORS['accent_light_green']}; height: 4px;"></td>
+                    </tr>
+                    
+                    <!-- Body Section - White Background -->
+                    <tr>
+                        <td style="background-color: {BRAND_COLORS['white']}; padding: 35px 30px;">
+                            <div style="color: {BRAND_COLORS['branding_grey']}; font-size: 15px; line-height: 1.6;">
+                                {html_content}
+                            </div>
+                        </td>
+                    </tr>
+                    
+                    <!-- Footer Section -->
+                    <tr>
+                        <td style="background-color: #f8f8f8; padding: 25px 30px; border-top: 1px solid #e0e0e0; border-radius: 0 0 8px 8px;">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                                <tr>
+                                    <td style="text-align: center;">
+                                        <p style="color: {BRAND_COLORS['primary_dark_green']}; font-size: 14px; font-weight: bold; margin: 0 0 8px 0;">{COMPANY_NAME}</p>
+                                        <p style="color: {BRAND_COLORS['branding_grey']}; font-size: 12px; margin: 0 0 5px 0;">
+                                            <a href="{COMPANY_WEBSITE}" style="color: {BRAND_COLORS['accent_light_green']}; text-decoration: none;">{COMPANY_WEBSITE}</a>
+                                        </p>
+                                        <p style="color: {BRAND_COLORS['branding_grey']}; font-size: 12px; margin: 0 0 5px 0;">
+                                            <a href="mailto:{CONTACT_EMAIL}" style="color: {BRAND_COLORS['accent_light_green']}; text-decoration: none;">{CONTACT_EMAIL}</a>
+                                        </p>
+                                        <p style="color: {BRAND_COLORS['branding_grey']}; font-size: 11px; margin: 10px 0 0 0;">{COMPANY_LOCATION}</p>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>'''
+    
+    return html_template
+
+def send_branded_email_with_pdf(to_email: str, subject: str, body: str, pdf_bytes: bytes = None, filename: str = "audit_report.pdf") -> tuple[bool, str]:
+    """
+    Send branded HTML email with optional PDF attachment.
+    
+    This wraps the email body in the Code Nest branded HTML template
+    and sends it as a multipart email with both plain text and HTML versions.
+    
+    Args:
+        to_email: Recipient email address
+        subject: Email subject line
+        body: Plain text email body (will be wrapped in branded HTML)
+        pdf_bytes: Optional PDF file as bytes
+        filename: Name for the PDF attachment
+    
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    try:
+        config = load_email_config()
+        
+        # Validate configuration
+        if not config.get("enabled"):
+            return False, "Email notifications are disabled. Go to API Settings to enable."
+        
+        if not config.get("smtp_server") or not config.get("sender_email") or not config.get("sender_password"):
+            return False, "SMTP not configured. Go to API Settings to configure SMTP first."
+        
+        # Validate recipient email
+        is_valid, error_msg = validate_email(to_email)
+        if not is_valid:
+            return False, f"Invalid recipient email: {error_msg}"
+        
+        # Create multipart message (alternative for text/html + mixed for attachments)
+        if pdf_bytes:
+            msg = MIMEMultipart("mixed")
+            msg_alt = MIMEMultipart("alternative")
+        else:
+            msg = MIMEMultipart("alternative")
+            msg_alt = msg
+        
+        msg["Subject"] = subject
+        msg["From"] = f"{config.get('from_name', COMPANY_NAME)} <{config['sender_email']}>"
+        msg["To"] = to_email
+        if config.get("reply_to"):
+            msg["Reply-To"] = config["reply_to"]
+        
+        # Attach plain text version (fallback)
+        plain_text = body
+        msg_alt.attach(MIMEText(plain_text, "plain", "utf-8"))
+        
+        # Attach branded HTML version
+        html_body = build_branded_email_html(body, subject)
+        msg_alt.attach(MIMEText(html_body, "html", "utf-8"))
+        
+        # If we have attachments, add the alternative part to mixed
+        if pdf_bytes:
+            msg.attach(msg_alt)
+            
+            # Attach PDF
+            pdf_attachment = MIMEBase("application", "pdf")
+            pdf_attachment.set_payload(pdf_bytes)
+            encoders.encode_base64(pdf_attachment)
+            pdf_attachment.add_header(
+                "Content-Disposition",
+                f"attachment; filename={filename}"
+            )
+            msg.attach(pdf_attachment)
+        
+        # Connect and send
+        smtp_port = config.get("smtp_port", 587)
+        smtp_server = config["smtp_server"]
+        
+        if smtp_port == 465:
+            # SSL connection
+            server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
+        else:
+            # TLS connection (port 587)
+            server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
+            server.starttls()
+        
+        server.login(config["sender_email"], config["sender_password"])
+        server.sendmail(config["sender_email"], to_email, msg.as_string())
+        server.quit()
+        
+        # Log the notification
+        log_notification(to_email, subject, "sent_branded_html")
+        logger.info(f"Branded HTML email sent to {to_email}: {subject}")
+        
+        return True, f"Email sent successfully to {to_email}"
+        
+    except smtplib.SMTPAuthenticationError:
+        logger.error("SMTP authentication failed")
+        return False, "Authentication failed - check your SMTP credentials in API Settings"
+    except smtplib.SMTPConnectError:
+        logger.error("SMTP connection failed")
+        return False, "Could not connect to SMTP server - check host and port in API Settings"
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error: {str(e)}")
+        return False, f"Email service error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Error sending branded email: {str(e)}")
+        return False, f"Error: {str(e)}"
 
 def log_notification(recipient, subject, status):
     """Log sent notifications."""
@@ -2448,11 +2710,11 @@ def show_api_settings():
                 }
                 save_email_config(test_config)
                 
-                # Send test email
-                success, message = send_email_with_pdf(
+                # Send test email with branding
+                success, message = send_branded_email_with_pdf(
                     test_email_addr,
                     "Test Email from Code Nest Sales Engine",
-                    "This is a test email to verify your SMTP configuration is working correctly.\n\nIf you received this, your email settings are configured properly!\n\n- Code Nest Team",
+                    "This is a test email to verify your SMTP configuration is working correctly.\n\nIf you received this, your email settings are configured properly!\n\nYou should see this message wrapped in our branded HTML email template with:\n- Dark green header with logo\n- White content area\n- Professional footer with contact info\n\n- Code Nest Team",
                     None,  # No PDF attachment for test
                     ""
                 )
@@ -2722,8 +2984,8 @@ def show_single_audit():
                                 st.warning(f"Could not generate PDF: {e}")
                                 pdf_bytes = None
                         
-                        # Send email
-                        success, message = send_email_with_pdf(
+                        # Send branded HTML email with PDF attachment
+                        success, message = send_branded_email_with_pdf(
                             to_email=to_email,
                             subject=email_subject,
                             body=email_body,
@@ -5165,81 +5427,290 @@ def load_email_templates():
         return {}
 
 class PDFReport(FPDF):
-    """Enhanced PDF report generator."""
+    """
+    Enhanced PDF report generator with Code Nest branding.
+    
+    Features:
+    - Professional cover page with logo
+    - Branded color scheme (dark green #0c3740, accent green #2b945f)
+    - Section-specific styling
+    - Consistent typography and spacing
+    """
+    
+    def __init__(self):
+        super().__init__()
+        # Convert hex colors to RGB for FPDF
+        self.brand_dark_green = (12, 55, 64)      # #0c3740
+        self.brand_accent_green = (43, 148, 95)   # #2b945f
+        self.brand_grey = (90, 90, 90)            # #5a5a5a
+        self.brand_white = (254, 255, 255)        # #feffff
+        self.brand_light_bg = (245, 250, 248)     # Light greenish tint
+        
+        # Check for logo file
+        self.logo_available = PDF_LOGO_PATH.exists()
+        if not self.logo_available:
+            print(f"⚠️ BRANDING: Please upload: {PDF_LOGO_PATH}")
+    
     def header(self):
-        self.set_font('Arial', 'B', 24)
-        self.set_text_color(0, 102, 204)
-        self.cell(0, 10, clean_text(COMPANY_NAME), 0, 1, 'L')
+        """Branded header with logo and accent line."""
+        # Add logo if available
+        if self.logo_available:
+            try:
+                self.image(str(PDF_LOGO_PATH), 10, 8, 40)
+                self.set_xy(55, 10)
+            except Exception:
+                self.set_xy(10, 10)
+        else:
+            self.set_xy(10, 10)
+        
+        # Company name in dark green
+        self.set_font('Arial', 'B', 22)
+        self.set_text_color(*self.brand_dark_green)
+        self.cell(0, 10, clean_text(COMPANY_NAME), 0, 1, 'L' if self.logo_available else 'L')
+        
+        # Tagline in accent green
+        if self.logo_available:
+            self.set_x(55)
         self.set_font('Arial', 'I', 11)
-        self.set_text_color(100, 100, 100)
-        self.cell(0, 8, clean_text(COMPANY_TAGLINE), 0, 1, 'L')
-        self.set_draw_color(0, 102, 204)
-        self.set_line_width(1)
+        self.set_text_color(*self.brand_accent_green)
+        self.cell(0, 6, clean_text(COMPANY_TAGLINE), 0, 1, 'L')
+        
+        # Branded accent line
+        self.set_draw_color(*self.brand_dark_green)
+        self.set_line_width(1.5)
         self.line(10, 30, 200, 30)
+        
+        # Thin accent line below
+        self.set_draw_color(*self.brand_accent_green)
+        self.set_line_width(0.5)
+        self.line(10, 32, 200, 32)
+        
+        self.ln(15)
+    
+    def footer(self):
+        """Branded footer with contact info."""
+        self.set_y(-25)
+        
+        # Accent line above footer
+        self.set_draw_color(*self.brand_accent_green)
+        self.set_line_width(0.3)
+        self.line(10, self.get_y(), 200, self.get_y())
+        self.ln(3)
+        
+        # Footer text
+        self.set_font('Arial', '', 8)
+        self.set_text_color(*self.brand_grey)
+        self.cell(0, 4, f"{COMPANY_NAME} | {COMPANY_WEBSITE}", 0, 1, 'C')
+        self.cell(0, 4, f"{CONTACT_EMAIL} | {COMPANY_LOCATION}", 0, 1, 'C')
+        
+        # Page number
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 4, f"Page {self.page_no()}", 0, 0, 'C')
+    
+    def add_cover_page(self, domain: str, score: int):
+        """Add professional branded cover page."""
+        self.add_page()
+        
+        # Large logo at top center
+        if self.logo_available:
+            try:
+                self.image(str(PDF_LOGO_PATH), 75, 30, 60)
+                self.ln(70)
+            except Exception:
+                self.ln(40)
+        else:
+            self.ln(40)
+        
+        # Main title
+        self.set_font('Arial', 'B', 28)
+        self.set_text_color(*self.brand_dark_green)
+        self.cell(0, 15, "Website Performance", 0, 1, 'C')
+        self.cell(0, 15, "& Growth Audit", 0, 1, 'C')
+        self.ln(5)
+        
+        # Accent line
+        self.set_draw_color(*self.brand_accent_green)
+        self.set_line_width(2)
+        self.line(60, self.get_y(), 150, self.get_y())
+        self.ln(15)
+        
+        # Client domain
+        self.set_font('Arial', 'B', 18)
+        self.set_text_color(*self.brand_grey)
+        self.cell(0, 10, "Prepared for:", 0, 1, 'C')
+        self.set_font('Arial', 'B', 22)
+        self.set_text_color(*self.brand_dark_green)
+        self.cell(0, 12, clean_text(domain), 0, 1, 'C')
         self.ln(10)
-
-    def section_title(self, label):
+        
+        # Health score badge
+        self.set_font('Arial', 'B', 14)
+        self.set_text_color(*self.brand_grey)
+        self.cell(0, 8, "Overall Health Score", 0, 1, 'C')
+        
+        # Score with color coding
+        self.set_font('Arial', 'B', 48)
+        if score >= 70:
+            self.set_text_color(*self.brand_accent_green)
+        elif score >= 40:
+            self.set_text_color(255, 165, 0)  # Orange
+        else:
+            self.set_text_color(200, 60, 60)  # Red
+        self.cell(0, 25, f"{score}/100", 0, 1, 'C')
+        self.ln(15)
+        
+        # Date
+        self.set_font('Arial', '', 12)
+        self.set_text_color(*self.brand_grey)
+        self.cell(0, 8, f"Report Date: {datetime.now().strftime('%B %d, %Y')}", 0, 1, 'C')
+        
+        # Bottom contact block
+        self.set_y(-60)
+        self.set_fill_color(*self.brand_dark_green)
+        self.rect(0, self.get_y(), 210, 50, 'F')
+        
+        self.set_y(-55)
+        self.set_font('Arial', 'B', 12)
+        self.set_text_color(*self.brand_white)
+        self.cell(0, 8, COMPANY_NAME, 0, 1, 'C')
+        self.set_font('Arial', '', 10)
+        self.cell(0, 6, COMPANY_WEBSITE, 0, 1, 'C')
+        self.cell(0, 6, f"{CONTACT_EMAIL} | {COMPANY_LOCATION}", 0, 1, 'C')
+    
+    def section_title(self, label, color_type="default"):
+        """
+        Branded section title with color-coded styling.
+        
+        color_type options: 'default', 'issues', 'quick_wins', 'ai_insights'
+        """
         self.ln(5)
         self.set_font('Arial', 'B', 14)
-        self.set_fill_color(240, 248, 255)
-        self.set_text_color(0, 0, 0)
+        
+        # Set colors based on section type
+        if color_type == "issues":
+            self.set_fill_color(255, 240, 240)  # Light red tint
+            self.set_text_color(180, 60, 60)
+        elif color_type == "quick_wins":
+            self.set_fill_color(240, 255, 245)  # Light green tint
+            self.set_text_color(*self.brand_accent_green)
+        elif color_type == "ai_insights":
+            self.set_fill_color(*self.brand_light_bg)
+            self.set_text_color(*self.brand_dark_green)
+        else:
+            self.set_fill_color(*self.brand_light_bg)
+            self.set_text_color(*self.brand_dark_green)
+        
+        # Draw section header with left accent bar
+        y_start = self.get_y()
+        self.set_draw_color(*self.brand_accent_green)
+        self.set_line_width(3)
+        self.line(10, y_start, 10, y_start + 10)
+        
         self.cell(0, 10, f"  {clean_text(label)}", 0, 1, 'L', fill=True)
         self.ln(4)
-
+    
     def chapter_body(self, text):
+        """Standard body text with proper styling."""
         self.set_font('Arial', '', 10)
-        self.set_text_color(50, 50, 50)
+        self.set_text_color(*self.brand_grey)
         self.multi_cell(0, 5, clean_text(text))
         self.ln()
+    
+    def bullet_point(self, text, indent=0):
+        """Consistent bullet point formatting."""
+        self.set_font('Arial', '', 10)
+        self.set_text_color(*self.brand_grey)
+        
+        # Bullet in accent green
+        self.set_x(10 + indent)
+        self.set_text_color(*self.brand_accent_green)
+        self.cell(5, 5, chr(149), 0, 0)  # Bullet character
+        
+        # Text in grey
+        self.set_text_color(*self.brand_grey)
+        self.multi_cell(0, 5, f" {clean_text(text)}")
 
 def generate_pdf(data):
-    """Generate enhanced PDF report with AI Insights page."""
+    """Generate enhanced branded PDF report with cover page and AI Insights."""
     pdf = PDFReport()
+    
+    # Extract domain for cover page
+    domain = data.get('url', 'Unknown')
+    if '://' in domain:
+        domain = domain.split('://')[1].split('/')[0]
+    domain = domain.replace('www.', '')
+    
+    score = data.get('score', 0)
+    
+    # =========================================================================
+    # COVER PAGE
+    # =========================================================================
+    pdf.add_cover_page(domain, score)
+    
+    # =========================================================================
+    # AUDIT DETAILS PAGE
+    # =========================================================================
     pdf.add_page()
-
-    # Title
-    pdf.set_font('Arial', 'B', 16)
-    pdf.cell(0, 10, f"Website Audit: {clean_text(data['url'])}", 0, 1)
     
-    # Score with color
-    if data['score'] > 70:
-        pdf.set_text_color(0, 128, 0)
-    elif data['score'] > 40:
-        pdf.set_text_color(255, 165, 0)
-    else:
-        pdf.set_text_color(200, 0, 0)
-    pdf.cell(0, 10, f"Health Score: {data['score']}/100", 0, 1)
+    # Audit Summary Section
+    pdf.section_title("Audit Summary")
     
-    # Meta info
-    pdf.set_text_color(0, 0, 0)
+    # Key metrics in a clean layout
     pdf.set_font('Arial', '', 10)
-    pdf.cell(0, 6, f"Domain Age: {data.get('domain_age', 'Unknown')}", 0, 1)
-    pdf.cell(0, 6, f"Report Date: {datetime.now().strftime('%B %d, %Y at %H:%M')}", 0, 1)
+    pdf.set_text_color(*pdf.brand_grey)
+    
+    metrics = [
+        ("Domain", domain),
+        ("Health Score", f"{score}/100"),
+        ("Domain Age", data.get('domain_age', 'Unknown')),
+        ("Report Date", datetime.now().strftime('%B %d, %Y at %H:%M')),
+    ]
+    
     if data.get('psi'):
-        pdf.cell(0, 6, f"Google Speed Score: {data['psi']}/100", 0, 1)
+        metrics.append(("Google PageSpeed Score", f"{data['psi']}/100"))
     if data.get('accessibility_score'):
-        pdf.cell(0, 6, f"Accessibility Score: {data['accessibility_score']}/100", 0, 1)
-    pdf.cell(0, 6, f"Audit ID: {data.get('audit_id', 'N/A')}", 0, 1)
+        metrics.append(("Accessibility Score", f"{data['accessibility_score']}/100"))
+    if data.get('audit_id'):
+        metrics.append(("Audit ID", str(data['audit_id'])))
+    
+    for label, value in metrics:
+        pdf.set_font('Arial', 'B', 10)
+        pdf.set_text_color(*pdf.brand_dark_green)
+        pdf.cell(60, 6, f"{label}:", 0, 0)
+        pdf.set_font('Arial', '', 10)
+        pdf.set_text_color(*pdf.brand_grey)
+        pdf.cell(0, 6, str(value), 0, 1)
+    
     pdf.ln(5)
 
     # Tech stack
     pdf.section_title("Technology Stack")
-    tech = ", ".join(data['tech_stack']) if data['tech_stack'] else "Standard"
-    pdf.chapter_body(f"Detected: {tech}")
+    tech = ", ".join(data['tech_stack']) if data.get('tech_stack') else "Standard HTML/CSS"
+    pdf.chapter_body(f"Detected technologies: {tech}")
 
-    # Issues
-    pdf.section_title("Critical Findings")
-    if data['issues']:
+    # =========================================================================
+    # CRITICAL FINDINGS (Issues)
+    # =========================================================================
+    pdf.section_title("Critical Findings", color_type="issues")
+    
+    if data.get('issues'):
         for issue in data['issues']:
+            # Issue title in bold
             pdf.set_font('Arial', 'B', 10)
-            pdf.set_text_color(180, 0, 0)
-            pdf.cell(0, 6, f"[!] {clean_text(issue['title'])}", 0, 1)
-            pdf.set_font('Arial', '', 10)
-            pdf.set_text_color(50, 50, 50)
-            pdf.multi_cell(0, 5, f"Impact: {clean_text(issue['impact'])}")
+            pdf.set_text_color(180, 60, 60)
+            issue_title = issue.get('title', str(issue)) if isinstance(issue, dict) else str(issue)
+            pdf.cell(0, 6, f"[!] {clean_text(issue_title)}", 0, 1)
+            
+            # Impact in italic
+            if isinstance(issue, dict) and issue.get('impact'):
+                pdf.set_font('Arial', 'I', 9)
+                pdf.set_text_color(*pdf.brand_grey)
+                pdf.multi_cell(0, 4, f"    Impact: {clean_text(issue['impact'])}")
             pdf.ln(2)
     else:
-        pdf.chapter_body("No critical issues detected.")
+        pdf.set_font('Arial', 'I', 10)
+        pdf.set_text_color(*pdf.brand_accent_green)
+        pdf.cell(0, 6, "No critical issues detected - Great job!", 0, 1)
 
     # =========================================================================
     # AI INSIGHTS PAGE
@@ -5247,101 +5718,104 @@ def generate_pdf(data):
     if data.get('ai') and data['ai'].get('insights'):
         pdf.add_page()
         
-        # AI Insights header
-        pdf.set_font('Arial', 'B', 18)
-        pdf.set_text_color(0, 102, 204)
+        # AI Insights header - centered with branding
+        pdf.set_font('Arial', 'B', 20)
+        pdf.set_text_color(*pdf.brand_dark_green)
         pdf.cell(0, 12, "AI-Powered Insights", 0, 1, 'C')
-        pdf.set_draw_color(0, 102, 204)
-        pdf.line(60, pdf.get_y(), 150, pdf.get_y())
-        pdf.ln(8)
+        
+        # Decorative lines
+        pdf.set_draw_color(*pdf.brand_accent_green)
+        pdf.set_line_width(1)
+        y = pdf.get_y()
+        pdf.line(70, y, 140, y)
+        pdf.ln(10)
         
         insights = data['ai']['insights']
         
         # Snapshot Summary
         if insights.get('snapshot_summary'):
-            pdf.set_font('Arial', 'B', 12)
-            pdf.set_text_color(0, 0, 0)
-            pdf.cell(0, 8, "Snapshot Summary", 0, 1)
-            pdf.set_font('Arial', '', 10)
-            pdf.set_text_color(50, 50, 50)
+            pdf.section_title("Snapshot Summary", color_type="ai_insights")
             for bullet in insights['snapshot_summary']:
-                pdf.cell(5, 5, chr(149), 0, 0)  # Bullet point
-                pdf.multi_cell(0, 5, f" {clean_text(bullet)}")
+                pdf.bullet_point(bullet)
             pdf.ln(4)
         
-        # Top 3 Issues
+        # Top 3 Issues - Red/Orange themed
         if insights.get('top_3_issues'):
-            pdf.set_font('Arial', 'B', 12)
-            pdf.set_text_color(180, 0, 0)
-            pdf.cell(0, 8, "Top 3 Issues Hurting You Most", 0, 1)
-            pdf.set_text_color(50, 50, 50)
+            pdf.section_title("Top 3 Issues Hurting You Most", color_type="issues")
             for item in insights['top_3_issues']:
                 pdf.set_font('Arial', 'B', 10)
+                pdf.set_text_color(180, 60, 60)
                 pdf.cell(5, 5, chr(149), 0, 0)
                 pdf.cell(0, 5, f" {clean_text(item.get('issue', ''))}", 0, 1)
+                
                 pdf.set_font('Arial', 'I', 9)
-                pdf.cell(10, 5, "", 0, 0)  # Indent
+                pdf.set_text_color(*pdf.brand_grey)
+                pdf.set_x(20)
                 pdf.multi_cell(0, 4, f"Impact: {clean_text(item.get('impact', ''))}")
             pdf.ln(4)
         
-        # Quick Wins
+        # Quick Wins - Green themed
         if insights.get('quick_wins'):
-            pdf.set_font('Arial', 'B', 12)
-            pdf.set_text_color(0, 128, 0)
-            pdf.cell(0, 8, "Quick Wins (Next 30 Days)", 0, 1)
-            pdf.set_font('Arial', '', 10)
-            pdf.set_text_color(50, 50, 50)
+            pdf.section_title("Quick Wins (Next 30 Days)", color_type="quick_wins")
             for idx, win in enumerate(insights['quick_wins'], 1):
-                pdf.cell(0, 5, f"{idx}. {clean_text(win)}", 0, 1)
+                pdf.set_font('Arial', '', 10)
+                pdf.set_text_color(*pdf.brand_accent_green)
+                pdf.cell(8, 5, f"{idx}.", 0, 0)
+                pdf.set_text_color(*pdf.brand_grey)
+                pdf.multi_cell(0, 5, clean_text(win))
             pdf.ln(4)
         
-        # How Code Nest Can Help
+        # How Code Nest Can Help - Brand themed
         if insights.get('code_nest_services'):
-            pdf.set_font('Arial', 'B', 12)
-            pdf.set_text_color(0, 102, 204)
-            pdf.cell(0, 8, "How Code Nest Can Help", 0, 1)
-            pdf.set_text_color(50, 50, 50)
+            pdf.section_title(f"How {COMPANY_NAME} Can Help", color_type="ai_insights")
             for item in insights['code_nest_services']:
                 pdf.set_font('Arial', 'B', 10)
+                pdf.set_text_color(*pdf.brand_dark_green)
                 pdf.cell(5, 5, chr(149), 0, 0)
                 pdf.cell(0, 5, f" {clean_text(item.get('issue', ''))}", 0, 1)
+                
                 pdf.set_font('Arial', '', 9)
-                pdf.cell(10, 5, "", 0, 0)  # Indent
-                pdf.set_text_color(0, 102, 204)
+                pdf.set_x(15)
+                pdf.set_text_color(*pdf.brand_accent_green)
                 pdf.multi_cell(0, 4, f"-> {clean_text(item.get('service', ''))}")
-                pdf.set_text_color(50, 50, 50)
+                pdf.set_text_color(*pdf.brand_grey)
             pdf.ln(4)
         
-        # Suggested Next Step
+        # Suggested Next Step - Call to Action box
         if insights.get('next_step'):
+            pdf.ln(5)
+            pdf.set_fill_color(*pdf.brand_light_bg)
+            pdf.set_draw_color(*pdf.brand_dark_green)
+            pdf.set_line_width(1)
+            
+            # Draw box
+            y_start = pdf.get_y()
+            pdf.rect(10, y_start, 190, 25, 'DF')
+            
+            pdf.set_xy(15, y_start + 3)
             pdf.set_font('Arial', 'B', 12)
-            pdf.set_text_color(0, 0, 0)
-            pdf.set_fill_color(240, 248, 255)
-            pdf.cell(0, 8, "Suggested Next Step", 0, 1, fill=True)
-            pdf.set_font('Arial', '', 11)
-            pdf.set_text_color(0, 102, 204)
-            pdf.ln(2)
-            pdf.multi_cell(0, 6, clean_text(insights['next_step']))
+            pdf.set_text_color(*pdf.brand_dark_green)
+            pdf.cell(0, 6, "Suggested Next Step", 0, 1)
+            
+            pdf.set_x(15)
+            pdf.set_font('Arial', '', 10)
+            pdf.set_text_color(*pdf.brand_accent_green)
+            pdf.multi_cell(180, 5, clean_text(insights['next_step']))
             pdf.ln(4)
     
     # Legacy AI summary (for backward compatibility)
     elif data.get('ai') and data['ai'].get('summary'):
-        pdf.section_title("Executive Summary")
+        pdf.add_page()
+        pdf.section_title("Executive Summary", color_type="ai_insights")
         pdf.chapter_body(data['ai'].get('summary', ''))
         
         if data['ai'].get('impact'):
-            pdf.section_title("Business Impact")
+            pdf.section_title("Business Impact", color_type="issues")
             pdf.chapter_body(data['ai'].get('impact', ''))
         
         if data['ai'].get('solutions'):
-            pdf.section_title("Recommended Solutions")
+            pdf.section_title("Recommended Solutions", color_type="quick_wins")
             pdf.chapter_body(data['ai'].get('solutions', ''))
-
-    # Footer
-    pdf.ln(10)
-    pdf.set_font('Arial', 'I', 8)
-    pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 6, f"Report by {COMPANY_NAME} | {CONTACT_EMAIL}", 0, 1, 'C')
 
     return pdf.output(dest='S').encode('latin-1')
 
