@@ -71,6 +71,7 @@ if DATABASE_URL:
 
 USERS_PATH = Path(__file__).parent / "users.json"
 TWO_FA_PATH = Path(__file__).parent / "two_fa.json"
+SESSIONS_PATH = Path(__file__).parent / "sessions.json"
 
 def init_users_file():
     """Create users.json if it doesn't exist."""
@@ -81,6 +82,65 @@ def init_2fa_file():
     """Create two_fa.json if it doesn't exist."""
     if not TWO_FA_PATH.exists():
         TWO_FA_PATH.write_text(json.dumps({}, indent=2))
+
+def init_sessions_file():
+    """Create sessions.json if it doesn't exist."""
+    if not SESSIONS_PATH.exists():
+        SESSIONS_PATH.write_text(json.dumps({}, indent=2))
+
+def load_sessions():
+    """Load active sessions."""
+    init_sessions_file()
+    try:
+        return json.loads(SESSIONS_PATH.read_text())
+    except Exception:
+        return {}
+
+def save_sessions(sessions: dict):
+    """Save active sessions."""
+    SESSIONS_PATH.write_text(json.dumps(sessions, indent=2))
+
+def create_session(username: str, role: str) -> str:
+    """Create a new session and return session token."""
+    import uuid
+    import base64
+    
+    session_token = base64.b64encode(uuid.uuid4().bytes).decode()[:32]
+    sessions = load_sessions()
+    
+    sessions[session_token] = {
+        "username": username,
+        "role": role,
+        "created_at": datetime.now().isoformat(),
+        "last_access": datetime.now().isoformat()
+    }
+    save_sessions(sessions)
+    
+    # Also store in browser via query parameter (Streamlit workaround)
+    st.session_state['session_token'] = session_token
+    
+    return session_token
+
+def validate_session(session_token: str) -> dict:
+    """Validate session token and return user info if valid."""
+    sessions = load_sessions()
+    
+    if session_token in sessions:
+        session_data = sessions[session_token]
+        # Update last access time
+        session_data["last_access"] = datetime.now().isoformat()
+        sessions[session_token] = session_data
+        save_sessions(sessions)
+        return session_data
+    
+    return None
+
+def destroy_session(session_token: str):
+    """Destroy a session."""
+    sessions = load_sessions()
+    if session_token in sessions:
+        del sessions[session_token]
+        save_sessions(sessions)
 
 def load_users():
     """Return users dict from users.json."""
@@ -253,10 +313,14 @@ def show_auth_page():
                     st.session_state["2fa_username"] = username
                     st.rerun()
                 else:
+                    # Create persistent session
+                    user_role = users[username].get("role", "user")
+                    session_token = create_session(username, user_role)
+                    st.experimental_set_query_params(session_token=session_token)
                     st.session_state["authenticated"] = True
                     st.session_state["current_user"] = username
-                    st.session_state["is_admin"] = users[username].get("role") == "admin"
-                    st.session_state["user_role"] = users[username].get("role", "user")
+                    st.session_state["is_admin"] = user_role == "admin"
+                    st.session_state["user_role"] = user_role
                     st.success(f"Welcome, {users[username].get('name') or username}!")
                     time.sleep(1)
                     st.rerun()
@@ -270,10 +334,15 @@ def show_auth_page():
             if st.button("Verify 2FA", type="primary"):
                 secrets_2fa = load_2fa_secrets()
                 if token and verify_2fa_token(secrets_2fa[st.session_state["2fa_username"]]["secret"], token):
+                    # Create persistent session
+                    username_2fa = st.session_state["2fa_username"]
+                    user_role = users[username_2fa].get("role", "user")
+                    session_token = create_session(username_2fa, user_role)
+                    st.experimental_set_query_params(session_token=session_token)
                     st.session_state["authenticated"] = True
-                    st.session_state["current_user"] = st.session_state["2fa_username"]
-                    st.session_state["is_admin"] = users[st.session_state["2fa_username"]].get("role") == "admin"
-                    st.session_state["user_role"] = users[st.session_state["2fa_username"]].get("role", "user")
+                    st.session_state["current_user"] = username_2fa
+                    st.session_state["is_admin"] = user_role == "admin"
+                    st.session_state["user_role"] = user_role
                     st.session_state["2fa_pending"] = False
                     st.success("2FA verified!")
                     time.sleep(1)
@@ -318,7 +387,9 @@ def show_auth_page():
 # Initialize auth
 init_users_file()
 init_2fa_file()
+init_sessions_file()
 
+# Initialize authentication state
 if 'authenticated' not in st.session_state:
     st.session_state['authenticated'] = False
     st.session_state['current_user'] = None
@@ -326,6 +397,20 @@ if 'authenticated' not in st.session_state:
     st.session_state['user_role'] = 'user'
     st.session_state['2fa_pending'] = False
     st.session_state['2fa_username'] = None
+
+# --- Session restoration from query params (ALWAYS CHECK FIRST) ---
+query_params = st.experimental_get_query_params()
+if 'session_token' in query_params and not st.session_state.get('authenticated'):
+    token = query_params['session_token'][0]
+    session_info = validate_session(token)
+    if session_info:
+        st.session_state['session_token'] = token
+        st.session_state['authenticated'] = True
+        st.session_state['current_user'] = session_info['username']
+        st.session_state['is_admin'] = session_info['role'] == 'admin'
+        st.session_state['user_role'] = session_info['role']
+        st.session_state['2fa_pending'] = False
+        st.session_state['2fa_username'] = None
 
 if not st.session_state.get('authenticated'):
     show_auth_page()
@@ -403,6 +488,12 @@ with st.sidebar:
         st.session_state['is_admin'] = False
         st.session_state['user_role'] = 'user'
         st.session_state.current_section = 'Single Audit'
+        # Destroy session token
+        if 'session_token' in st.session_state:
+            destroy_session(st.session_state['session_token'])
+            del st.session_state['session_token']
+        # Clear query params to complete logout
+        st.experimental_set_query_params()
         st.rerun()
     
     # 2FA setup (if admin)
@@ -1038,7 +1129,7 @@ def show_email_outreach():
             
             if leads:
                 lead_opts = {f"{l.domain} (Score: {l.health_score}, Opp: {l.opportunity_rating})": l for l in leads}
-                selected_name = st.selectbox("Choose lead", list(lead_opts.keys()))
+                selected
                 selected_lead = lead_opts[selected_name] if selected_name else None
                 
                 if selected_lead:
@@ -1977,62 +2068,3 @@ def show_admin_settings():
         st.info("Slack Webhook: " + ("✓ Configured" if SLACK_WEBHOOK else "Not configured"))
         st.info("OpenAI API: " + ("✓ Configured" if OPENAI_API_KEY else "Not configured"))
         st.info("Database: " + ("✓ Connected" if DB_AVAILABLE else "Not connected"))
-
-# ============================================================================
-# MAIN APPLICATION - NAVIGATION-BASED RENDERING
-# ============================================================================
-
-st.title("🦅 Code Nest Sales Engine Pro")
-st.caption("Intelligent Website Auditing & Lead Generation Platform")
-
-# Admin notification
-users = load_users()
-if st.session_state.get("is_admin"):
-    pending = [u for u in users if users[u].get("admin_request")]
-    if pending:
-        st.warning(f"🔔 {len(pending)} pending admin request(s) - Check Admin Settings")
-
-st.divider()
-
-# Render content based on current section
-if st.session_state.current_section == "Single Audit":
-    show_single_audit()
-
-elif st.session_state.current_section == "Audit History":
-    show_audit_history()
-
-elif st.session_state.current_section == "Bulk Audit":
-    if st.session_state.get("is_admin"):
-        show_bulk_audit()
-    else:
-        st.error("This section is only available for admin users.")
-
-elif st.session_state.current_section == "Competitor Analysis":
-    if st.session_state.get("is_admin"):
-        show_competitor_analysis()
-    else:
-        st.error("This section is only available for admin users.")
-
-elif st.session_state.current_section == "Email Outreach":
-    if st.session_state.get("is_admin"):
-        show_email_outreach()
-    else:
-        st.error("This section is only available for admin users.")
-
-elif st.session_state.current_section == "Scheduled Audits":
-    if st.session_state.get("is_admin"):
-        show_scheduled_audits()
-    else:
-        st.error("This section is only available for admin users.")
-
-elif st.session_state.current_section == "API Settings":
-    if st.session_state.get("is_admin"):
-        show_api_settings()
-    else:
-        st.error("This section is only available for admin users.")
-
-elif st.session_state.current_section == "Admin Settings":
-    if st.session_state.get("is_admin"):
-        show_admin_settings()
-    else:
-        st.error("This section is only available for admin users.")
