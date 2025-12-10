@@ -11,6 +11,6 @@ python-dotenv
 pyotp>=2.8.0
 qrcode>=7.4
 Pillow>=9.0.0
-cryptography>=41.0.0
-openpyxl>=3.10.0
+cryptography>=3.4
+openpyxl>=3.0.0,<3.2
 plotly>=5.0.0
