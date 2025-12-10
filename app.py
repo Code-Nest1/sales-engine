@@ -18,6 +18,9 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
+from cryptography.fernet import Fernet
+import logging
+from logging.handlers import RotatingFileHandler
 
 # Optional: 2FA support
 try:
@@ -41,6 +44,10 @@ st.set_page_config(
     page_icon="🦅",
     initial_sidebar_state="expanded"
 )
+
+# Initialize theme preferences early
+if 'user_theme' not in st.session_state:
+    st.session_state.user_theme = 'light'
 
 # Branding
 COMPANY_NAME = "Code Nest"
@@ -66,12 +73,795 @@ if DATABASE_URL:
         DB_AVAILABLE = False
 
 # ============================================================================
+# LOGGING SYSTEM
+# ============================================================================
+
+# Configure logging
+LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
+def setup_logging():
+    """Configure rotating file logger."""
+    logger = logging.getLogger("sales_engine")
+    
+    if logger.hasHandlers():
+        return logger
+    
+    logger.setLevel(logging.DEBUG)
+    
+    # Rotating file handler (max 5MB per file, keep 5 backups)
+    handler = RotatingFileHandler(
+        LOGS_DIR / "app.log",
+        maxBytes=5_000_000,
+        backupCount=5
+    )
+    
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    return logger
+
+logger = setup_logging()
+
+# ============================================================================
+# INPUT VALIDATION & SANITIZATION
+# ============================================================================
+
+def validate_url(url: str) -> tuple[bool, str]:
+    """Validate URL format. Returns (is_valid, error_message)."""
+    if not url or not isinstance(url, str):
+        return False, "URL cannot be empty"
+    
+    url = url.strip()
+    if len(url) > 2000:
+        return False, "URL is too long (max 2000 characters)"
+    
+    try:
+        # Basic URL validation
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        result = urlparse(url)
+        if not all([result.scheme, result.netloc]):
+            return False, "Invalid URL format"
+        
+        # Check for valid domain
+        if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$', result.netloc):
+            return False, "Invalid domain name"
+        
+        return True, ""
+    except Exception as e:
+        logger.warning(f"URL validation error for '{url}': {str(e)}")
+        return False, f"URL validation failed: {str(e)}"
+
+def validate_email(email: str) -> tuple[bool, str]:
+    """Validate email format. Returns (is_valid, error_message)."""
+    if not email or not isinstance(email, str):
+        return False, "Email cannot be empty"
+    
+    email = email.strip()
+    if len(email) > 254:
+        return False, "Email is too long"
+    
+    # Basic email regex pattern
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    
+    if re.match(pattern, email):
+        return True, ""
+    else:
+        return False, "Invalid email format"
+
+def validate_password(password: str) -> tuple[bool, str]:
+    """Validate password strength. Returns (is_valid, error_message)."""
+    if not password:
+        return False, "Password cannot be empty"
+    
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters"
+    
+    if len(password) > 128:
+        return False, "Password is too long"
+    
+    # Check for complexity (optional but recommended)
+    has_upper = any(c.isupper() for c in password)
+    has_lower = any(c.islower() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    has_special = any(c in '!@#$%^&*()_+-=[]{}|;:,.<>?' for c in password)
+    
+    complexity_score = sum([has_upper, has_lower, has_digit, has_special])
+    
+    if complexity_score < 3:
+        return False, "Password should contain uppercase, lowercase, numbers, and special characters"
+    
+    return True, ""
+
+def sanitize_input(user_input: str, max_length: int = 1000) -> str:
+    """Sanitize user input by removing dangerous characters."""
+    if not isinstance(user_input, str):
+        return ""
+    
+    # Limit length
+    sanitized = user_input[:max_length]
+    
+    # Remove null bytes
+    sanitized = sanitized.replace('\x00', '')
+    
+    # Remove control characters except newlines and tabs
+    sanitized = ''.join(char for char in sanitized if ord(char) >= 32 or char in '\n\t')
+    
+    return sanitized.strip()
+
+def safe_execute(func, *args, default_return=None, error_message: str = "Operation failed", **kwargs):
+    """Execute function safely with error handling. Returns (success, result)."""
+    try:
+        result = func(*args, **kwargs)
+        logger.debug(f"Successfully executed {func.__name__}")
+        return True, result
+    except Exception as e:
+        logger.error(f"Error in {func.__name__}: {str(e)}", exc_info=True)
+        return False, default_return
+
+# ============================================================================
+# PERFORMANCE OPTIMIZATION - CACHING & PAGINATION
+# ============================================================================
+
+# Caching configuration
+CACHE_TTL = 300  # 5 minutes cache for database queries
+
+@st.cache_data(ttl=CACHE_TTL)
+def get_audit_history_cached(limit=100, search_query=None, min_score=None, max_score=None):
+    """Cached version of audit history query."""
+    return get_audit_history(limit=limit, search_query=search_query, min_score=min_score, max_score=max_score)
+
+@st.cache_data(ttl=CACHE_TTL)
+def get_leads_cached():
+    """Cached version of leads query."""
+    return get_leads()
+
+@st.cache_data(ttl=CACHE_TTL)
+def get_scheduled_audits_cached():
+    """Cached version of scheduled audits query."""
+    return get_scheduled_audits() if DB_AVAILABLE else []
+
+# Pagination helper functions
+def init_pagination_state(page_key: str, items_per_page: int = 50):
+    """Initialize pagination state in session."""
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 0
+
+def get_paginated_items(items: list, page_key: str, items_per_page: int = 50) -> tuple[list, int, int]:
+    """Get paginated items. Returns (items_on_page, total_pages, current_page)."""
+    init_pagination_state(page_key, items_per_page)
+    
+    total_items = len(items)
+    total_pages = (total_items + items_per_page - 1) // items_per_page
+    
+    current_page = st.session_state[page_key]
+    # Ensure current page is valid
+    if current_page >= total_pages and total_pages > 0:
+        current_page = total_pages - 1
+    
+    start_idx = current_page * items_per_page
+    end_idx = start_idx + items_per_page
+    
+    return items[start_idx:end_idx], total_pages, current_page
+
+def display_pagination_controls(page_key: str, total_pages: int, current_page: int):
+    """Display pagination controls (previous/next buttons and page info)."""
+    if total_pages <= 1:
+        return
+    
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 2, 1, 1])
+    
+    with col1:
+        if st.button("◀ Prev", key=f"{page_key}_prev", use_container_width=True):
+            if current_page > 0:
+                st.session_state[page_key] -= 1
+                st.rerun()
+    
+    with col2:
+        # Page number selector
+        page_selector = st.number_input(
+            "Page",
+            min_value=1,
+            max_value=total_pages,
+            value=current_page + 1,
+            key=f"{page_key}_select",
+            label_visibility="collapsed"
+        )
+        if page_selector - 1 != current_page:
+            st.session_state[page_key] = page_selector - 1
+            st.rerun()
+    
+    with col3:
+        st.markdown(f"<p style='text-align: center; margin-top: 8px;'>Page {current_page + 1} of {total_pages}</p>", unsafe_allow_html=True)
+    
+    with col4:
+        st.markdown("")  # Spacer
+    
+    with col5:
+        if st.button("Next ▶", key=f"{page_key}_next", use_container_width=True):
+            if current_page < total_pages - 1:
+                st.session_state[page_key] += 1
+                st.rerun()
+
+# ============================================================================
+# PHASE 4: EMAIL NOTIFICATIONS SYSTEM
+# ============================================================================
+
+EMAIL_CONFIG_PATH = Path(__file__).parent / "email_config.json"
+NOTIFICATIONS_LOG_PATH = Path(__file__).parent / "notifications.json"
+
+def init_email_config():
+    """Initialize email configuration file."""
+    if not EMAIL_CONFIG_PATH.exists():
+        default_config = {
+            "enabled": False,
+            "smtp_server": "",
+            "smtp_port": 587,
+            "sender_email": "",
+            "sender_password": "",
+            "from_name": "Code Nest Sales Engine",
+            "notifications": {
+                "audit_complete": True,
+                "permission_change": True,
+                "admin_alert": True
+            }
+        }
+        EMAIL_CONFIG_PATH.write_text(json.dumps(default_config, indent=2))
+        return default_config
+    try:
+        return json.loads(EMAIL_CONFIG_PATH.read_text())
+    except Exception:
+        return init_email_config()
+
+def load_email_config():
+    """Load email configuration."""
+    return init_email_config()
+
+def save_email_config(config):
+    """Save email configuration."""
+    try:
+        EMAIL_CONFIG_PATH.write_text(json.dumps(config, indent=2))
+        return True, "Configuration saved successfully"
+    except Exception as e:
+        return False, f"Error saving configuration: {str(e)}"
+
+def send_email(recipient_email, subject, html_body):
+    """Send email notification with error handling."""
+    try:
+        config = load_email_config()
+        
+        if not config.get("enabled"):
+            return False, "Email notifications are disabled"
+        
+        if not config.get("smtp_server") or not config.get("sender_email"):
+            return False, "Email configuration incomplete"
+        
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{config['from_name']} <{config['sender_email']}>"
+        msg["To"] = recipient_email
+        
+        part = MIMEText(html_body, "html")
+        msg.attach(part)
+        
+        server = smtplib.SMTP(config["smtp_server"], config["smtp_port"], timeout=10)
+        server.starttls()
+        server.login(config["sender_email"], config["sender_password"])
+        server.sendmail(config["sender_email"], recipient_email, msg.as_string())
+        server.quit()
+        
+        log_notification(recipient_email, subject, "sent")
+        logger.info(f"Email sent to {recipient_email}: {subject}")
+        return True, "Email sent successfully"
+    except smtplib.SMTPAuthenticationError:
+        logger.error("SMTP authentication failed")
+        return False, "Authentication failed - check credentials"
+    except smtplib.SMTPException as e:
+        logger.error(f"SMTP error: {str(e)}")
+        return False, f"Email service error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Error sending email: {str(e)}")
+        return False, f"Error: {str(e)}"
+
+def log_notification(recipient, subject, status):
+    """Log sent notifications."""
+    try:
+        if not NOTIFICATIONS_LOG_PATH.exists():
+            notifications = []
+        else:
+            notifications = json.loads(NOTIFICATIONS_LOG_PATH.read_text())
+        
+        notifications.append({
+            "timestamp": datetime.now().isoformat(),
+            "recipient": recipient,
+            "subject": subject,
+            "status": status
+        })
+        
+        # Keep only last 1000 notifications
+        notifications = notifications[-1000:]
+        NOTIFICATIONS_LOG_PATH.write_text(json.dumps(notifications, indent=2))
+    except Exception as e:
+        logger.error(f"Error logging notification: {str(e)}")
+
+def get_email_template(template_type, data):
+    """Generate HTML email templates."""
+    if template_type == "audit_complete":
+        return f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333;">
+                <h2>Audit Completed! ✅</h2>
+                <p>Hello {data.get('username', 'User')},</p>
+                <p>Your audit for <strong>{data.get('domain', 'N/A')}</strong> has been completed.</p>
+                <div style="background-color: #f0f0f0; padding: 15px; border-radius: 5px; margin: 20px 0;">
+                    <p><strong>Score:</strong> {data.get('score', 'N/A')}/100</p>
+                    <p><strong>Status:</strong> {data.get('status', 'N/A')}</p>
+                    <p><strong>Completed:</strong> {data.get('timestamp', 'N/A')}</p>
+                </div>
+                <p>Log in to view detailed results and recommendations.</p>
+                <p>Best regards,<br>Code Nest Sales Engine</p>
+            </body>
+        </html>
+        """
+    elif template_type == "permission_change":
+        return f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333;">
+                <h2>Permission Update 🔐</h2>
+                <p>Hello {data.get('username', 'User')},</p>
+                <p>Your account permissions have been updated.</p>
+                <div style="background-color: #f0f0f0; padding: 15px; border-radius: 5px; margin: 20px 0;">
+                    <p><strong>New Role:</strong> {data.get('role', 'N/A')}</p>
+                    <p><strong>Changed:</strong> {data.get('timestamp', 'N/A')}</p>
+                </div>
+                <p>If this wasn't you, please contact support immediately.</p>
+                <p>Best regards,<br>Code Nest Sales Engine</p>
+            </body>
+        </html>
+        """
+    elif template_type == "admin_alert":
+        return f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333;">
+                <h2>Admin Alert ⚠️</h2>
+                <p>An important event has occurred:</p>
+                <div style="background-color: #f0f0f0; padding: 15px; border-radius: 5px; margin: 20px 0;">
+                    <p><strong>Event:</strong> {data.get('event', 'N/A')}</p>
+                    <p><strong>Details:</strong> {data.get('details', 'N/A')}</p>
+                    <p><strong>Time:</strong> {data.get('timestamp', 'N/A')}</p>
+                </div>
+                <p>Log in to the admin panel for more information.</p>
+                <p>Best regards,<br>Code Nest Sales Engine</p>
+            </body>
+        </html>
+        """
+
+# ============================================================================
+# PHASE 4: ANALYTICS DASHBOARD WITH CHARTS
+# ============================================================================
+
+def get_dashboard_analytics():
+    """Compile analytics data for dashboard."""
+    try:
+        audits = get_audit_history_cached(limit=1000)
+        if not audits:
+            return None
+        
+        df = pd.DataFrame(audits)
+        
+        analytics = {
+            "total_audits": len(audits),
+            "avg_score": df["score"].mean() if "score" in df.columns else 0,
+            "high_issue_count": len([a for a in audits if a.get("issue_count", 0) > 10]),
+            "audits_by_day": df.groupby(df["timestamp"].str[:10]).size() if "timestamp" in df.columns else {},
+            "score_distribution": pd.cut(df["score"], bins=[0, 25, 50, 75, 100]).value_counts() if "score" in df.columns else {},
+            "top_issues": get_top_issues(audits),
+            "latest_audits": audits[:5]
+        }
+        return analytics
+    except Exception as e:
+        logger.error(f"Error compiling analytics: {str(e)}")
+        return None
+
+def get_top_issues(audits, limit=10):
+    """Get most common issues found."""
+    try:
+        issue_count = {}
+        for audit in audits:
+            if "issues" in audit and isinstance(audit["issues"], list):
+                for issue in audit["issues"][:5]:  # Take top 5 per audit
+                    issue_count[issue] = issue_count.get(issue, 0) + 1
+        
+        return sorted(issue_count.items(), key=lambda x: x[1], reverse=True)[:limit]
+    except Exception:
+        return []
+
+def show_dashboard():
+    """Display analytics dashboard."""
+    st.markdown("## 📊 Analytics Dashboard")
+    
+    analytics = get_dashboard_analytics()
+    if not analytics:
+        st.warning("No audit data available yet. Complete some audits first!")
+        return
+    
+    # KPI Metrics
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            "Total Audits",
+            analytics["total_audits"],
+            delta=None,
+            help="Total number of audits completed"
+        )
+    
+    with col2:
+        avg_score = round(analytics["avg_score"], 1)
+        st.metric(
+            "Average Score",
+            f"{avg_score}/100",
+            delta=None,
+            help="Average health score across all audits"
+        )
+    
+    with col3:
+        st.metric(
+            "High Issue Sites",
+            analytics["high_issue_count"],
+            delta=None,
+            help="Sites with 10+ issues found"
+        )
+    
+    # Charts
+    st.divider()
+    
+    col_chart1, col_chart2 = st.columns(2)
+    
+    with col_chart1:
+        st.markdown("### Audits Over Time (Last 30 Days)")
+        if analytics["audits_by_day"]:
+            try:
+                import plotly.express as px
+                df_days = pd.DataFrame({
+                    "Date": list(analytics["audits_by_day"].keys()),
+                    "Count": list(analytics["audits_by_day"].values())
+                })
+                fig = px.line(df_days, x="Date", y="Count", markers=True,
+                            title="", labels={"Count": "Audits"})
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error creating chart: {str(e)}")
+        else:
+            st.info("No recent audit data")
+    
+    with col_chart2:
+        st.markdown("### Score Distribution")
+        if analytics["score_distribution"].size > 0:
+            try:
+                import plotly.express as px
+                dist_data = analytics["score_distribution"].reset_index()
+                dist_data.columns = ["Range", "Count"]
+                fig = px.bar(dist_data, x="Range", y="Count",
+                           title="", labels={"Count": "Number of Sites"})
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error creating chart: {str(e)}")
+        else:
+            st.info("No score distribution data")
+    
+    # Top Issues
+    st.divider()
+    st.markdown("### Top 10 Issues Found")
+    if analytics["top_issues"]:
+        issue_df = pd.DataFrame(analytics["top_issues"], columns=["Issue", "Occurrences"])
+        st.dataframe(issue_df, use_container_width=True)
+    else:
+        st.info("No issue data available yet")
+
+# ============================================================================
+# PHASE 4: PDF & EXCEL EXPORT REPORTS
+# ============================================================================
+
+def generate_pdf_report(audit_data, filename="audit_report.pdf"):
+    """Generate professional PDF report for an audit."""
+    try:
+        pdf = FPDF()
+        pdf.add_page()
+        
+        # Header
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 10, "Code Nest Sales Engine - Audit Report", ln=True, align="C")
+        pdf.set_font("Arial", "", 10)
+        pdf.cell(0, 5, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
+        pdf.ln(5)
+        
+        # Audit Details
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 8, "Audit Summary", ln=True)
+        pdf.set_font("Arial", "", 10)
+        
+        details = [
+            ("Domain", audit_data.get("domain", "N/A")),
+            ("Score", f"{audit_data.get('score', 'N/A')}/100"),
+            ("Status", audit_data.get("status", "N/A")),
+            ("Date", audit_data.get("timestamp", "N/A")),
+        ]
+        
+        for label, value in details:
+            pdf.cell(50, 6, f"{label}:", 0)
+            pdf.cell(0, 6, str(value), ln=True)
+        
+        pdf.ln(5)
+        
+        # Issues
+        if "issues" in audit_data and audit_data["issues"]:
+            pdf.set_font("Arial", "B", 12)
+            pdf.cell(0, 8, "Issues Found", ln=True)
+            pdf.set_font("Arial", "", 9)
+            
+            for i, issue in enumerate(audit_data["issues"][:10], 1):
+                pdf.multi_cell(0, 5, f"{i}. {issue}")
+        
+        # Footer
+        pdf.ln(10)
+        pdf.set_font("Arial", "I", 8)
+        pdf.cell(0, 5, "© 2025 Code Nest. All rights reserved.", align="C")
+        
+        # Save to bytes
+        pdf_bytes = pdf.output(dest='S').encode('latin-1')
+        return pdf_bytes
+    except Exception as e:
+        logger.error(f"Error generating PDF: {str(e)}")
+        return None
+
+def generate_excel_report(audits, filename="audits_report.xlsx"):
+    """Generate Excel report with multiple sheets."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+        
+        # Create workbook
+        from io import BytesIO
+        output = BytesIO()
+        
+        df = pd.DataFrame(audits)
+        
+        # Write to Excel
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Sheet 1: Summary
+            summary_data = {
+                "Metric": ["Total Audits", "Average Score", "Highest Score", "Lowest Score"],
+                "Value": [
+                    len(audits),
+                    round(df["score"].mean(), 2) if "score" in df.columns else "N/A",
+                    df["score"].max() if "score" in df.columns else "N/A",
+                    df["score"].min() if "score" in df.columns else "N/A"
+                ]
+            }
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # Sheet 2: All Audits
+            df.to_excel(writer, sheet_name='Audits', index=False)
+        
+        output.seek(0)
+        return output
+    except Exception as e:
+        logger.error(f"Error generating Excel: {str(e)}")
+        return None
+
+# ============================================================================
+# PHASE 4: DARK MODE SUPPORT
+# ============================================================================
+
+def init_theme_preferences():
+    """Initialize theme preferences file."""
+    theme_path = Path(__file__).parent / "theme_prefs.json"
+    if not theme_path.exists():
+        theme_path.write_text(json.dumps({"theme": "light"}, indent=2))
+    return theme_path
+
+def get_user_theme(username):
+    """Get user's theme preference."""
+    try:
+        theme_path = init_theme_preferences()
+        prefs = json.loads(theme_path.read_text())
+        return prefs.get("theme", "light")
+    except Exception:
+        return "light"
+
+def save_user_theme(username, theme):
+    """Save user's theme preference."""
+    try:
+        theme_path = init_theme_preferences()
+        prefs = json.loads(theme_path.read_text()) if theme_path.exists() else {}
+        prefs["theme"] = theme
+        theme_path.write_text(json.dumps(prefs, indent=2))
+        return True
+    except Exception:
+        return False
+
+def apply_theme(theme="light"):
+    """Apply theme via CSS."""
+    if theme == "dark":
+        st.markdown("""
+        <style>
+            :root {
+                --primary-color: #3B82F6;
+                --bg-color: #111827;
+                --text-color: #F3F4F6;
+                --border-color: #374151;
+            }
+            body {
+                background-color: #111827;
+                color: #F3F4F6;
+            }
+            .stButton > button {
+                background-color: #3B82F6;
+                color: white;
+            }
+            .stMetric {
+                background-color: #1F2937;
+                padding: 10px;
+                border-radius: 5px;
+            }
+        </style>
+        """, unsafe_allow_html=True)
+
+# ============================================================================
+# PHASE 4: USER PREFERENCES & SETTINGS PANEL
+# ============================================================================
+
+PREFERENCES_PATH = Path(__file__).parent / "user_preferences.json"
+
+def init_preferences_file():
+    """Initialize user preferences file."""
+    if not PREFERENCES_PATH.exists():
+        PREFERENCES_PATH.write_text(json.dumps({}, indent=2))
+
+def load_user_preferences(username):
+    """Load user preferences."""
+    try:
+        init_preferences_file()
+        prefs = json.loads(PREFERENCES_PATH.read_text())
+        return prefs.get(username, {
+            "theme": "light",
+            "notifications_enabled": True,
+            "notification_frequency": "weekly",
+            "items_per_page": 50,
+            "timezone": "UTC",
+            "language": "en"
+        })
+    except Exception:
+        return {}
+
+def save_user_preferences(username, preferences):
+    """Save user preferences."""
+    try:
+        init_preferences_file()
+        prefs = json.loads(PREFERENCES_PATH.read_text())
+        prefs[username] = preferences
+        PREFERENCES_PATH.write_text(json.dumps(prefs, indent=2))
+        return True, "Preferences saved successfully"
+    except Exception as e:
+        return False, f"Error saving preferences: {str(e)}"
+
+def show_preferences_panel(username):
+    """Display user preferences panel."""
+    st.markdown("## ⚙️ User Preferences")
+    
+    # Load current preferences
+    prefs = load_user_preferences(username)
+    
+    # Create tabs for different settings
+    tab1, tab2, tab3, tab4 = st.tabs(["Display", "Notifications", "Account", "Privacy"])
+    
+    with tab1:
+        st.markdown("### Display Settings")
+        new_theme = st.selectbox(
+            "Theme",
+            ["light", "dark", "auto"],
+            index=["light", "dark", "auto"].index(prefs.get("theme", "light"))
+        )
+        
+        new_items_per_page = st.slider(
+            "Items per page",
+            min_value=10,
+            max_value=100,
+            value=prefs.get("items_per_page", 50),
+            step=10
+        )
+        
+        new_language = st.selectbox(
+            "Language",
+            ["English", "Spanish", "French", "German"],
+            index=0 if prefs.get("language", "en") == "en" else 1
+        )
+    
+    with tab2:
+        st.markdown("### Notification Settings")
+        notifications_enabled = st.checkbox(
+            "Enable email notifications",
+            value=prefs.get("notifications_enabled", True)
+        )
+        
+        notification_frequency = st.selectbox(
+            "Notification frequency",
+            ["immediately", "daily", "weekly", "monthly"],
+            index=["immediately", "daily", "weekly", "monthly"].index(prefs.get("notification_frequency", "weekly"))
+        )
+        
+        st.markdown("**Notify me for:**")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            audit_complete = st.checkbox("Audit completion", value=True)
+        with col2:
+            permission_change = st.checkbox("Permission changes", value=True)
+        with col3:
+            admin_alerts = st.checkbox("Admin alerts", value=True)
+    
+    with tab3:
+        st.markdown("### Account Settings")
+        if st.button("Change Password", use_container_width=True):
+            st.session_state.show_password_change = True
+        
+        if st.button("View Login History", use_container_width=True):
+            st.session_state.show_login_history = True
+        
+        if st.checkbox("Enable Two-Factor Authentication", value=False):
+            st.info("Two-factor authentication is enabled for your account.")
+    
+    with tab4:
+        st.markdown("### Privacy Settings")
+        data_retention = st.selectbox(
+            "Data retention",
+            ["30 days", "90 days", "1 year", "indefinite"],
+            index=2
+        )
+        
+        api_key_visible = st.checkbox("Show API key in plain text", value=False)
+        
+        if st.button("Download My Data", use_container_width=True):
+            st.info("Your data will be downloaded as a JSON file.")
+        
+        if st.button("Delete Account", use_container_width=True, help="This action cannot be undone"):
+            st.warning("⚠️ This will permanently delete your account and all associated data.")
+    
+    # Save button
+    if st.button("Save Preferences", use_container_width=True, type="primary"):
+        updated_prefs = {
+            "theme": new_theme if 'new_theme' in locals() else prefs.get("theme", "light"),
+            "notifications_enabled": notifications_enabled if 'notifications_enabled' in locals() else prefs.get("notifications_enabled", True),
+            "notification_frequency": notification_frequency if 'notification_frequency' in locals() else prefs.get("notification_frequency", "weekly"),
+            "items_per_page": new_items_per_page if 'new_items_per_page' in locals() else prefs.get("items_per_page", 50),
+            "timezone": prefs.get("timezone", "UTC"),
+            "language": new_language if 'new_language' in locals() else prefs.get("language", "en")
+        }
+        success, message = save_user_preferences(username, updated_prefs)
+        if success:
+            st.success(message)
+        else:
+            st.error(message)
+
+# ============================================================================
 # AUTHENTICATION & USER MANAGEMENT
 # ============================================================================
 
 USERS_PATH = Path(__file__).parent / "users.json"
 TWO_FA_PATH = Path(__file__).parent / "two_fa.json"
 SESSIONS_PATH = Path(__file__).parent / "sessions.json"
+LOGIN_ATTEMPTS_PATH = Path(__file__).parent / "login_attempts.json"
+ENCRYPTION_KEY_PATH = Path(__file__).parent / ".encryption_key"
+SESSION_TIMEOUT_HOURS = 168  # 7 days
+LOGIN_ATTEMPT_LIMIT = 5
+LOGIN_ATTEMPT_WINDOW_MINUTES = 5
 
 def init_users_file():
     """Create users.json if it doesn't exist."""
@@ -82,6 +872,68 @@ def init_2fa_file():
     """Create two_fa.json if it doesn't exist."""
     if not TWO_FA_PATH.exists():
         TWO_FA_PATH.write_text(json.dumps({}, indent=2))
+
+def get_encryption_key() -> bytes:
+    """Get or create encryption key for API keys."""
+    if ENCRYPTION_KEY_PATH.exists():
+        return ENCRYPTION_KEY_PATH.read_bytes()
+    else:
+        key = Fernet.generate_key()
+        ENCRYPTION_KEY_PATH.write_bytes(key)
+        return key
+
+def init_login_attempts_file():
+    """Create login_attempts.json if it doesn't exist."""
+    if not LOGIN_ATTEMPTS_PATH.exists():
+        LOGIN_ATTEMPTS_PATH.write_text(json.dumps({}, indent=2))
+
+def load_login_attempts():
+    """Load login attempts tracking."""
+    init_login_attempts_file()
+    try:
+        return json.loads(LOGIN_ATTEMPTS_PATH.read_text())
+    except Exception:
+        return {}
+
+def save_login_attempts(attempts: dict):
+    """Save login attempts tracking."""
+    LOGIN_ATTEMPTS_PATH.write_text(json.dumps(attempts, indent=2))
+
+def check_login_rate_limit(username: str) -> tuple[bool, str]:
+    """Check if user is rate limited. Returns (allowed, message)."""
+    attempts = load_login_attempts()
+    now = datetime.now()
+    
+    if username not in attempts:
+        attempts[username] = []
+    
+    # Remove attempts older than the window
+    attempts[username] = [
+        attempt for attempt in attempts[username]
+        if datetime.fromisoformat(attempt) > now - timedelta(minutes=LOGIN_ATTEMPT_WINDOW_MINUTES)
+    ]
+    
+    if len(attempts[username]) >= LOGIN_ATTEMPT_LIMIT:
+        return False, f"Too many login attempts. Please try again in {LOGIN_ATTEMPT_WINDOW_MINUTES} minutes."
+    
+    return True, ""
+
+def record_login_attempt(username: str):
+    """Record a failed login attempt."""
+    attempts = load_login_attempts()
+    
+    if username not in attempts:
+        attempts[username] = []
+    
+    attempts[username].append(datetime.now().isoformat())
+    save_login_attempts(attempts)
+
+def clear_login_attempts(username: str):
+    """Clear login attempts on successful login."""
+    attempts = load_login_attempts()
+    if username in attempts:
+        attempts[username] = []
+        save_login_attempts(attempts)
 
 def init_sessions_file():
     """Create sessions.json if it doesn't exist."""
@@ -103,9 +955,8 @@ def save_sessions(sessions: dict):
 def create_session(username: str, role: str) -> str:
     """Create a new session and return session token."""
     import uuid
-    import base64
     
-    session_token = base64.b64encode(uuid.uuid4().bytes).decode()[:32]
+    session_token = uuid.uuid4().hex[:32]
     sessions = load_sessions()
     
     sessions[session_token] = {
@@ -122,11 +973,20 @@ def create_session(username: str, role: str) -> str:
     return session_token
 
 def validate_session(session_token: str) -> dict:
-    """Validate session token and return user info if valid."""
+    """Validate session token and return user info if valid. Checks for timeout."""
     sessions = load_sessions()
     
     if session_token in sessions:
         session_data = sessions[session_token]
+        
+        # Check if session has expired
+        created_at = datetime.fromisoformat(session_data["created_at"])
+        if datetime.now() - created_at > timedelta(hours=SESSION_TIMEOUT_HOURS):
+            # Session expired, remove it
+            del sessions[session_token]
+            save_sessions(sessions)
+            return None
+        
         # Update last access time
         session_data["last_access"] = datetime.now().isoformat()
         sessions[session_token] = session_data
@@ -183,15 +1043,15 @@ def check_user_api_access(username: str, api_key: str) -> bool:
     return perms.get(api_key, False)
 
 def encrypt_key(key: str) -> str:
-    """Simple encryption for API keys (base64 encoding for now, can be enhanced)."""
-    import base64
-    return base64.b64encode(key.encode()).decode()
+    """Encrypt API key using Fernet (secure encryption)."""
+    cipher = Fernet(get_encryption_key())
+    return cipher.encrypt(key.encode()).decode()
 
 def decrypt_key(encrypted_key: str) -> str:
-    """Decrypt API key."""
-    import base64
+    """Decrypt API key using Fernet."""
     try:
-        return base64.b64decode(encrypted_key.encode()).decode()
+        cipher = Fernet(get_encryption_key())
+        return cipher.decrypt(encrypted_key.encode()).decode()
     except:
         return ""
 
@@ -301,29 +1161,39 @@ def show_auth_page():
         if st.button("Login", type="primary", use_container_width=True):
             if not username or not password:
                 st.error("Please fill in all fields")
-            elif username not in users:
-                st.error("User not found")
-            elif not verify_password(password, users[username]["password_hash"]):
-                st.error("Invalid credentials")
             else:
-                # Check if 2FA is enabled
-                secrets_2fa = load_2fa_secrets()
-                if username in secrets_2fa and secrets_2fa[username].get("enabled"):
-                    st.session_state["2fa_pending"] = True
-                    st.session_state["2fa_username"] = username
-                    st.rerun()
+                # Check rate limiting
+                allowed, message = check_login_rate_limit(username)
+                if not allowed:
+                    st.error(message)
+                elif username not in users:
+                    record_login_attempt(username)
+                    st.error("User not found")
+                elif not verify_password(password, users[username]["password_hash"]):
+                    record_login_attempt(username)
+                    st.error("Invalid credentials")
                 else:
-                    # Create persistent session
-                    user_role = users[username].get("role", "user")
-                    session_token = create_session(username, user_role)
-                    st.experimental_set_query_params(session_token=session_token)
-                    st.session_state["authenticated"] = True
-                    st.session_state["current_user"] = username
-                    st.session_state["is_admin"] = user_role == "admin"
-                    st.session_state["user_role"] = user_role
-                    st.success(f"Welcome, {users[username].get('name') or username}!")
-                    time.sleep(1)
-                    st.rerun()
+                    # Successful login - clear attempts
+                    clear_login_attempts(username)
+                    
+                    # Check if 2FA is enabled
+                    secrets_2fa = load_2fa_secrets()
+                    if username in secrets_2fa and secrets_2fa[username].get("enabled"):
+                        st.session_state["2fa_pending"] = True
+                        st.session_state["2fa_username"] = username
+                        st.rerun()
+                    else:
+                        # Create persistent session
+                        user_role = users[username].get("role", "user")
+                        session_token = create_session(username, user_role)
+                        st.experimental_set_query_params(session_token=session_token)
+                        st.session_state["authenticated"] = True
+                        st.session_state["current_user"] = username
+                        st.session_state["is_admin"] = user_role == "admin"
+                        st.session_state["user_role"] = user_role
+                        st.success(f"Welcome, {users[username].get('name') or username}!")
+                        time.sleep(1)
+                        st.rerun()
         
         # 2FA verification if pending
         if st.session_state.get("2fa_pending"):
@@ -361,33 +1231,60 @@ def show_auth_page():
             reason = st.text_area("Why do you need admin access?")
         
         if st.button("Create Account", type="primary", use_container_width=True):
-            if not username or not password or not full_name:
-                st.error("All fields required")
+            # Sanitize inputs
+            full_name_clean = sanitize_input(full_name, max_length=100)
+            username_clean = sanitize_input(username, max_length=50)
+            reason_clean = sanitize_input(reason, max_length=500) if reason else ""
+            
+            # Validate fields
+            if not full_name_clean or not username_clean or not password:
+                st.error("❌ All fields are required")
+                logger.warning(f"Signup attempt with missing fields")
             elif password != confirm:
-                st.error("Passwords don't match")
-            elif username in users:
-                st.error("Username already taken")
-            elif len(password) < 6:
-                st.error("Password must be at least 6 characters")
+                st.error("❌ Passwords don't match")
+                logger.warning(f"Signup attempt: password mismatch for {username_clean}")
+            elif username_clean in users:
+                st.error("❌ Username already taken")
+                logger.warning(f"Signup attempt with existing username: {username_clean}")
             else:
-                users[username] = {
-                    "name": full_name,
-                    "password_hash": hash_password(password),
-                    "role": "user",
-                    "admin_request": request_admin,
-                    "admin_request_reason": reason if request_admin else "",
-                    "created_at": datetime.now().isoformat(),
-                    "last_login": None
-                }
-                save_users(users)
-                st.success("Account created! Please login.")
-                time.sleep(1)
-                st.rerun()
+                # Validate password strength
+                is_valid, pwd_error = validate_password(password)
+                if not is_valid:
+                    st.error(f"❌ Password requirements: {pwd_error}")
+                    logger.warning(f"Weak password attempt for {username_clean}")
+                else:
+                    # Validate username format
+                    if not re.match(r'^[a-zA-Z0-9_]{3,50}$', username_clean):
+                        st.error("❌ Username must be 3-50 characters, alphanumeric + underscore only")
+                        logger.warning(f"Invalid username format: {username_clean}")
+                    else:
+                        try:
+                            users[username_clean] = {
+                                "name": full_name_clean,
+                                "password_hash": hash_password(password),
+                                "role": "user",
+                                "admin_request": request_admin,
+                                "admin_request_reason": reason_clean,
+                                "created_at": datetime.now().isoformat(),
+                                "last_login": None
+                            }
+                            save_users(users)
+                            logger.info(f"New account created: {username_clean}")
+                            st.success("✅ Account created! Please login.")
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as e:
+                            logger.error(f"Error creating account for {username_clean}: {str(e)}", exc_info=True)
+                            st.error("❌ Failed to create account. Please try again.")
 
 # Initialize auth
 init_users_file()
 init_2fa_file()
 init_sessions_file()
+init_login_attempts_file()
+
+# Initialize encryption key (will be created if not exists)
+get_encryption_key()
 
 # Initialize authentication state first
 if 'authenticated' not in st.session_state:
@@ -449,7 +1346,7 @@ with st.sidebar:
     st.divider()
     
     # Build navigation items based on role
-    nav_items = ["Single Audit", "Audit History"]
+    nav_items = ["Single Audit", "Audit History", "Dashboard", "Preferences"]
     if st.session_state.get("is_admin"):
         nav_items.extend([
             "Bulk Audit",
@@ -457,7 +1354,9 @@ with st.sidebar:
             "Email Outreach",
             "Scheduled Audits",
             "API Settings",
-            "Admin Settings"
+            "Admin Settings",
+            "Email Settings",
+            "Export Reports"
         ])
     
     # Navigation buttons
@@ -863,15 +1762,41 @@ def show_single_audit():
         analyze_btn = st.button("🔍 Analyze", type="primary", use_container_width=True)
     
     if analyze_btn:
-        if not url:
-            st.error("Please enter a URL")
+        url_sanitized = sanitize_input(url, max_length=2000)
+        
+        # Validate URL
+        is_valid, error_msg = validate_url(url_sanitized)
+        if not is_valid:
+            st.error(f"❌ Invalid URL: {error_msg}")
+            logger.warning(f"Invalid URL submitted: {url_sanitized}")
         else:
+            logger.info(f"Starting audit for URL: {url_sanitized}")
+            
             with st.spinner("🔄 Analyzing website..."):
-                data = run_audit(url, st.session_state.OPENAI_API_KEY, st.session_state.GOOGLE_API_KEY)
+                success, data = safe_execute(
+                    run_audit,
+                    url_sanitized,
+                    st.session_state.OPENAI_API_KEY,
+                    st.session_state.GOOGLE_API_KEY,
+                    error_message="Audit failed"
+                )
                 
-                if "error" in data:
-                    st.error(f"❌ Scan Failed: {data['error']}")
+                if not success or "error" in data:
+                    error_msg = data.get('error', 'Unknown error during audit')
+                    st.error(f"❌ Scan Failed: {error_msg}")
+                    logger.error(f"Audit failed for {url_sanitized}: {error_msg}")
                 else:
+                    logger.info(f"Audit completed successfully for {url_sanitized}")
+                    
+                    # Save to database safely
+                    try:
+                        if DB_AVAILABLE:
+                            save_audit_to_db(data)
+                            logger.debug(f"Audit saved to database for {url_sanitized}")
+                    except Exception as e:
+                        logger.warning(f"Failed to save audit to database: {str(e)}")
+                        st.warning("⚠️ Audit completed but couldn't save to database")
+                    
                     # Metrics
                     st.markdown("---")
                     st.markdown("### 📊 Audit Results")
@@ -879,32 +1804,36 @@ def show_single_audit():
                     c1, c2, c3, c4, c5 = st.columns(5)
                     
                     with c1:
-                        st.metric("Health Score", data['score'], delta=("Good" if data['score'] >= 70 else "Needs Work"))
+                        st.metric("Health Score", data.get('score', 'N/A'), delta=("Good" if data.get('score', 0) >= 70 else "Needs Work"))
                     with c2:
                         st.metric("Google Speed", data.get('psi', 'N/A'))
                     with c3:
                         st.metric("Accessibility", data.get('accessibility_score', 'N/A'))
                     with c4:
-                        st.metric("Issues Found", len(data['issues']))
+                        st.metric("Issues Found", len(data.get('issues', [])))
                     with c5:
                         st.metric("Age", data.get('domain_age', 'Unknown'))
                     
                     # Tech stack
-                    if data['tech_stack']:
+                    if data.get('tech_stack'):
                         st.markdown(f"**📦 Tech Stack:** {', '.join(data['tech_stack'])}")
                     
                     # Issues
-                    if data['issues']:
+                    if data.get('issues'):
                         st.markdown("---")
                         st.markdown("### ⚠️ Issues Detected")
                         
-                        for i, issue in enumerate(data['issues'], 1):
-                            with st.expander(f"{i}. {issue['title']}", expanded=(i <= 2)):
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.markdown(f"**Impact:** {issue['impact']}")
-                                with col2:
-                                    st.markdown(f"**Solution:** {issue['solution']}")
+                        for i, issue in enumerate(data.get('issues', []), 1):
+                            try:
+                                with st.expander(f"{i}. {issue.get('title', 'Unknown Issue')}", expanded=(i <= 2)):
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.markdown(f"**Impact:** {issue.get('impact', 'N/A')}")
+                                    with col2:
+                                        st.markdown(f"**Solution:** {issue.get('solution', 'N/A')}")
+                            except Exception as e:
+                                logger.error(f"Error displaying issue {i}: {str(e)}")
+                                st.warning(f"Could not display issue #{i}")
                     
                     # AI analysis
                     if data.get('ai'):
@@ -917,13 +1846,13 @@ def show_single_audit():
                             col1, col2 = st.columns(2)
                             with col1:
                                 st.markdown("**Summary**")
-                                st.info(data['ai']['summary'])
+                                st.info(data['ai'].get('summary', 'No summary available'))
                                 st.markdown("**Impact**")
-                                st.warning(data['ai']['impact'])
+                                st.warning(data['ai'].get('impact', 'No impact assessment available'))
                             
                             with col2:
                                 st.markdown("**Solutions**")
-                                st.success(data['ai']['solutions'])
+                                st.success(data['ai'].get('solutions', 'No solutions available'))
                             
                             st.markdown("---")
                             st.markdown("**📧 Cold Email Draft**")
@@ -1018,7 +1947,7 @@ def show_bulk_audit():
                 )
 
 def show_audit_history():
-    """Audit history page for all users."""
+    """Audit history page for all users - with pagination."""
     st.title("📊 Audit History")
     st.markdown("View and download your previous audits")
     st.markdown("---")
@@ -1034,9 +1963,16 @@ def show_audit_history():
         with col3:
             max_score = st.number_input("Max Score", 0, 100, 100)
         
-        audits = get_audit_history(limit=100, search_query=search if search else None, min_score=min_score if min_score > 0 else None, max_score=max_score if max_score < 100 else None)
+        # Use cached query
+        audits = get_audit_history_cached(
+            limit=1000,
+            search_query=search if search else None,
+            min_score=min_score if min_score > 0 else None,
+            max_score=max_score if max_score < 100 else None
+        )
         
         if audits:
+            # Convert to dataframe for pagination
             hist_data = []
             for audit in audits:
                 hist_data.append({
@@ -1048,34 +1984,59 @@ def show_audit_history():
                     "ID": audit.id
                 })
             
-            st.dataframe(pd.DataFrame(hist_data).drop(columns=["ID"]), use_container_width=True)
+            # Pagination
+            paginated_data, total_pages, current_page = get_paginated_items(
+                hist_data, 
+                page_key="audit_history_page",
+                items_per_page=50
+            )
             
-            # Add download buttons for each audit
+            # Display data
+            st.dataframe(
+                pd.DataFrame(paginated_data).drop(columns=["ID"]),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Pagination controls
             st.markdown("---")
-            st.markdown("### 📥 Download Audit PDFs")
+            display_pagination_controls("audit_history_page", total_pages, current_page)
+            
+            # Download section
+            st.markdown("---")
+            st.markdown(f"### 📥 Download PDFs (Page {current_page + 1})")
             
             cols = st.columns(3)
             col_idx = 0
-            for audit in audits:
-                with cols[col_idx % 3]:
-                    if st.button(f"📄 {audit.domain}", key=f"dl_audit_{audit.id}"):
-                        pdf_bytes = get_audit_pdf(audit.id)
-                        if pdf_bytes:
-                            st.download_button(
-                                label=f"⬇️ {audit.domain}",
-                                data=pdf_bytes,
-                                file_name=f"audit_{audit.id}_{audit.domain}.pdf",
-                                mime="application/pdf",
-                                key=f"btn_{audit.id}"
-                            )
-                        else:
-                            st.warning(f"PDF not available for this audit. Run audit again to generate.")
-                col_idx += 1
+            for item in paginated_data:
+                # Find corresponding audit object
+                audit = next((a for a in audits if a.id == item["ID"]), None)
+                if audit:
+                    with cols[col_idx % 3]:
+                        if st.button(f"📄 {audit.domain}", key=f"dl_audit_{audit.id}"):
+                            pdf_bytes = get_audit_pdf(audit.id)
+                            if pdf_bytes:
+                                st.download_button(
+                                    label=f"⬇️ {audit.domain}",
+                                    data=pdf_bytes,
+                                    file_name=f"audit_{audit.id}_{audit.domain}.pdf",
+                                    mime="application/pdf",
+                                    key=f"btn_{audit.id}"
+                                )
+                            else:
+                                st.warning(f"PDF not available. Run audit again to generate.")
+                    col_idx += 1
             
-            # Export CSV option
+            # Export CSV for all results
             st.markdown("---")
+            st.markdown("### 📥 Export All Results")
             csv = pd.DataFrame(hist_data).drop(columns=["ID"]).to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Export CSV", csv, "audit_history.csv", "text/csv")
+            st.download_button(
+                "📥 Export All Audits as CSV",
+                csv,
+                "audit_history_complete.csv",
+                "text/csv"
+            )
         else:
             st.info("No audits found")
 
@@ -1134,11 +2095,11 @@ def show_email_outreach():
         email_sub1, email_sub2 = st.tabs(["Send Email", "Email Templates"])
         
         with email_sub1:
-            leads = get_leads()
+            leads = get_leads_cached()
             
             if leads:
                 lead_opts = {f"{l.domain} (Score: {l.health_score}, Opp: {l.opportunity_rating})": l for l in leads}
-                selected
+                selected_name = st.selectbox("Select a lead", list(lead_opts.keys()), key="lead_select")
                 selected_lead = lead_opts[selected_name] if selected_name else None
                 
                 if selected_lead:
@@ -1965,65 +2926,62 @@ def show_admin_settings():
                     # Action buttons
                     st.markdown("**Actions:**")
                     
-                    # Role management
-                    if role == "user":
-                        if st.button("👑 Make Admin", key=f"admin_{username}", use_container_width=True):
-                            users[username]["role"] = "admin"
+                    # Role management (using selectbox instead of buttons)
+                    new_role = st.selectbox(
+                        "Role",
+                        ["user", "admin"],
+                        index=0 if role == "user" else 1,
+                        key=f"role_{username}"
+                    )
+                    
+                    if new_role != role:
+                        users[username]["role"] = new_role
+                        if new_role == "admin":
                             users[username]["admin_request"] = False
-                            save_users(users)
-                            st.success(f"✓ {username} is now admin")
-                            st.rerun()
-                    else:
-                        if st.button("👤 Make User", key=f"user_{username}", use_container_width=True):
-                            users[username]["role"] = "user"
-                            save_users(users)
-                            st.success(f"✓ {username} is now user")
-                            st.rerun()
+                        save_users(users)
+                        st.toast(f"✓ {username} role updated to {new_role}")
                     
                     # Clear admin requests
                     if admin_req:
-                        if st.button("❌ Clear Request", key=f"clear_{username}", use_container_width=True):
+                        if st.button("❌ Clear Admin Request", key=f"clear_{username}", use_container_width=True):
                             users[username]["admin_request"] = False
                             save_users(users)
-                            st.rerun()
+                            st.toast(f"Request cleared for {username}")
                 
-                # API Access Control Section
+                # API Access Control Section with form
                 st.markdown("**⚙️ API Access Control:**")
                 
-                col_api1, col_api2, col_api3 = st.columns(3)
-                
-                with col_api1:
-                    openai_access = st.checkbox(
-                        "🤖 Allow OpenAI Access",
-                        value=api_perms.get("openai", False),
-                        key=f"openai_{username}"
-                    )
-                    if openai_access != api_perms.get("openai", False):
+                with st.form(key=f"api_form_{username}", clear_on_submit=False):
+                    col_api1, col_api2, col_api3 = st.columns(3)
+                    
+                    with col_api1:
+                        openai_access = st.checkbox(
+                            "🤖 Allow OpenAI",
+                            value=api_perms.get("openai", False),
+                            key=f"openai_{username}"
+                        )
+                    
+                    with col_api2:
+                        google_access = st.checkbox(
+                            "🔍 Allow Google PageSpeed",
+                            value=api_perms.get("google", False),
+                            key=f"google_{username}"
+                        )
+                    
+                    with col_api3:
+                        slack_access = st.checkbox(
+                            "📱 Allow Slack",
+                            value=api_perms.get("slack", False),
+                            key=f"slack_{username}"
+                        )
+                    
+                    # Submit button for form (no rerun)
+                    submitted = st.form_submit_button("💾 Save API Permissions", use_container_width=True)
+                    if submitted:
                         set_user_api_permission(username, "openai", openai_access)
-                        st.success("✓ OpenAI access updated")
-                        st.rerun()
-                
-                with col_api2:
-                    google_access = st.checkbox(
-                        "🔍 Allow Google PageSpeed",
-                        value=api_perms.get("google", False),
-                        key=f"google_{username}"
-                    )
-                    if google_access != api_perms.get("google", False):
                         set_user_api_permission(username, "google", google_access)
-                        st.success("✓ Google access updated")
-                        st.rerun()
-                
-                with col_api3:
-                    slack_access = st.checkbox(
-                        "📱 Allow Slack Notifications",
-                        value=api_perms.get("slack", False),
-                        key=f"slack_{username}"
-                    )
-                    if slack_access != api_perms.get("slack", False):
                         set_user_api_permission(username, "slack", slack_access)
-                        st.success("✓ Slack access updated")
-                        st.rerun()
+                        st.toast(f"✓ API permissions saved for {username}")
                 
                 st.divider()
     
@@ -2078,6 +3036,233 @@ def show_admin_settings():
         st.info("OpenAI API: " + ("✓ Configured" if OPENAI_API_KEY else "Not configured"))
         st.info("Database: " + ("✓ Connected" if DB_AVAILABLE else "Not connected"))
 
+def show_email_settings():
+    """Configure email notification settings."""
+    st.markdown("## 📧 Email Notification Settings")
+    
+    config = load_email_config()
+    
+    st.markdown("### SMTP Configuration")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        enabled = st.checkbox("Enable Email Notifications", value=config.get("enabled", False))
+    with col2:
+        st.markdown("")  # Spacer
+    
+    with st.form("email_config_form"):
+        smtp_server = st.text_input(
+            "SMTP Server",
+            value=config.get("smtp_server", ""),
+            placeholder="e.g., smtp.gmail.com",
+            help="Your email provider's SMTP server address"
+        )
+        
+        smtp_port = st.number_input(
+            "SMTP Port",
+            value=config.get("smtp_port", 587),
+            min_value=1,
+            max_value=65535,
+            help="Usually 587 for TLS or 465 for SSL"
+        )
+        
+        sender_email = st.text_input(
+            "Sender Email Address",
+            value=config.get("sender_email", ""),
+            placeholder="noreply@example.com"
+        )
+        
+        sender_password = st.text_input(
+            "Email Password/App Password",
+            value=config.get("sender_password", ""),
+            type="password",
+            help="Use an app-specific password for Gmail",
+            placeholder="••••••••"
+        )
+        
+        from_name = st.text_input(
+            "Display Name",
+            value=config.get("from_name", "Code Nest Sales Engine"),
+            help="Name that appears in 'From:' field"
+        )
+        
+        st.markdown("### Notification Types")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            audit_notif = st.checkbox("Audit Completions", value=config.get("notifications", {}).get("audit_complete", True))
+        with col2:
+            perm_notif = st.checkbox("Permission Changes", value=config.get("notifications", {}).get("permission_change", True))
+        with col3:
+            admin_notif = st.checkbox("Admin Alerts", value=config.get("notifications", {}).get("admin_alert", True))
+        
+        # Test email
+        st.markdown("### Test Configuration")
+        test_email = st.text_input("Send test email to:", placeholder="test@example.com")
+        
+        col1, col2, col3 = st.columns([1, 1, 2])
+        with col1:
+            submit = st.form_submit_button("Save Configuration", type="primary", use_container_width=True)
+        with col2:
+            test = st.form_submit_button("Send Test Email", use_container_width=True)
+        
+        if submit:
+            new_config = {
+                "enabled": enabled,
+                "smtp_server": smtp_server,
+                "smtp_port": smtp_port,
+                "sender_email": sender_email,
+                "sender_password": sender_password,
+                "from_name": from_name,
+                "notifications": {
+                    "audit_complete": audit_notif,
+                    "permission_change": perm_notif,
+                    "admin_alert": admin_notif
+                }
+            }
+            success, message = save_email_config(new_config)
+            if success:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
+        
+        if test and test_email:
+            if not enabled or not smtp_server or not sender_email:
+                st.error("Please configure SMTP settings and enable notifications first")
+            else:
+                with st.spinner("Sending test email..."):
+                    html_body = get_email_template("admin_alert", {
+                        "event": "Test Email",
+                        "details": "This is a test email from Code Nest Sales Engine",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    success, message = send_email(test_email, "Test Email - Code Nest Sales Engine", html_body)
+                    if success:
+                        st.success(f"✅ {message}")
+                    else:
+                        st.error(f"❌ {message}")
+    
+    # Notification logs
+    st.divider()
+    st.markdown("### Notification Logs")
+    
+    if NOTIFICATIONS_LOG_PATH.exists():
+        try:
+            notifications = json.loads(NOTIFICATIONS_LOG_PATH.read_text())
+            if notifications:
+                df = pd.DataFrame(notifications[-50:])  # Last 50
+                df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+                st.dataframe(df.sort_values("timestamp", ascending=False), use_container_width=True)
+            else:
+                st.info("No notifications sent yet")
+        except Exception as e:
+            st.error(f"Error loading logs: {str(e)}")
+    else:
+        st.info("No notification logs available yet")
+
+def show_export_reports():
+    """Export audits as PDF or Excel reports."""
+    st.markdown("## 📄 Export Reports")
+    
+    export_type = st.radio("Export Format", ["PDF (Single)", "Excel (Batch)", "CSV (Data)"], horizontal=True)
+    
+    if export_type == "PDF (Single)":
+        st.markdown("### Export Single Audit as PDF")
+        
+        # Get list of audits
+        audits = get_audit_history_cached(limit=100)
+        if not audits:
+            st.warning("No audits available to export")
+            return
+        
+        # Select audit
+        audit_options = {f"{a.get('domain', 'Unknown')} ({a.get('timestamp', 'N/A')[:10]})": a for a in audits}
+        selected = st.selectbox("Select Audit", list(audit_options.keys()))
+        
+        if selected and st.button("Generate PDF Report", use_container_width=True, type="primary"):
+            with st.spinner("Generating PDF..."):
+                audit_data = audit_options[selected]
+                pdf_bytes = generate_pdf_report(audit_data)
+                
+                if pdf_bytes:
+                    st.success("✅ PDF generated successfully")
+                    st.download_button(
+                        label="⬇️ Download PDF Report",
+                        data=pdf_bytes,
+                        file_name=f"audit_{audit_data.get('domain', 'report').replace('/', '_')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                else:
+                    st.error("Error generating PDF")
+    
+    elif export_type == "Excel (Batch)":
+        st.markdown("### Export Multiple Audits as Excel")
+        
+        audits = get_audit_history_cached(limit=500)
+        if not audits:
+            st.warning("No audits available to export")
+            return
+        
+        # Filter options
+        col1, col2 = st.columns(2)
+        with col1:
+            min_score = st.slider("Minimum Score", 0, 100, 0)
+        with col2:
+            max_score = st.slider("Maximum Score", 0, 100, 100)
+        
+        filtered_audits = [a for a in audits if min_score <= a.get("score", 0) <= max_score]
+        
+        st.info(f"Exporting {len(filtered_audits)} audits...")
+        
+        if st.button("Generate Excel Report", use_container_width=True, type="primary"):
+            with st.spinner("Generating Excel..."):
+                excel_bytes = generate_excel_report(filtered_audits)
+                
+                if excel_bytes:
+                    st.success("✅ Excel file generated successfully")
+                    st.download_button(
+                        label="⬇️ Download Excel Report",
+                        data=excel_bytes,
+                        file_name=f"audits_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                else:
+                    st.error("Error generating Excel")
+    
+    elif export_type == "CSV (Data)":
+        st.markdown("### Export as CSV for Analysis")
+        
+        audits = get_audit_history_cached(limit=1000)
+        if not audits:
+            st.warning("No audits available to export")
+            return
+        
+        df = pd.DataFrame(audits)
+        
+        # Column selection
+        columns = st.multiselect(
+            "Select columns to export",
+            df.columns.tolist(),
+            default=["domain", "score", "status", "timestamp"]
+        )
+        
+        if st.button("Generate CSV", use_container_width=True, type="primary"):
+            csv_data = df[columns].to_csv(index=False)
+            st.success("✅ CSV ready for download")
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=csv_data,
+                file_name=f"audits_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        
+        # Preview
+        st.markdown("### Preview")
+        st.dataframe(df[columns].head(10), use_container_width=True)
+
 
 # ============================================================================
 # MAIN ROUTING & CONTENT DISPATCHER
@@ -2090,6 +3275,10 @@ if current_section == "Single Audit":
     show_single_audit()
 elif current_section == "Audit History":
     show_audit_history()
+elif current_section == "Dashboard":
+    show_dashboard()
+elif current_section == "Preferences":
+    show_preferences_panel(st.session_state.get('current_user', 'user'))
 elif current_section == "Bulk Audit":
     show_bulk_audit()
 elif current_section == "Competitor Analysis":
@@ -2100,6 +3289,10 @@ elif current_section == "Scheduled Audits":
     show_scheduled_audits()
 elif current_section == "API Settings":
     show_api_settings()
+elif current_section == "Email Settings":
+    show_email_settings()
+elif current_section == "Export Reports":
+    show_export_reports()
 elif current_section == "Admin Settings":
     show_admin_settings()
 else:

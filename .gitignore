@@ -18,6 +18,7 @@ sales_engine.db
 # Logs
 *.log
 *.log.*
+logs/
 
 # Streamlit / editor
 .streamlit/
@@ -35,6 +36,12 @@ sessions.json
 two_fa.json
 audit_pdfs/
 *.pyc
+
+# Security & Sensitive Files
+.encryption_key
+.encryption_key.backup
+login_attempts.json
+users.json
 
 # IDE
 .vscode/
