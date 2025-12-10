@@ -53,10 +53,24 @@ class Lead(Base):
     domain = Column(String(255), nullable=False)
     email = Column(String(255), nullable=True)
     company_name = Column(String(255), nullable=True)
+    phone = Column(String(20), nullable=True)
+    address = Column(Text, nullable=True)
+    place_id = Column(String(500), nullable=True)  # Google Places ID
+    city = Column(String(100), nullable=True)
+    state = Column(String(100), nullable=True)
+    zipcode = Column(String(20), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     health_score = Column(Integer, nullable=True)
     opportunity_rating = Column(Integer, default=0)
+    industry = Column(String(100), nullable=True)  # Auto-detected or manual
+    company_size = Column(String(50), nullable=True)  # Small, Medium, Large, Enterprise
+    estimated_revenue = Column(String(50), nullable=True)
+    services_needed = Column(JSON, default=list)  # Array of service scores
+    service_priorities = Column(JSON, default=dict)  # {"website_dev": 85, "seo": 90, ...}
     status = Column(String(50), default="new")  # new, contacted, responded, converted, lost
     notes = Column(Text, nullable=True)
+    ai_enrichment = Column(JSON, nullable=True)  # Stores AI analysis
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

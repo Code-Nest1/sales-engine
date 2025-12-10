@@ -1575,6 +1575,7 @@ with st.sidebar:
         nav_items.extend([
             "Bulk Audit",
             "Competitor Analysis",
+            "Lead Management",
             "Email Outreach",
             "Scheduled Audits",
             "API Settings",
@@ -2408,6 +2409,263 @@ def show_email_outreach():
                     st.write(f"**Subject:** {template['subject']}")
                     st.write(f"**Body:** {template['body']}")
 
+def show_lead_management():
+    """Advanced lead management with CSV import, AI enrichment, and service scoring."""
+    st.title("🎯 Lead Management & Enrichment")
+    st.markdown("Import leads from Google Places, enrich with AI, and identify service opportunities")
+    st.markdown("---")
+    
+    if not DB_AVAILABLE:
+        st.error("Database required for lead management")
+        return
+    
+    tab1, tab2, tab3, tab4 = st.tabs(["Import Leads", "Lead Database", "Service Opportunities", "AI Insights"])
+    
+    with tab1:
+        st.markdown("### 📤 Import Leads from CSV")
+        st.markdown("Upload your Google Places CSV export with: name, phone, address, city, state, zipcode, place_id, website")
+        
+        uploaded_file = st.file_uploader("Upload CSV file", type="csv")
+        
+        if uploaded_file:
+            try:
+                df = pd.read_csv(uploaded_file)
+                st.write(f"**Preview:** {len(df)} leads found")
+                
+                with st.expander("View CSV Preview"):
+                    st.dataframe(df.head(10), use_container_width=True)
+                
+                if st.button("🚀 Process & Enrich Leads", type="primary"):
+                    with st.spinner("Processing leads and running audits..."):
+                        # First, run audits on websites
+                        audit_scores = {}
+                        progress_bar = st.progress(0)
+                        
+                        for idx, row in df.iterrows():
+                            website = row.get('website', '') or row.get('url', '')
+                            if website:
+                                if not website.startswith('http'):
+                                    website = 'https://' + website
+                                
+                                try:
+                                    audit_data = run_audit(website, st.session_state.OPENAI_API_KEY, st.session_state.GOOGLE_API_KEY)
+                                    domain = urlparse(website).netloc.replace('www.', '')
+                                    audit_scores[domain] = audit_data
+                                except Exception as e:
+                                    logger.warning(f"Error auditing {website}: {str(e)}")
+                            
+                            progress_bar.progress((idx + 1) / len(df))
+                        
+                        # Process CSV with enrichment
+                        leads_created, errors = process_csv_leads(
+                            uploaded_file,
+                            audit_scores,
+                            st.session_state.OPENAI_API_KEY
+                        )
+                        
+                        st.success(f"✅ Successfully imported {leads_created} leads!")
+                        
+                        if errors:
+                            with st.expander(f"⚠️ {len(errors)} Import Issues"):
+                                for error in errors:
+                                    st.warning(error)
+            
+            except Exception as e:
+                st.error(f"Error processing file: {str(e)}")
+    
+    with tab2:
+        st.markdown("### 📊 Lead Database")
+        
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            status_filter = st.selectbox("Filter by Status", ["all", "new", "contacted", "responded", "converted", "lost"])
+        with col2:
+            industry_filter = st.text_input("Filter by Industry", placeholder="E.g., E-Commerce, SaaS")
+        with col3:
+            size_filter = st.selectbox("Filter by Company Size", ["All", "Small", "Medium", "Large", "Enterprise"])
+        
+        # Get leads
+        db = get_db()
+        if db:
+            query = db.query(Lead).order_by(Lead.opportunity_rating.desc())
+            
+            if status_filter != "all":
+                query = query.filter(Lead.status == status_filter)
+            
+            if industry_filter:
+                query = query.filter(Lead.industry.contains(industry_filter))
+            
+            if size_filter != "All":
+                query = query.filter(Lead.company_size == size_filter)
+            
+            leads = query.all()
+            db.close()
+            
+            if leads:
+                # Display metrics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Leads", len(leads))
+                with col2:
+                    avg_opp = sum(l.opportunity_rating for l in leads) / len(leads) if leads else 0
+                    st.metric("Avg Opportunity", f"{avg_opp:.0f}/100")
+                with col3:
+                    high_priority = len([l for l in leads if l.opportunity_rating >= 70])
+                    st.metric("High Priority", high_priority)
+                with col4:
+                    converted = len([l for l in leads if l.status == "converted"])
+                    st.metric("Converted", converted)
+                
+                st.divider()
+                
+                # Leads table
+                leads_data = []
+                for lead in leads[:100]:  # Limit to 100 for performance
+                    leads_data.append({
+                        "Company": lead.company_name or "N/A",
+                        "Industry": lead.industry or "Unknown",
+                        "Size": lead.company_size or "Unknown",
+                        "Health Score": lead.health_score or "N/A",
+                        "Opportunity": lead.opportunity_rating,
+                        "Status": lead.status,
+                        "Location": f"{lead.city}, {lead.state}" if lead.city else "N/A",
+                        "Phone": lead.phone or "N/A"
+                    })
+                
+                st.dataframe(
+                    pd.DataFrame(leads_data),
+                    use_container_width=True,
+                    column_config={
+                        "Opportunity": st.column_config.ProgressColumn(
+                            "Opportunity",
+                            min_value=0,
+                            max_value=100,
+                        ),
+                    }
+                )
+            else:
+                st.info("No leads found. Try importing CSV data first.")
+    
+    with tab3:
+        st.markdown("### 🎯 Service Opportunities")
+        
+        db = get_db()
+        if db:
+            leads = db.query(Lead).order_by(Lead.opportunity_rating.desc()).limit(50).all()
+            db.close()
+            
+            if leads:
+                # Select a lead to see service opportunities
+                lead_options = {f"{l.company_name} ({l.city}, {l.state})" or l.domain: l for l in leads}
+                selected_lead_name = st.selectbox("Select a lead to view service opportunities", list(lead_options.keys()))
+                selected_lead = lead_options[selected_lead_name]
+                
+                if selected_lead:
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.markdown(f"**Company:** {selected_lead.company_name or 'N/A'}")
+                        st.markdown(f"**Industry:** {selected_lead.industry or 'Unknown'}")
+                    with col2:
+                        st.markdown(f"**Size:** {selected_lead.company_size or 'Unknown'}")
+                        st.markdown(f"**Health Score:** {selected_lead.health_score or 'N/A'}/100")
+                    with col3:
+                        st.markdown(f"**Location:** {selected_lead.city}, {selected_lead.state}" if selected_lead.city else "")
+                        st.markdown(f"**Opportunity:** {selected_lead.opportunity_rating}/100")
+                    
+                    st.divider()
+                    
+                    if selected_lead.service_priorities:
+                        st.markdown("### 📈 Service Opportunity Scores")
+                        
+                        service_names = {
+                            'website_development': '🌐 Website Development',
+                            'seo_optimization': '🔍 SEO Optimization',
+                            'mobile_app_development': '📱 Mobile App Development',
+                            'social_media_marketing': '📱 Social Media Marketing',
+                            'paid_advertising': '💰 Paid Advertising (PPC)',
+                            'ecommerce_development': '🛒 E-Commerce Development',
+                            'website_maintenance': '🔧 Website Maintenance',
+                            'react_nextjs_development': '⚛️ React/Next.js Development',
+                            'website_optimization': '⚡ Website Optimization',
+                            'graphic_designing': '🎨 Graphic Designing'
+                        }
+                        
+                        cols = st.columns(2)
+                        for idx, (service_key, score) in enumerate(sorted(selected_lead.service_priorities.items(), 
+                                                                          key=lambda x: x[1], reverse=True)):
+                            with cols[idx % 2]:
+                                service_name = service_names.get(service_key, service_key)
+                                st.markdown(f"### {service_name}")
+                                
+                                # Progress bar
+                                col_score, col_badge = st.columns([3, 1])
+                                with col_score:
+                                    st.progress(min(100, score) / 100)
+                                with col_badge:
+                                    if score >= 80:
+                                        st.error(f"{score:.0f}")
+                                    elif score >= 60:
+                                        st.warning(f"{score:.0f}")
+                                    else:
+                                        st.info(f"{score:.0f}")
+                                
+                                # Show pitch on click
+                                if st.button(f"View Pitch", key=f"pitch_{service_key}"):
+                                    st.session_state[f"show_pitch_{service_key}"] = True
+                                
+                                if st.session_state.get(f"show_pitch_{service_key}"):
+                                    with st.expander("📧 Service Pitch", expanded=True):
+                                        pitch = generate_service_pitch(
+                                            selected_lead.company_name or "Client",
+                                            service_key,
+                                            score,
+                                            selected_lead.industry or "Unknown",
+                                            selected_lead.company_size or "Unknown",
+                                            {"score": selected_lead.health_score or 0, "issues": []}
+                                        )
+                                        st.markdown(pitch)
+            else:
+                st.info("No leads available")
+    
+    with tab4:
+        st.markdown("### 🤖 AI Lead Insights")
+        
+        db = get_db()
+        if db:
+            leads_with_ai = db.query(Lead).filter(Lead.ai_enrichment.isnot(None)).order_by(Lead.updated_at.desc()).limit(20).all()
+            db.close()
+            
+            if leads_with_ai:
+                for lead in leads_with_ai:
+                    with st.expander(f"{lead.company_name or lead.domain} - {lead.city}, {lead.state}"):
+                        if lead.ai_enrichment:
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.markdown("**Key Challenges:**")
+                                if isinstance(lead.ai_enrichment, dict):
+                                    for challenge in lead.ai_enrichment.get('key_challenges', []):
+                                        st.markdown(f"- {challenge}")
+                                    
+                                    st.markdown("**Quick Wins (30 days):**")
+                                    for win in lead.ai_enrichment.get('quick_wins', []):
+                                        st.markdown(f"✅ {win}")
+                            
+                            with col2:
+                                st.markdown("**Recommended Services:**")
+                                for service in lead.ai_enrichment.get('recommended_services', []):
+                                    st.markdown(f"• {service}")
+                                
+                                st.markdown("**Conversation Starters:**")
+                                for starter in lead.ai_enrichment.get('conversation_starters', []):
+                                    st.markdown(f"💡 {starter}")
+                            
+                            st.markdown("**Estimated Business Impact:**")
+                            st.info(lead.ai_enrichment.get('estimated_impact', 'N/A'))
+            else:
+                st.info("No AI-enriched leads yet. Import leads with AI enrichment enabled.")
+
 def show_scheduled_audits():
     """Scheduled audits page."""
     st.title("⏰ Scheduled Audits")
@@ -2564,6 +2822,438 @@ def calculate_opportunity_score(data):
         score += 10
     
     return min(100, score)
+
+# ============================================================================
+# ENHANCED SERVICE SCORING & LEAD ENRICHMENT
+# ============================================================================
+
+def detect_industry(url, html_content, tech_stack):
+    """Detect industry from website content using keywords and tech stack."""
+    html_lower = html_content.lower()
+    
+    industry_keywords = {
+        "E-Commerce": ["shop", "cart", "product", "buy", "purchase", "store", "shopify"],
+        "SaaS": ["dashboard", "api", "integration", "subscription", "pricing", "features"],
+        "Real Estate": ["property", "listing", "real estate", "broker", "agent", "mls"],
+        "Healthcare": ["doctor", "clinic", "medical", "appointment", "patient", "pharmacy"],
+        "Finance": ["banking", "investment", "loan", "credit", "financial", "wealth"],
+        "Legal": ["attorney", "lawyer", "law firm", "legal services", "litigation"],
+        "Education": ["course", "university", "school", "student", "learning", "tuition"],
+        "Restaurant/Food": ["menu", "reservation", "dining", "cafe", "restaurant", "food"],
+        "Travel/Hospitality": ["hotel", "booking", "travel", "vacation", "resort", "airline"],
+        "B2B Services": ["solution", "enterprise", "consulting", "service", "corporate"],
+        "Manufacturing": ["manufacturing", "industrial", "equipment", "supplier", "production"],
+        "Non-Profit": ["charity", "donation", "volunteer", "nonprofit", "mission"],
+    }
+    
+    detected_industries = {}
+    for industry, keywords in industry_keywords.items():
+        score = sum(1 for keyword in keywords if keyword in html_lower)
+        if score > 0:
+            detected_industries[industry] = score
+    
+    if detected_industries:
+        return max(detected_industries, key=detected_industries.get)
+    return "General Business"
+
+def estimate_company_size(tech_stack, content_length, has_team_page, num_emails):
+    """Estimate company size based on website indicators."""
+    score = 0
+    
+    # Enterprise tech
+    enterprise_tech = ["salesforce", "sap", "servicenow", "workday", "oracle"]
+    if any(tech.lower() in str(tech_stack).lower() for tech in enterprise_tech):
+        return "Enterprise"
+    
+    # Startup/SaaS indicators
+    if any(tech in str(tech_stack).lower() for tech in ["react", "nextjs", "vue", "node"]):
+        score += 20
+    
+    # Content length (larger = usually bigger company)
+    if content_length > 50000:
+        score += 30
+        size = "Large"
+    elif content_length > 20000:
+        score += 20
+        size = "Medium"
+    else:
+        score += 10
+        size = "Small"
+    
+    # Email count (more emails = bigger)
+    if num_emails > 5:
+        score += 20
+        size = "Large"
+    elif num_emails > 2:
+        score += 10
+        size = "Medium"
+    
+    # Team page indicates medium+
+    if has_team_page:
+        if score >= 40:
+            return "Large"
+        elif score >= 25:
+            return "Medium"
+    
+    return size
+
+def calculate_service_scores(audit_data, company_size, industry):
+    """Calculate opportunity score for each Code Nest service."""
+    scores = {}
+    
+    # Website Development Score (0-100)
+    web_dev_score = 0
+    web_dev_score += (100 - audit_data['score']) * 0.3  # Health score = 30%
+    
+    # Design freshness (check for outdated patterns)
+    if any(issue['title'] in ['Outdated Design', 'Poor UX', 'Mobile Issues'] 
+           for issue in audit_data.get('issues', [])):
+        web_dev_score += 30
+    
+    if company_size in ["Large", "Enterprise"]:
+        web_dev_score += 15
+    
+    scores['website_development'] = min(100, web_dev_score)
+    
+    # SEO Score (0-100)
+    seo_score = 0
+    seo_issues = [issue for issue in audit_data.get('issues', []) 
+                  if any(word in issue.get('title', '').lower() for word in ['seo', 'meta', 'title', 'heading'])]
+    seo_score += len(seo_issues) * 15
+    seo_score += (100 - audit_data['score']) * 0.2  # Low health = SEO need
+    
+    if company_size in ["Medium", "Large", "Enterprise"]:
+        seo_score += 20
+    
+    scores['seo_optimization'] = min(100, seo_score)
+    
+    # Mobile App Score (0-100)
+    mobile_app_score = 0
+    if any("mobile" in issue.get('title', '').lower() for issue in audit_data.get('issues', [])):
+        mobile_app_score += 40
+    
+    if industry in ["E-Commerce", "SaaS", "Restaurant/Food"]:
+        mobile_app_score += 30
+    
+    if company_size in ["Medium", "Large", "Enterprise"]:
+        mobile_app_score += 20
+    
+    scores['mobile_app_development'] = mobile_app_score
+    
+    # Social Media Score (0-100)
+    social_score = 0
+    social_score += sum(1 for issue in audit_data.get('issues', []) 
+                       if 'social' in issue.get('title', '').lower()) * 20
+    
+    if industry in ["E-Commerce", "Restaurant/Food", "Travel/Hospitality"]:
+        social_score += 35
+    
+    if company_size in ["Medium", "Large"]:
+        social_score += 15
+    
+    scores['social_media_marketing'] = min(100, social_score)
+    
+    # PPC/Paid Ads Score (0-100)
+    ppc_score = 0
+    if industry in ["E-Commerce", "SaaS", "Finance"]:
+        ppc_score += 40
+    
+    if company_size in ["Large", "Enterprise"]:
+        ppc_score += 25
+    
+    # If low organic traffic signals
+    if audit_data['score'] < 50:
+        ppc_score += 20
+    
+    scores['paid_advertising'] = min(100, ppc_score)
+    
+    # E-Commerce Score (0-100)
+    ecommerce_score = 0
+    if industry == "E-Commerce":
+        ecommerce_score = 85
+    elif "product" in str(audit_data.get('tech_stack', '')).lower():
+        ecommerce_score = 60
+    else:
+        ecommerce_score = 20
+    
+    scores['ecommerce_development'] = ecommerce_score
+    
+    # WordPress/Website Maintenance Score (0-100)
+    maintenance_score = 50  # Most sites need maintenance
+    if "wordpress" in str(audit_data.get('tech_stack', '')).lower():
+        maintenance_score = 75
+    
+    if company_size in ["Small", "Medium"]:
+        maintenance_score += 20
+    
+    scores['website_maintenance'] = min(100, maintenance_score)
+    
+    # React/Modern Development Score (0-100)
+    modern_dev_score = 0
+    modern_stacks = ["react", "nextjs", "vue", "angular"]
+    if any(stack in str(audit_data.get('tech_stack', '')).lower() for stack in modern_stacks):
+        modern_dev_score = 60  # Already using modern stack, but might need optimization
+    else:
+        modern_dev_score = 40
+    
+    if industry == "SaaS":
+        modern_dev_score += 30
+    
+    scores['react_nextjs_development'] = min(100, modern_dev_score)
+    
+    # Website Optimization Score (0-100)
+    optimization_score = 100 - audit_data['score']
+    optimization_score += (100 - (audit_data.get('psi', 0) or 0)) * 0.3
+    scores['website_optimization'] = min(100, optimization_score)
+    
+    # Graphic Design Score (0-100)
+    design_score = 30 if any("design" in issue.get('title', '').lower() 
+                            for issue in audit_data.get('issues', [])) else 20
+    if company_size in ["Medium", "Large"]:
+        design_score += 20
+    scores['graphic_designing'] = design_score
+    
+    return scores
+
+def generate_service_pitch(company_name, service_name, score, industry, company_size, audit_data):
+    """Generate AI-powered service pitch for a specific service."""
+    pitches = {
+        'website_development': f"""
+Based on our audit of {company_name}'s current website, we identified significant opportunities for improvement:
+
+**Current State:** Your website scores {audit_data['score']}/100 on our health assessment
+**Key Issues Found:** {', '.join([issue['title'] for issue in audit_data.get('issues', [])[:3]])}
+
+**What We Recommend:**
+Our website development team specializes in building high-performance, conversion-optimized sites for {industry} businesses like yours. We'll:
+- Rebuild your site with modern architecture ({company_size}-grade infrastructure)
+- Optimize for conversions and user experience
+- Ensure mobile-first responsive design
+- Integrate with your existing tools and systems
+
+**Expected Results:** 40-60% improvement in site performance, 25-35% increase in lead generation
+**Timeline:** 8-12 weeks | **Investment:** Based on scope and complexity
+""",
+        
+        'seo_optimization': f"""
+{company_name} is currently ranking poorly for critical keywords in your industry.
+
+**Current Gaps:**
+- Missing or weak meta tags and structure
+- Limited internal linking strategy
+- Technical SEO issues affecting crawlability
+
+**Our SEO Strategy:**
+We'll execute a comprehensive SEO plan tailored for {industry} that includes:
+- Technical SEO audit and remediation
+- On-page optimization for high-intent keywords
+- Content strategy and creation
+- Off-page authority building
+- Monthly performance reporting
+
+**Expected Results:** Top 10 rankings for target keywords within 6 months, 200%+ organic traffic growth
+**Timeline:** Ongoing (6-12 month commitment) | **Investment:** Monthly retainer starting at $2,500/month
+""",
+
+        'mobile_app_development': f"""
+For a {company_size} {industry} business like {company_name}, a native mobile app could unlock new revenue streams.
+
+**Opportunity:**
+Your website receives significant mobile traffic, but a dedicated app would:
+- Increase customer engagement and retention
+- Enable push notifications and personalization
+- Create a direct channel to your customers
+- Generate new revenue opportunities
+
+**Our Process:**
+We build iOS and Android apps with:
+- Native performance and user experience
+- Offline functionality
+- Seamless backend integration
+- App Store and Play Store optimization
+
+**Expected ROI:** 40-60% increase in customer lifetime value
+**Timeline:** 12-16 weeks | **Investment:** Starting at $35,000
+""",
+
+        'social_media_marketing': f"""
+{company_name}'s social presence is not aligned with your market potential.
+
+**Current Assessment:**
+- Limited social media integration on website
+- Missing or inactive social accounts
+- No consistent content strategy
+
+**Our Social Media Services:**
+For {industry} businesses, we create and execute comprehensive social strategies:
+- Content calendar and creation
+- Community management and engagement
+- Paid social advertising ($500-$5,000/month)
+- Analytics and monthly reporting
+- Influencer partnerships (if relevant)
+
+**Expected Results:** 5-10x follower growth, 30-50% increase in social-driven traffic
+**Timeline:** Ongoing (minimum 3 months) | **Investment:** $2,000-$5,000/month
+""",
+
+        'paid_advertising': f"""
+Your organic traffic is limited, but paid advertising could immediately increase qualified leads.
+
+**Opportunity Analysis:**
+- Low organic visibility in search results
+- High cost of waiting for SEO results
+- Immediate revenue opportunity through PPC
+
+**Our Paid Advertising Services:**
+Fully-managed campaigns on Google, Facebook, and Instagram with:
+- Keyword and audience research
+- Creative development and A/B testing
+- Daily optimization and monitoring
+- Conversion tracking and reporting
+- Weekly performance reviews
+
+**Expected ROI:** 3-5x return on ad spend for e-commerce, 200-500% for B2B
+**Timeline:** Ongoing (minimum 3 months) | **Investment:** $1,000-$10,000/month ad spend + management
+"""
+    }
+    
+    return pitches.get(service_name, "Service pitch unavailable")
+
+def enrich_lead_with_ai(lead_data, audit_data, openai_key):
+    """Use AI to generate comprehensive lead enrichment and recommendations."""
+    if not openai_key:
+        return None
+    
+    try:
+        client = OpenAI(api_key=openai_key)
+        
+        prompt = f"""
+Analyze this business lead and provide strategic recommendations:
+
+**Company:** {lead_data.get('company_name', 'Unknown')}
+**Industry:** {lead_data.get('industry', 'Unknown')}
+**Company Size:** {lead_data.get('company_size', 'Unknown')}
+**Location:** {lead_data.get('city', 'Unknown')}, {lead_data.get('state', 'Unknown')}
+
+**Website Audit Results:**
+- Health Score: {audit_data.get('score', 0)}/100
+- Performance Score: {audit_data.get('psi', 'N/A')}/100
+- Accessibility Score: {audit_data.get('accessibility_score', 'N/A')}/100
+- Critical Issues: {len(audit_data.get('issues', []))}
+
+**Top 3 Issues:** {', '.join([i['title'] for i in audit_data.get('issues', [])[:3]])}
+
+Provide a JSON response with:
+1. "key_challenges": [list of 3-5 main business challenges based on website audit]
+2. "quick_wins": [3-5 quick improvements that could be made in 30 days]
+3. "recommended_services": [list of top 3 Code Nest services with priority 1-10]
+4. "estimated_impact": Brief description of potential business impact
+5. "conversation_starters": [3 compelling reasons to talk to this prospect]
+
+Return ONLY valid JSON, no other text.
+"""
+        
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=800
+        )
+        
+        result = response.choices[0].message.content
+        return json.loads(result)
+    
+    except Exception as e:
+        logger.error(f"Error enriching lead with AI: {str(e)}")
+        return None
+
+def process_csv_leads(csv_file, audit_scores_lookup, openai_key):
+    """Process CSV lead file with Google Places data and audit matching."""
+    try:
+        df = pd.read_csv(csv_file)
+        leads_created = 0
+        errors = []
+        
+        for idx, row in df.iterrows():
+            try:
+                company_name = row.get('name', f"Lead {idx}")
+                phone = row.get('phone', '')
+                address = row.get('address', '')
+                place_id = row.get('place_id', '')
+                website = row.get('website', '') or row.get('url', '')
+                city = row.get('city', '')
+                state = row.get('state', '')
+                zipcode = row.get('zipcode', '')
+                
+                # Extract domain from website if available
+                if website:
+                    domain = urlparse(website).netloc.replace('www.', '')
+                else:
+                    domain = None
+                
+                if not domain:
+                    errors.append(f"Row {idx}: No website/domain found")
+                    continue
+                
+                # Look up audit scores if available
+                audit_data = audit_scores_lookup.get(domain, {})
+                
+                # Create lead record
+                db = get_db()
+                if not db:
+                    continue
+                
+                lead = Lead(
+                    domain=domain,
+                    company_name=company_name,
+                    phone=phone,
+                    address=address,
+                    place_id=place_id,
+                    city=city,
+                    state=state,
+                    zipcode=zipcode,
+                    health_score=audit_data.get('score'),
+                    industry=audit_data.get('industry', detect_industry(domain, '', audit_data.get('tech_stack', []))),
+                    company_size=audit_data.get('company_size', estimate_company_size(
+                        audit_data.get('tech_stack', []),
+                        len(str(audit_data)),
+                        False,
+                        len(audit_data.get('emails', []))
+                    )),
+                    service_priorities=audit_data.get('service_scores', {}),
+                    status='new'
+                )
+                
+                # AI enrichment if audit data available
+                if audit_data and openai_key:
+                    ai_enrichment = enrich_lead_with_ai(
+                        {
+                            'company_name': company_name,
+                            'city': city,
+                            'state': state,
+                            'industry': lead.industry,
+                            'company_size': lead.company_size
+                        },
+                        audit_data,
+                        openai_key
+                    )
+                    lead.ai_enrichment = ai_enrichment
+                
+                db.add(lead)
+                db.commit()
+                leads_created += 1
+                
+                db.close()
+            
+            except Exception as e:
+                errors.append(f"Row {idx}: {str(e)}")
+                continue
+        
+        return leads_created, errors
+    
+    except Exception as e:
+        logger.error(f"Error processing CSV: {str(e)}")
+        return 0, [str(e)]
 
 def run_audit(url, openai_key, google_key):
     """Enhanced audit with new checks."""
@@ -2751,6 +3441,20 @@ def run_audit(url, openai_key, google_key):
         data['error'] = str(e)
 
     data['score'] = max(0, data['score'])
+    
+    # Add service scoring for lead enrichment
+    try:
+        industry = detect_industry(url, html if 'html' in locals() else '', data.get('tech_stack', []))
+        company_size = estimate_company_size(data.get('tech_stack', []), 
+                                            len(str(data)), 
+                                            False, 
+                                            len(data.get('emails', [])))
+        data['industry'] = industry
+        data['company_size'] = company_size
+        data['service_scores'] = calculate_service_scores(data, company_size, industry)
+    except Exception as e:
+        logger.warning(f"Error calculating service scores: {str(e)}")
+    
     return data
 
 def save_audit_to_db(data, comparison_group=None):
@@ -3583,6 +4287,8 @@ elif current_section == "Bulk Audit":
     show_bulk_audit()
 elif current_section == "Competitor Analysis":
     show_competitor_analysis()
+elif current_section == "Lead Management":
+    show_lead_management()
 elif current_section == "Email Outreach":
     show_email_outreach()
 elif current_section == "Scheduled Audits":
