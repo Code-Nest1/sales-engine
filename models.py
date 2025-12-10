@@ -89,6 +89,20 @@ class EmailOutreach(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class BulkScan(Base):
+    __tablename__ = "bulk_scans"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(255), nullable=False)  # Unique session identifier
+    status = Column(String(50), default="running")  # running, paused, completed, stopped
+    total_urls = Column(Integer, nullable=False)
+    processed_urls = Column(Integer, default=0)
+    urls = Column(JSON, default=list)  # All URLs to scan
+    results = Column(JSON, default=dict)  # {"url": audit_id}
+    paused_at_index = Column(Integer, default=0)  # Resume point
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 class User(Base):
     __tablename__ = "users"
 

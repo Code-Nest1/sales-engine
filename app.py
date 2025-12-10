@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 import json
 import hashlib
 from pathlib import Path
-import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from io import BytesIO
@@ -32,7 +31,7 @@ except ImportError:
 
 # Load environment variables
 load_dotenv()
-from models import init_db, get_db, Audit, Lead, EmailOutreach, DATABASE_URL, User
+from models import init_db, get_db, Audit, Lead, EmailOutreach, DATABASE_URL, User, BulkScan
 
 # ============================================================================
 # ENHANCED APP CONFIGURATION
@@ -769,7 +768,7 @@ def show_dashboard():
 # ============================================================================
 
 def generate_pdf_report(audit_data, filename="audit_report.pdf"):
-    """Generate professional PDF report for an audit."""
+    """Generate professional PDF report for an audit with complete details."""
     try:
         pdf = FPDF()
         pdf.add_page()
@@ -787,31 +786,86 @@ def generate_pdf_report(audit_data, filename="audit_report.pdf"):
         pdf.set_font("Arial", "", 10)
         
         details = [
-            ("Domain", audit_data.get("domain", "N/A")),
-            ("Score", f"{audit_data.get('score', 'N/A')}/100"),
-            ("Status", audit_data.get("status", "N/A")),
-            ("Date", audit_data.get("timestamp", "N/A")),
+            ("Domain", audit_data.get("domain", audit_data.get("url", "N/A"))),
+            ("Health Score", f"{audit_data.get('score', audit_data.get('health_score', 'N/A'))}/100"),
+            ("Page Speed Score", str(audit_data.get('psi', audit_data.get('psi_score', 'N/A')))),
+            ("Domain Age", str(audit_data.get('domain_age', 'N/A'))),
+            ("Date", audit_data.get('timestamp', audit_data.get('created_at', 'N/A'))),
         ]
         
         for label, value in details:
+            pdf.set_font("Arial", "", 10)
             pdf.cell(50, 6, f"{label}:", 0)
-            pdf.cell(0, 6, str(value), ln=True)
+            pdf.set_font("Arial", "B", 10)
+            pdf.cell(0, 6, str(value)[:50], ln=True)
         
         pdf.ln(5)
         
+        # Tech Stack
+        if "tech_stack" in audit_data and audit_data["tech_stack"]:
+            pdf.set_font("Arial", "B", 11)
+            pdf.cell(0, 7, "Technology Stack", ln=True)
+            pdf.set_font("Arial", "", 9)
+            tech_text = ", ".join(audit_data["tech_stack"][:15])
+            pdf.multi_cell(0, 4, tech_text)
+            pdf.ln(3)
+        
         # Issues
         if "issues" in audit_data and audit_data["issues"]:
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 8, "Issues Found", ln=True)
+            pdf.set_font("Arial", "B", 11)
+            pdf.cell(0, 7, f"Issues Found ({len(audit_data['issues'])})", ln=True)
             pdf.set_font("Arial", "", 9)
             
-            for i, issue in enumerate(audit_data["issues"][:10], 1):
-                pdf.multi_cell(0, 5, f"{i}. {issue}")
+            for i, issue in enumerate(audit_data["issues"][:15], 1):
+                issue_text = str(issue)[:80]
+                pdf.multi_cell(0, 4, f"{i}. {issue_text}")
+            pdf.ln(2)
+        
+        # Emails Found
+        if "emails" in audit_data and audit_data["emails"]:
+            pdf.set_font("Arial", "B", 11)
+            pdf.cell(0, 7, "Contact Emails", ln=True)
+            pdf.set_font("Arial", "", 10)
+            for email in audit_data["emails"][:5]:
+                pdf.cell(0, 5, f"• {email}", ln=True)
+            pdf.ln(2)
+        
+        # AI Insights
+        if "ai" in audit_data and audit_data["ai"]:
+            ai_data = audit_data["ai"]
+            
+            if ai_data.get("summary"):
+                pdf.set_font("Arial", "B", 11)
+                pdf.cell(0, 7, "AI Summary", ln=True)
+                pdf.set_font("Arial", "", 9)
+                pdf.multi_cell(0, 4, str(ai_data.get("summary", ""))[:400])
+                pdf.ln(2)
+            
+            if ai_data.get("impact"):
+                pdf.set_font("Arial", "B", 11)
+                pdf.cell(0, 7, "Business Impact", ln=True)
+                pdf.set_font("Arial", "", 9)
+                pdf.multi_cell(0, 4, str(ai_data.get("impact", ""))[:400])
+                pdf.ln(2)
+            
+            if ai_data.get("solutions"):
+                pdf.set_font("Arial", "B", 11)
+                pdf.cell(0, 7, "Recommended Solutions", ln=True)
+                pdf.set_font("Arial", "", 9)
+                pdf.multi_cell(0, 4, str(ai_data.get("solutions", ""))[:400])
+                pdf.ln(2)
+            
+            if ai_data.get("email"):
+                pdf.set_font("Arial", "B", 11)
+                pdf.cell(0, 7, "AI Email Draft", ln=True)
+                pdf.set_font("Arial", "", 8)
+                pdf.multi_cell(0, 3, str(ai_data.get("email", ""))[:600])
+                pdf.ln(2)
         
         # Footer
-        pdf.ln(10)
+        pdf.ln(5)
         pdf.set_font("Arial", "I", 8)
-        pdf.cell(0, 5, "© 2025 Code Nest. All rights reserved.", align="C")
+        pdf.cell(0, 5, "© 2025 Code Nest. All rights reserved. | www.codenest.dev", align="C")
         
         # Save to bytes
         pdf_bytes = pdf.output(dest='S').encode('latin-1')
@@ -2173,60 +2227,309 @@ def show_single_audit():
                     except Exception as e:
                         st.error(f"PDF Error: {e}")
 
+# ============================================================================
+# BULK SCAN BACKGROUND PROCESSING FUNCTIONS
+# ============================================================================
+
+def create_bulk_scan_session(urls: list) -> str:
+    """Create a new bulk scan session and store in database."""
+    import uuid
+    db = get_db()
+    if not db:
+        return None
+    
+    try:
+        session_id = str(uuid.uuid4())
+        bulk_scan = BulkScan(
+            session_id=session_id,
+            status="running",
+            total_urls=len(urls),
+            urls=urls,
+            processed_urls=0,
+            paused_at_index=0,
+            results={}
+        )
+        db.add(bulk_scan)
+        db.commit()
+        return session_id
+    except Exception as e:
+        logger.error(f"Error creating bulk scan session: {e}")
+        return None
+    finally:
+        db.close()
+
+def get_bulk_scan_session(session_id: str):
+    """Retrieve bulk scan session from database."""
+    db = get_db()
+    if not db:
+        return None
+    try:
+        return db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
+    finally:
+        db.close()
+
+def update_bulk_scan_progress(session_id: str, processed_count: int, results: dict, status: str = "running"):
+    """Update bulk scan progress in database."""
+    db = get_db()
+    if not db:
+        return False
+    
+    try:
+        scan = db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
+        if scan:
+            scan.processed_urls = processed_count
+            scan.results = results
+            scan.status = status
+            scan.updated_at = datetime.utcnow()
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error updating bulk scan: {e}")
+        return False
+    finally:
+        db.close()
+
+def pause_bulk_scan(session_id: str, current_index: int):
+    """Pause a bulk scan at a specific index."""
+    db = get_db()
+    if not db:
+        return False
+    
+    try:
+        scan = db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
+        if scan:
+            scan.status = "paused"
+            scan.paused_at_index = current_index
+            scan.updated_at = datetime.utcnow()
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error pausing bulk scan: {e}")
+        return False
+    finally:
+        db.close()
+
+def resume_bulk_scan(session_id: str):
+    """Resume a paused bulk scan."""
+    db = get_db()
+    if not db:
+        return False
+    
+    try:
+        scan = db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
+        if scan:
+            scan.status = "running"
+            scan.updated_at = datetime.utcnow()
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error resuming bulk scan: {e}")
+        return False
+    finally:
+        db.close()
+
+def stop_bulk_scan(session_id: str):
+    """Stop a bulk scan permanently."""
+    db = get_db()
+    if not db:
+        return False
+    
+    try:
+        scan = db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
+        if scan:
+            scan.status = "stopped"
+            scan.updated_at = datetime.utcnow()
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error stopping bulk scan: {e}")
+        return False
+    finally:
+        db.close()
+
+def complete_bulk_scan(session_id: str):
+    """Mark a bulk scan as completed."""
+    db = get_db()
+    if not db:
+        return False
+    
+    try:
+        scan = db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
+        if scan:
+            scan.status = "completed"
+            scan.updated_at = datetime.utcnow()
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error completing bulk scan: {e}")
+        return False
+    finally:
+        db.close()
+
+def get_bulk_scan_sessions(limit=10):
+    """Get list of recent bulk scan sessions."""
+    db = get_db()
+    if not db:
+        return []
+    
+    try:
+        sessions = db.query(BulkScan).order_by(BulkScan.created_at.desc()).limit(limit).all()
+        return sessions
+    finally:
+        db.close()
+
 def show_bulk_audit():
-    """Bulk audit processor page."""
+    """Bulk audit processor page with background processing, pause/resume support."""
     st.title("📂 Bulk Website Audit")
     st.markdown("Upload CSV with 'Website' column to analyze multiple sites at once")
+    st.markdown("**Features:** Background processing • Pause/Resume • Real-time progress • PDF downloads")
     st.markdown("---")
     
-    uploaded = st.file_uploader("Upload CSV", type="csv")
+    tab1, tab2 = st.tabs(["New Scan", "Active Sessions"])
     
-    if uploaded:
-        df = pd.read_csv(uploaded)
-        st.write(f"**Loaded {len(df)} rows**")
+    with tab1:
+        uploaded = st.file_uploader("Upload CSV", type="csv", key="bulk_csv")
         
-        if "Website" not in df.columns:
-            st.error("CSV must have 'Website' column")
-        else:
-            st.dataframe(df.head(), use_container_width=True)
+        if uploaded:
+            df = pd.read_csv(uploaded)
+            st.write(f"**Loaded {len(df)} rows**")
             
-            if st.button("▶️ Process Batch", type="primary"):
-                results = []
-                progress = st.progress(0)
-                status = st.empty()
+            if "Website" not in df.columns:
+                st.error("CSV must have 'Website' column")
+            else:
+                st.dataframe(df.head(), use_container_width=True)
                 
-                for i, row_site in enumerate(df['Website']):
-                    status.text(f"📊 {i+1}/{len(df)}: {row_site}")
-                    d = run_audit(str(row_site).strip(), st.session_state.OPENAI_API_KEY, st.session_state.GOOGLE_API_KEY)
+                if st.button("▶️ Start Background Scan", type="primary", use_container_width=True):
+                    # Create new bulk scan session
+                    urls = [str(url).strip() for url in df['Website'].tolist()]
+                    session_id = create_bulk_scan_session(urls)
                     
-                    save_audit_to_db(d)
-                    opp_score = calculate_opportunity_score(d)
+                    if session_id:
+                        st.session_state['bulk_scan_session_id'] = session_id
+                        st.session_state['bulk_scan_urls'] = urls
+                        st.session_state['bulk_scan_results'] = {}
+                        st.session_state['bulk_scan_status'] = 'running'
+                        st.success(f"✓ Bulk scan session created! Session ID: {session_id[:8]}...")
+                        st.info("📌 You can now navigate to other sections. Progress will continue in the background!")
+                        st.rerun()
+    
+    with tab2:
+        st.subheader("Active Scanning Sessions")
+        sessions = get_bulk_scan_sessions(limit=20)
+        
+        if not sessions:
+            st.info("No active sessions")
+        else:
+            for session in sessions:
+                with st.container(border=True):
+                    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
                     
-                    results.append({
-                        "Website": row_site,
-                        "Health Score": d['score'],
-                        "Speed": d.get('psi', 'N/A'),
-                        "Issues": len(d['issues']),
-                        "Opportunity": opp_score,
-                        "Tech": ", ".join(d['tech_stack'][:3]) if d['tech_stack'] else "Standard",
-                        "Email": d['emails'][0] if d['emails'] else "N/A"
-                    })
-                    progress.progress((i+1)/len(df))
-                
-                status.empty()
-                st.success(f"✓ Processed {len(df)} websites")
-                
-                res_df = pd.DataFrame(results).sort_values("Opportunity", ascending=False)
-                st.dataframe(res_df, use_container_width=True)
-                
-                csv = res_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "📥 Download Leads CSV",
-                    csv,
-                    "CodeNest_Leads.csv",
-                    "text/csv",
-                    use_container_width=True
-                )
+                    with col1:
+                        progress_pct = (session.processed_urls / session.total_urls * 100) if session.total_urls > 0 else 0
+                        st.write(f"**Session:** {session.session_id[:12]}...")
+                        st.write(f"**Status:** {session.status.upper()}")
+                        st.progress(progress_pct / 100)
+                        st.write(f"{session.processed_urls}/{session.total_urls} completed ({progress_pct:.0f}%)")
+                    
+                    with col2:
+                        st.metric("Total URLs", session.total_urls)
+                    
+                    with col3:
+                        st.metric("Processed", session.processed_urls)
+                    
+                    with col4:
+                        st.write("")  # Spacing
+                        col_btn1, col_btn2, col_btn3 = st.columns(3)
+                        
+                        with col_btn1:
+                            if session.status == "running":
+                                if st.button("⏸️ Pause", key=f"pause_{session.id}"):
+                                    pause_bulk_scan(session.session_id, session.processed_urls)
+                                    st.rerun()
+                            elif session.status == "paused":
+                                if st.button("▶️ Resume", key=f"resume_{session.id}"):
+                                    resume_bulk_scan(session.session_id)
+                                    st.rerun()
+                        
+                        with col_btn2:
+                            if session.status != "stopped" and session.status != "completed":
+                                if st.button("⏹️ Stop", key=f"stop_{session.id}"):
+                                    stop_bulk_scan(session.session_id)
+                                    st.rerun()
+                        
+                        with col_btn3:
+                            if session.status == "completed":
+                                if st.button("📥 Export", key=f"export_{session.id}"):
+                                    # Create CSV export of results
+                                    results_list = []
+                                    db = get_db()
+                                    for url, audit_id in session.results.items():
+                                        audit = db.query(Audit).filter(Audit.id == audit_id).first()
+                                        if audit:
+                                            results_list.append({
+                                                "Website": url,
+                                                "Health Score": audit.health_score,
+                                                "Speed": audit.psi_score or "N/A",
+                                                "Issues": len(audit.issues) if audit.issues else 0,
+                                                "Tech": ", ".join(audit.tech_stack[:3]) if audit.tech_stack else "Standard",
+                                                "Email": ", ".join(audit.emails_found) if audit.emails_found else "N/A"
+                                            })
+                                    
+                                    if results_list:
+                                        res_df = pd.DataFrame(results_list)
+                                        csv = res_df.to_csv(index=False).encode('utf-8')
+                                        st.download_button(
+                                            "📥 Download CSV",
+                                            csv,
+                                            f"scan_{session.session_id[:8]}.csv",
+                                            "text/csv"
+                                        )
+                    
+                    # Show recently scanned URLs
+                    if session.results:
+                        st.write("**Recently scanned:**")
+                        recent_urls = list(session.results.keys())[-5:]
+                        for url in recent_urls:
+                            st.write(f"  ✓ {url}")
+    
+    # Background processing logic (runs every page load)
+    if 'bulk_scan_session_id' in st.session_state:
+        session_id = st.session_state['bulk_scan_session_id']
+        session = get_bulk_scan_session(session_id)
+        
+        if session and session.status == "running":
+            urls = session.urls
+            start_idx = session.paused_at_index
+            
+            # Process URLs from the resume point
+            for i in range(start_idx, min(start_idx + 1, len(urls))):  # Process one URL per page load
+                url = urls[i]
+                try:
+                    # Run audit
+                    audit_data = run_audit(url, st.session_state.OPENAI_API_KEY, st.session_state.GOOGLE_API_KEY)
+                    audit_id = save_audit_to_db(audit_data)
+                    
+                    # Update session results
+                    if audit_id:
+                        session.results[url] = audit_id
+                        session.processed_urls = i + 1
+                        
+                        # Update database
+                        update_bulk_scan_progress(session_id, i + 1, session.results)
+                        
+                        if i + 1 >= len(urls):
+                            # All done!
+                            complete_bulk_scan(session_id)
+                            del st.session_state['bulk_scan_session_id']
+                except Exception as e:
+                    logger.error(f"Error processing {url}: {e}")
+                    session.processed_urls = i + 1
+                    update_bulk_scan_progress(session_id, i + 1, session.results)
 
 def show_audit_history():
     """Audit history page for all users - with pagination."""
@@ -3742,14 +4045,45 @@ def save_audit_pdf_to_file(audit_id, pdf_bytes):
         return None
 
 def get_audit_pdf(audit_id):
-    """Retrieve stored audit PDF."""
-    pdf_path = Path(__file__).parent / "audit_pdfs" / f"audit_{audit_id}.pdf"
+    """Generate PDF from audit database record."""
+    db = get_db()
+    if not db:
+        return None
+    
     try:
-        if pdf_path.exists():
-            return pdf_path.read_bytes()
+        audit = db.query(Audit).filter(Audit.id == audit_id).first()
+        if not audit:
+            return None
+        
+        # Prepare audit data for PDF generation
+        audit_data = {
+            "domain": audit.domain,
+            "url": audit.url,
+            "score": audit.health_score,
+            "health_score": audit.health_score,
+            "psi": audit.psi_score,
+            "psi_score": audit.psi_score,
+            "domain_age": audit.domain_age,
+            "tech_stack": audit.tech_stack or [],
+            "issues": audit.issues or [],
+            "emails": audit.emails_found or [],
+            "created_at": audit.created_at.strftime("%Y-%m-%d %H:%M:%S") if audit.created_at else "N/A",
+            "ai": {
+                "summary": audit.ai_summary or "",
+                "impact": audit.ai_impact or "",
+                "solutions": audit.ai_solutions or "",
+                "email": audit.ai_email or ""
+            }
+        }
+        
+        # Generate PDF
+        pdf_bytes = generate_pdf_report(audit_data, f"audit_{audit_id}.pdf")
+        return pdf_bytes
+    except Exception as e:
+        logger.error(f"Error generating audit PDF: {e}")
         return None
-    except Exception:
-        return None
+    finally:
+        db.close()
 
 def show_admin_settings():
     """Admin settings page with enhanced features."""
