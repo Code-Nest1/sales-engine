@@ -2191,6 +2191,10 @@ def show_single_audit():
     st.markdown("Enter a website URL to analyze its technical health, SEO, performance & generate AI insights")
     st.markdown("---")
     
+    # Initialize session state for audit results
+    if 'current_audit_data' not in st.session_state:
+        st.session_state.current_audit_data = None
+    
     col1, col2 = st.columns([3, 1])
     with col1:
         url = st.text_input("Website URL", placeholder="example.com")
@@ -2221,8 +2225,13 @@ def show_single_audit():
                     error_msg = data.get('error', 'Unknown error during audit')
                     st.error(f"❌ Scan Failed: {error_msg}")
                     logger.error(f"Audit failed for {url_sanitized}: {error_msg}")
+                    # Clear previous audit data on error
+                    st.session_state.current_audit_data = None
                 else:
                     logger.info(f"Audit completed successfully for {url_sanitized}")
+                    
+                    # Store audit results in session state for persistence
+                    st.session_state.current_audit_data = data
                     
                     # Save to database safely
                     try:
@@ -2232,127 +2241,132 @@ def show_single_audit():
                     except Exception as e:
                         logger.warning(f"Failed to save audit to database: {str(e)}")
                         st.warning("⚠️ Audit completed but couldn't save to database")
-                    
-                    # Metrics
-                    st.markdown("---")
-                    st.markdown("### 📊 Audit Results")
-                    
-                    c1, c2, c3, c4, c5 = st.columns(5)
-                    
-                    with c1:
-                        st.metric("Health Score", data.get('score', 'N/A'), delta=("Good" if data.get('score', 0) >= 70 else "Needs Work"))
-                    with c2:
-                        st.metric("Google Speed", data.get('psi', 'N/A'))
-                    with c3:
-                        st.metric("Accessibility", data.get('accessibility_score', 'N/A'))
-                    with c4:
-                        st.metric("Issues Found", len(data.get('issues', [])))
-                    with c5:
-                        st.metric("Age", data.get('domain_age', 'Unknown'))
-                    
-                    # Tech stack
-                    if data.get('tech_stack'):
-                        st.markdown(f"**📦 Tech Stack:** {', '.join(data['tech_stack'])}")
-                    
-                    # Issues
-                    if data.get('issues'):
-                        st.markdown("---")
-                        st.markdown("### ⚠️ Issues Detected")
-                        
-                        for i, issue in enumerate(data.get('issues', []), 1):
-                            try:
-                                with st.expander(f"{i}. {issue.get('title', 'Unknown Issue')}", expanded=(i <= 2)):
-                                    col1, col2 = st.columns(2)
-                                    with col1:
-                                        st.markdown(f"**Impact:** {issue.get('impact', 'N/A')}")
-                                    with col2:
-                                        st.markdown(f"**Solution:** {issue.get('solution', 'N/A')}")
-                            except Exception as e:
-                                logger.error(f"Error displaying issue {i}: {str(e)}")
-                                st.warning(f"Could not display issue #{i}")
-                    
-                    # AI analysis
-                    if data.get('ai'):
-                        st.markdown("---")
-                        st.markdown("### 🤖 AI Analysis")
-                        
+    
+    # Display results from session state (persists across reruns)
+    if st.session_state.current_audit_data:
+        data = st.session_state.current_audit_data
+        
+        # Metrics
+        st.markdown("---")
+        st.markdown("### 📊 Audit Results")
+        
+        c1, c2, c3, c4, c5 = st.columns(5)
+        
+        with c1:
+            st.metric("Health Score", data.get('score', 'N/A'), delta=("Good" if data.get('score', 0) >= 70 else "Needs Work"))
+        with c2:
+            st.metric("Google Speed", data.get('psi', 'N/A'))
+        with c3:
+            st.metric("Accessibility", data.get('accessibility_score', 'N/A'))
+        with c4:
+            st.metric("Issues Found", len(data.get('issues', [])))
+        with c5:
+            st.metric("Age", data.get('domain_age', 'Unknown'))
+        
+        # Tech stack
+        if data.get('tech_stack'):
+            st.markdown(f"**📦 Tech Stack:** {', '.join(data['tech_stack'])}")
+        
+        # Issues
+        if data.get('issues'):
+            st.markdown("---")
+            st.markdown("### ⚠️ Issues Detected")
+            
+            for i, issue in enumerate(data.get('issues', []), 1):
+                try:
+                    with st.expander(f"{i}. {issue.get('title', 'Unknown Issue')}", expanded=(i <= 2)):
                         col1, col2 = st.columns(2)
                         with col1:
-                            st.markdown("**Summary**")
-                            st.info(data['ai'].get('summary', 'No summary available'))
-                            st.markdown("**Impact**")
-                            st.warning(data['ai'].get('impact', 'No impact assessment available'))
-                        
+                            st.markdown(f"**Impact:** {issue.get('impact', 'N/A')}")
                         with col2:
-                            st.markdown("**Solutions**")
-                            st.success(data['ai'].get('solutions', 'No solutions available'))
-                        
-                        st.markdown("---")
-                        st.markdown("**📧 Cold Email Draft**")
-                        st.text_area("", value=clean_text(data['ai']['email']), height=250, key="email_draft")
-                        
-                        # Auto-send audit report to contact email
-                        st.markdown("---")
-                        st.markdown("### 📤 Send Audit Report")
-                        
-                        # Try to extract email from OpenAI data
-                        extracted_email = extract_email_from_data(data)
-                        
-                        col1, col2 = st.columns([2, 1])
-                        with col1:
-                            recipient_email = st.text_input(
-                                "Send report to (contact email)",
-                                value=extracted_email or "",
-                                placeholder="contact@website.com",
-                                help="Email will be sent with detailed audit report"
-                            )
-                        
-                        with col2:
-                            if st.button("📧 Send Report", type="secondary", use_container_width=True):
-                                if recipient_email:
-                                    with st.spinner("Sending report..."):
-                                        success, message = send_audit_report_email(recipient_email, data)
-                                        if success:
-                                            st.success(f"✅ {message}")
-                                            logger.info(f"Audit report sent to {recipient_email}")
-                                        else:
-                                            st.error(f"❌ {message}")
-                                            logger.error(f"Failed to send report to {recipient_email}: {message}")
-                                else:
-                                    st.warning("⚠️ Please enter a recipient email address")
-                    
-                    # Save to DB
-                    audit_id = None
-                    if DB_AVAILABLE:
-                        audit_id = save_audit_to_db(data)
-                        if audit_id:
-                            st.success(f"✓ Audit saved (ID: {audit_id})")
-                            
-                            # Send Slack notification
-                            if st.session_state.SLACK_WEBHOOK:
-                                send_slack_notification(f"🔍 New audit: {url} (Score: {data['score']}/100)", st.session_state.SLACK_WEBHOOK)
-                    
-                    # PDF export and persistent storage
-                    st.markdown("---")
-                    try:
-                        pdf_bytes = generate_pdf(data)
-                        domain_name = urlparse(data['url']).netloc.replace("www.", "").replace(".", "_")
-                        
-                        # Save PDF to persistent storage if audit was saved to DB
-                        if audit_id:
-                            save_audit_pdf_to_file(audit_id, pdf_bytes)
-                            st.info(f"✓ PDF saved for future downloads")
-                        
-                        st.download_button(
-                            "📥 Download PDF Report",
-                            pdf_bytes,
-                            f"CodeNest_Audit_{domain_name}.pdf",
-                            "application/pdf",
-                            type="primary",
-                            use_container_width=True
-                        )
-                    except Exception as e:
-                        st.error(f"PDF Error: {e}")
+                            st.markdown(f"**Solution:** {issue.get('solution', 'N/A')}")
+                except Exception as e:
+                    logger.error(f"Error displaying issue {i}: {str(e)}")
+                    st.warning(f"Could not display issue #{i}")
+        
+        # AI analysis
+        if data.get('ai'):
+            st.markdown("---")
+            st.markdown("### 🤖 AI Analysis")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Summary**")
+                st.info(data['ai'].get('summary', 'No summary available'))
+                st.markdown("**Impact**")
+                st.warning(data['ai'].get('impact', 'No impact assessment available'))
+            
+            with col2:
+                st.markdown("**Solutions**")
+                st.success(data['ai'].get('solutions', 'No solutions available'))
+            
+            st.markdown("---")
+            st.markdown("**📧 Cold Email Draft**")
+            st.text_area("", value=clean_text(data['ai']['email']), height=250, key="email_draft")
+            
+            # Auto-send audit report to contact email
+            st.markdown("---")
+            st.markdown("### 📤 Send Audit Report")
+            
+            # Try to extract email from OpenAI data
+            extracted_email = extract_email_from_data(data)
+            
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                recipient_email = st.text_input(
+                    "Send report to (contact email)",
+                    value=extracted_email or "",
+                    placeholder="contact@website.com",
+                    help="Email will be sent with detailed audit report"
+                )
+            
+            with col2:
+                if st.button("📧 Send Report", type="secondary", use_container_width=True):
+                    if recipient_email:
+                        with st.spinner("Sending report..."):
+                            success, message = send_audit_report_email(recipient_email, data)
+                            if success:
+                                st.success(f"✅ {message}")
+                                logger.info(f"Audit report sent to {recipient_email}")
+                            else:
+                                st.error(f"❌ {message}")
+                                logger.error(f"Failed to send report to {recipient_email}: {message}")
+                    else:
+                        st.warning("⚠️ Please enter a recipient email address")
+        
+        # Save to DB (only if not already saved)
+        audit_id = data.get('audit_id')
+        if not audit_id and DB_AVAILABLE:
+            audit_id = save_audit_to_db(data)
+            if audit_id:
+                data['audit_id'] = audit_id  # Store for future reference
+                st.success(f"✓ Audit saved (ID: {audit_id})")
+                
+                # Send Slack notification
+                if st.session_state.SLACK_WEBHOOK:
+                    send_slack_notification(f"🔍 New audit: {data['url']} (Score: {data['score']}/100)", st.session_state.SLACK_WEBHOOK)
+        
+        # PDF export and persistent storage
+        st.markdown("---")
+        try:
+            pdf_bytes = generate_pdf(data)
+            domain_name = urlparse(data['url']).netloc.replace("www.", "").replace(".", "_")
+            
+            # Save PDF to persistent storage if audit was saved to DB
+            if audit_id:
+                save_audit_pdf_to_file(audit_id, pdf_bytes)
+                st.info(f"✓ PDF saved for future downloads")
+            
+            st.download_button(
+                "📥 Download PDF Report",
+                pdf_bytes,
+                f"CodeNest_Audit_{domain_name}.pdf",
+                "application/pdf",
+                type="primary",
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"PDF Error: {e}")
 
 # ============================================================================
 # BULK SCAN BACKGROUND PROCESSING FUNCTIONS
