@@ -2693,7 +2693,7 @@ def show_audit_history():
         </style>''', unsafe_allow_html=True)
     st.markdown('<div class="sticky-bar">', unsafe_allow_html=True)
     # Date filtering row with calendar
-    col_date1, col_date2, col_date3 = st.columns([2, 2, 2])
+    col_date1, col_date2, col_date3, col_date4 = st.columns([2, 2, 2, 2])
     with col_date1:
         time_filter = st.selectbox(
             "📅 Time Period",
@@ -2712,6 +2712,9 @@ def show_audit_history():
             date_to = st.date_input("To Date", value=datetime.now(), key="hist_date_to")
         else:
             st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
+    with col_date4:
+        show_all_scans = st.checkbox("🔄 Show All Scans", value=False, key="show_all_scans", 
+                                      help="Unchecked: shows only most recent scan per domain. Checked: all historical scans.")
     
     # Search and score filters row
     col1, col2, col3 = st.columns([2, 1, 1])
@@ -2792,6 +2795,26 @@ def show_audit_history():
                 filtered_audits.append(audit)
             
             audits = filtered_audits
+            
+            # Deduplicate by domain (keep most recent) unless "Show All Scans" is checked
+            if not show_all_scans and audits:
+                # Group by domain and keep only the most recent
+                domain_map = {}
+                for audit in audits:
+                    domain = audit.domain
+                    if domain not in domain_map:
+                        domain_map[domain] = audit
+                    else:
+                        # Keep the one with the latest created_at
+                        if audit.created_at and domain_map[domain].created_at:
+                            if audit.created_at > domain_map[domain].created_at:
+                                domain_map[domain] = audit
+                        elif audit.created_at:  # current has date, existing doesn't
+                            domain_map[domain] = audit
+                
+                audits = list(domain_map.values())
+                # Re-sort by created_at descending
+                audits.sort(key=lambda x: x.created_at if x.created_at else datetime.min, reverse=True)
             
             # Group audits by time period for display
             grouped_audits = {
@@ -2889,7 +2912,9 @@ def show_audit_history():
             # Bulk actions state
             if 'audit_bulk_selected' not in st.session_state:
                 st.session_state.audit_bulk_selected = set()
-            st.markdown("### 📋 Audit List")
+            
+            dedup_msg = "" if show_all_scans else " (showing most recent scan per domain)"
+            st.markdown(f"### 📋 Audit List{dedup_msg}")
             st.markdown(f"Click on any audit below to view full details. **{len(st.session_state.audit_bulk_selected)} selected**")
             # Bulk action controls
             col_bulk1, col_bulk2, col_bulk3, col_bulk4 = st.columns([1.5,1.5,1.5,1.5])
