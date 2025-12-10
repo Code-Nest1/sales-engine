@@ -61,7 +61,7 @@ if st.button("Create Gist & Trigger Workflow"):
     workflow_filename = "apply-patch.yml"
     dispatch_api = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{workflow_filename}/dispatches"
     dispatch_payload = {
-        "ref": target_branch,
+        "ref": DEFAULT_REF,
         "inputs": {
             "patch_url": raw_url,
             "target_branch": target_branch,
