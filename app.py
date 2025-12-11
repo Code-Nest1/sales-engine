@@ -4501,13 +4501,14 @@ SUBJECT: [lowercase subject]
             }
         
         logger.info(f"Calling OpenAI API for {domain} with key starting: {api_key[:8]}...")
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, timeout=30.0)  # 30s timeout per request
         
         # Get structured insights
         insights_response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": insights_prompt}],
-            temperature=0.7
+            temperature=0.7,
+            timeout=20.0  # 20s for this specific request
         )
         insights_text = insights_response.choices[0].message.content.strip()
         logger.info(f"OpenAI insights response received for {domain}")
@@ -4524,12 +4525,15 @@ SUBJECT: [lowercase subject]
             insights = None
         
         # Get premium cold email
+        logger.info(f"Generating cold email for {domain}...")
         email_response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": email_prompt}],
-            temperature=0.7
+            temperature=0.7,
+            timeout=20.0  # 20s for this specific request
         )
         email_content = email_response.choices[0].message.content.strip()
+        logger.info(f"Cold email generated for {domain}")
         
         # Parse email response
         email_subject = ""
@@ -5277,13 +5281,27 @@ def run_audit(url, openai_key, google_key):
         ai_executor = ThreadPoolExecutor(max_workers=1)
         ai_future = ai_executor.submit(get_ai_consultation, url, data, openai_key)
         try:
-            data['ai'] = ai_future.result(timeout=12)  # 12s timeout for AI
-        except Exception as e:
+            data['ai'] = ai_future.result(timeout=45)  # 45s timeout for AI (2 API calls)
+        except TimeoutError:
+            logger.warning(f"AI consultation timed out for {url}")
             data['ai'] = {
-                "summary": "AI analysis timed out or failed",
-                "impact": "Manual review recommended",
-                "solutions": "Contact support if issue persists",
-                "email": f"Error: {str(e)}"
+                "summary": "AI analysis timed out",
+                "impact": "OpenAI took too long to respond - this can happen during high traffic",
+                "solutions": "Try running the audit again",
+                "email": "AI timed out - click 'Regenerate Email' to try again",
+                "email_subject": f"quick idea for {urlparse(url).netloc.replace('www.', '')}",
+                "insights": None
+            }
+        except Exception as e:
+            error_str = str(e)
+            logger.error(f"AI consultation failed for {url}: {error_str}")
+            data['ai'] = {
+                "summary": "AI analysis failed",
+                "impact": f"Error: {error_str[:100]}",
+                "solutions": "Check API key in API Settings or try again",
+                "email": f"AI error - check API Settings. Error: {error_str[:50]}",
+                "email_subject": f"quick idea for {urlparse(url).netloc.replace('www.', '')}",
+                "insights": None
             }
         finally:
             ai_executor.shutdown(wait=False)
