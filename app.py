@@ -119,16 +119,27 @@ if _missing_assets:
 
 # Centralized AI Model Settings
 AI_MODEL = "gpt-4o-mini"  # Cheapest reliable model
-AI_MAX_TOKENS = 800       # Cap response size
+AI_MAX_TOKENS = 1200      # Increased for richer insights (was 800)
 AI_TEMPERATURE = 0.7      # Balance creativity/consistency
-AI_TIMEOUT = 25.0         # Per-request timeout (seconds)
-AI_CLIENT_TIMEOUT = 30.0  # Client-level timeout
+AI_TIMEOUT = 30.0         # Per-request timeout (seconds)
+AI_CLIENT_TIMEOUT = 35.0  # Client-level timeout
 
 # Regeneration Limits
 MAX_REGENERATIONS_PER_URL = 2  # Max times user can regenerate AI content per URL
 
 # AI Cache Configuration
 AI_CACHE_FILE = Path(__file__).parent / "ai_cache.json"
+
+# Issue Categories (for structured issues)
+ISSUE_CATEGORIES = {
+    "SEO": "Search Engine Optimization",
+    "Performance": "Site Speed & Performance", 
+    "Tracking": "Analytics & Tracking",
+    "Conversion": "Lead Generation & Conversion",
+    "UX": "User Experience",
+    "Security": "Security & Trust",
+    "Content": "Content Quality"
+}
 
 def get_ai_cache_key(url: str, audit_hash: str = "") -> str:
     """Generate a cache key for AI results."""
@@ -4501,15 +4512,20 @@ def get_ai_consultation(url, data, api_key, force_regenerate=False):
     """
     Get AI analysis with structured insights for PDF and email outreach.
     
+    ENHANCED FOR RICHER ISSUES:
+    - Receives structured issues with category, title, impact, technical_detail
+    - Produces deeper business-focused insights
+    - Email references specific impactful issues across categories
+    
     OPTIMIZED FOR COST:
     - Single OpenAI call returns both insights AND email
     - Results are cached per URL
-    - Shorter prompts with explicit word/token limits
+    - Word limits: ~450 words for insights, ~180 words for email
     - No conversation history (single user message)
     
     Args:
         url: Website URL
-        data: Audit data dict
+        data: Audit data dict with rich issues structure
         api_key: OpenAI API key
         force_regenerate: If True, skip cache and make fresh API call
     
@@ -4550,57 +4566,144 @@ def get_ai_consultation(url, data, api_key, force_regenerate=False):
             "from_cache": False
         }
     
-    # Prepare minimal audit data for prompt (reduce tokens)
+    # =========================================================================
+    # PREPARE RICH AUDIT DATA FOR PROMPT
+    # =========================================================================
     health_score = data.get('score', 0)
     psi_score = data.get('psi', 'N/A')
-    tech_list = ", ".join(data.get('tech_stack', [])[:5])  # Max 5 techs
+    domain_age = data.get('domain_age', 'Unknown')
+    tech_list = ", ".join(data.get('tech_stack', [])[:8])
     
-    # Only top 3 issues with short descriptions
-    issues_short = []
-    for issue in data.get('issues', [])[:3]:
-        title = issue.get('title', '')[:40]  # Truncate long titles
-        issues_short.append(title)
-    issues_text = "; ".join(issues_short) if issues_short else "Minor optimization opportunities"
+    # Build rich issues summary grouped by category
+    issues = data.get('issues', [])
+    issues_by_category = {}
+    for issue in issues:
+        cat = issue.get('category', 'General')
+        if cat not in issues_by_category:
+            issues_by_category[cat] = []
+        issues_by_category[cat].append({
+            'title': issue.get('title', ''),
+            'impact': issue.get('impact', ''),
+            'severity': issue.get('severity', 'medium')
+        })
     
-    # SINGLE COMBINED PROMPT - Returns both insights AND email in one call
-    combined_prompt = f"""You are a senior strategist at Code Nest LLC (New Mexico). Analyze this audit and provide BOTH insights AND a cold email in ONE JSON response.
+    # Format issues for prompt (top issues from each category, prioritize high severity)
+    issues_text_parts = []
+    priority_categories = ['Tracking', 'Conversion', 'SEO', 'Performance', 'Security', 'Content', 'UX']
+    
+    for cat in priority_categories:
+        if cat in issues_by_category:
+            cat_issues = issues_by_category[cat]
+            # Sort by severity (high first)
+            cat_issues.sort(key=lambda x: 0 if x['severity'] == 'high' else (1 if x['severity'] == 'medium' else 2))
+            for issue in cat_issues[:2]:  # Max 2 per category
+                issues_text_parts.append(f"[{cat}] {issue['title']}: {issue['impact']}")
+    
+    # Limit to top 8 most impactful issues for prompt
+    issues_text = "\n".join(issues_text_parts[:8]) if issues_text_parts else "Minor optimization opportunities found"
+    
+    # Additional context for AI
+    content_stats = data.get('content_stats', {})
+    word_count = content_stats.get('word_count', 'unknown')
+    tracking_info = data.get('tracking', {})
+    has_analytics = tracking_info.get('google_analytics', False) or tracking_info.get('gtm', False)
+    has_retargeting = tracking_info.get('facebook_pixel', False) or tracking_info.get('linkedin_insight', False)
+    
+    # =========================================================================
+    # ENHANCED COMBINED PROMPT
+    # =========================================================================
+    combined_prompt = f"""You are a senior digital strategist at Code Nest LLC (New Mexico). Analyze this comprehensive audit and produce BOTH detailed insights AND a cold outreach email.
 
-AUDIT DATA:
+AUDIT OVERVIEW:
 - Domain: {domain}
-- Score: {health_score}/100
-- Speed: {psi_score}
-- Tech: {tech_list}
-- Issues: {issues_text}
+- Health Score: {health_score}/100
+- PageSpeed: {psi_score}
+- Domain Age: {domain_age}
+- Tech Stack: {tech_list}
+- Content: ~{word_count} words on homepage
+- Has Analytics: {has_analytics}
+- Has Retargeting: {has_retargeting}
 
-Return ONLY valid JSON (no markdown):
+DETAILED ISSUES FOUND (by category):
+{issues_text}
+
+Return ONLY valid JSON (no markdown code blocks):
 {{
   "insights": {{
-    "snapshot_summary": ["bullet1 (<15 words)", "bullet2", "bullet3"],
+    "snapshot_summary": [
+      "bullet1 - key finding about business impact (15-20 words)",
+      "bullet2 - another key finding (15-20 words)",
+      "bullet3 - third finding if relevant (15-20 words)"
+    ],
     "top_3_issues": [
-      {{"issue": "name", "impact": "1-line impact"}},
-      {{"issue": "name", "impact": "1-line impact"}},
-      {{"issue": "name", "impact": "1-line impact"}}
+      {{
+        "issue": "Issue name",
+        "impact": "2-3 sentence explanation of business impact. How does this hurt leads, sales, or visibility?",
+        "category": "category name"
+      }},
+      {{
+        "issue": "Issue name",
+        "impact": "2-3 sentence explanation. Be specific about lost revenue/leads/trust.",
+        "category": "category name"
+      }},
+      {{
+        "issue": "Issue name",
+        "impact": "2-3 sentence explanation with business outcome focus.",
+        "category": "category name"
+      }}
     ],
-    "quick_wins": ["action1", "action2", "action3"],
+    "quick_wins": [
+      "Specific actionable fix 1 (e.g., 'Add Google Analytics tracking to see which channels drive leads')",
+      "Specific actionable fix 2",
+      "Specific actionable fix 3",
+      "Specific actionable fix 4 (optional)",
+      "Specific actionable fix 5 (optional)"
+    ],
     "code_nest_services": [
-      {{"issue": "problem", "service": "solution"}},
-      {{"issue": "problem", "service": "solution"}},
-      {{"issue": "problem", "service": "solution"}}
+      {{
+        "issue": "Problem area",
+        "service": "Specific Code Nest service/solution that addresses this"
+      }},
+      {{
+        "issue": "Problem area",
+        "service": "Specific solution"
+      }},
+      {{
+        "issue": "Problem area",
+        "service": "Specific solution"
+      }}
     ],
-    "next_step": "Clear CTA to schedule call or reply"
+    "next_step": "Clear call-to-action: suggest scheduling a free 15-minute strategy call to discuss priorities"
   }},
   "email": {{
-    "subject": "lowercase 3-5 word subject about {domain}",
-    "body": "Full email body (85-130 words). Start with 'Hi there,' and include: 1) mention reviewing their site, 2) 2-3 bullet findings, 3) business impact line, 4) credibility: 'For context, I'm reaching out from Code Nest LLC (New Mexico), where we help businesses improve website performance, SEO, social media, and paid ads.' 5) single CTA. End with: Best regards,\\nCode Nest Team\\nCode Nest LLC – New Mexico\\nContact@codenest.us.com\\nwww.codenest.us.com"
+    "subject": "lowercase 4-6 word subject mentioning {domain} (no caps, no punctuation)",
+    "body": "Full cold email body. Structure:
+1. Opening: 'Hi there,' + brief mention you reviewed their site
+2. Key findings: 2-4 bullet points from DIFFERENT categories (mix SEO, tracking, conversion issues)
+3. Business impact: 1-2 sentences on how these issues affect leads/revenue
+4. Credibility line: 'For context, I'm reaching out from Code Nest LLC, a New Mexico-based agency specializing in website optimization, SEO, and digital marketing.'
+5. Soft CTA: offer a free audit review call
+6. Sign off with full signature"
   }}
 }}
 
-RULES:
-- All bullets under 18 words
-- Email body: 85-130 words (excluding signature)
-- Focus on business impact
-- If score >70, focus on optimization not problems
-- No fluff phrases"""
+CRITICAL GUIDELINES:
+1. INSIGHTS TOTAL: Keep under 450 words. Be concise but substantive.
+2. EMAIL BODY: Target 120-180 words (not counting signature). Short enough for mobile reading.
+3. BUSINESS LANGUAGE: Translate technical issues to business outcomes:
+   - 'No analytics' → 'You can't see which marketing channels drive actual revenue'
+   - 'No retargeting pixel' → 'You can't follow up on the 95%+ of visitors who leave without contacting you'
+   - 'Thin content' → 'Google struggles to understand what your business offers, hurting rankings'
+   - 'Slow speed' → '53% of visitors abandon sites that take more than 3 seconds to load'
+4. PRIORITIZE issues that affect: lead generation, search visibility, ad ROI, user trust
+5. If score >70, frame as 'optimization opportunities' not 'problems'
+6. EMAIL must include issues from at least 2 different categories (e.g., one SEO + one Tracking)
+7. Sign email as:
+Best regards,
+Code Nest Team
+Code Nest LLC – New Mexico
+contact@codenest.us.com
+www.codenest.us.com"""
 
     try:
         log_source = "regeneration" if force_regenerate else "initial"
@@ -4611,7 +4714,7 @@ RULES:
         response = client.chat.completions.create(
             model=AI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a concise business analyst. Return only valid JSON."},
+                {"role": "system", "content": "You are a business-focused digital strategist. Translate technical website issues into clear business impact language. Return only valid JSON."},
                 {"role": "user", "content": combined_prompt}
             ],
             temperature=AI_TEMPERATURE,
@@ -4648,26 +4751,37 @@ RULES:
         signature = """Best regards,
 Code Nest Team
 Code Nest LLC – New Mexico
-Contact@codenest.us.com
+contact@codenest.us.com
 www.codenest.us.com"""
         
-        if email_body and ("Code Nest LLC" not in email_body or "Contact@codenest.us.com" not in email_body):
+        if email_body and ("Code Nest LLC" not in email_body or "codenest.us.com" not in email_body.lower()):
             email_body = email_body.rstrip() + "\n\n" + signature
         
-        # Fallback if email is missing/malformed
+        # Fallback if email is missing/malformed - use rich issues data
         if not email_body or len(email_body) < 50:
+            # Get top issues from different categories for fallback email
+            fallback_bullets = []
+            seen_categories = set()
+            for issue in issues[:5]:
+                cat = issue.get('category', 'General')
+                if cat not in seen_categories and len(fallback_bullets) < 3:
+                    fallback_bullets.append(f"• {issue.get('title', 'Optimization opportunity')}")
+                    seen_categories.add(cat)
+            
+            if not fallback_bullets:
+                fallback_bullets = ["• Site optimization opportunities identified"]
+            
             email_body = f"""Hi there,
 
-I recently reviewed {domain} and noticed a few areas where improvements could drive better results:
+I recently reviewed {domain} and noticed a few opportunities that could help drive better results:
 
-• {issues_short[0] if issues_short else 'Site optimization opportunities'}
-• Overall performance could be enhanced for better conversions
+{chr(10).join(fallback_bullets)}
 
-These quick fixes can significantly improve your site's visibility and conversion rates.
+These issues can directly impact your visibility in search results and your ability to convert visitors into leads.
 
-For context, I'm reaching out from Code Nest LLC (New Mexico), where we help businesses improve website performance, SEO, social media, and paid ads.
+For context, I'm reaching out from Code Nest LLC, a New Mexico-based agency specializing in website optimization, SEO, and digital marketing.
 
-Would you be open to a quick 10-minute call to discuss?
+Would you be open to a quick 15-minute call to discuss priorities?
 
 {signature}"""
             email_subject = f"quick note about {domain}"
@@ -5180,156 +5294,589 @@ def process_csv_leads(csv_file, audit_scores_lookup, openai_key):
         logger.error(f"Error processing CSV: {str(e)}")
         return 0, [str(e)]
 
+def create_issue(category: str, title: str, impact: str, technical_detail: str, severity: str = "medium") -> dict:
+    """
+    Create a structured issue with full business context.
+    
+    Args:
+        category: One of SEO, Performance, Tracking, Conversion, UX, Security, Content
+        title: Short human-readable issue title
+        impact: Business-level impact explanation
+        technical_detail: Technical explanation (1-2 lines)
+        severity: high, medium, or low
+    
+    Returns:
+        Structured issue dict
+    """
+    return {
+        "category": category,
+        "title": title,
+        "impact": impact,
+        "technical_detail": technical_detail,
+        "severity": severity
+    }
+
+
 def run_audit(url, openai_key, google_key):
-    """Enhanced audit with new checks."""
+    """
+    Enhanced website audit with deep free checks across multiple categories:
+    - Technical SEO & Indexability
+    - On-Page Content & Structure
+    - Performance (PageSpeed API)
+    - Tracking & Analytics
+    - Conversion & UX
+    - Security & Professionalism
+    
+    Returns structured issues with category, title, impact, technical_detail, and severity.
+    """
     if not url.startswith('http'): 
         url = 'http://' + url
     
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc.replace("www.", "")
+    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    
     data = {
         "url": url,
+        "domain": domain,
         "score": 100,
         "issues": [],
         "tech_stack": [],
         "emails": [],
         "psi": None,
         "psi_error": None,
+        "psi_audits": [],  # NEW: Store detailed PSI audit findings
         "domain_age": "Unknown",
         "accessibility_score": None,
         "security_issues": [],
         "broken_links": 0,
-        "cwv_metrics": {}
+        "cwv_metrics": {},
+        "content_stats": {},  # NEW: Content analysis stats
+        "seo_stats": {}  # NEW: SEO analysis stats
     }
 
     try:
         start = time.time()
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         response = requests.get(url, headers=headers, timeout=30)
         load_time = time.time() - start
+        response_headers = response.headers
         
         html = response.text.lower()
+        html_original = response.text  # Keep original case for some checks
         soup = BeautifulSoup(response.text, 'html.parser')
         
         # Start domain age lookup in background (slow WHOIS operation)
         executor = ThreadPoolExecutor(max_workers=1)
         domain_age_future = executor.submit(get_domain_age, url)
         
+        # Extract emails
         data['emails'] = list(set(re.findall(r"[a-z0-9\.\-+_]+@[a-z0-9\.\-+_]+\.[a-z]+", html)))
 
-        # Tech detection
+        # =====================================================================
+        # A. TECHNICAL SEO & INDEXABILITY
+        # =====================================================================
+        
+        # 1. robots.txt check
+        try:
+            robots_resp = requests.get(f"{base_url}/robots.txt", headers=headers, timeout=5)
+            if robots_resp.status_code == 200:
+                robots_content = robots_resp.text.lower()
+                data['tech_stack'].append("robots.txt")
+                
+                # Check if blocking important paths
+                if "disallow: /" in robots_content and "disallow: /wp-admin" not in robots_content:
+                    data['score'] -= 15
+                    data['issues'].append(create_issue(
+                        "SEO", 
+                        "robots.txt Blocks Entire Site",
+                        "Google can't index your site – you're invisible in search results",
+                        "robots.txt contains 'Disallow: /' which blocks all crawlers from indexing",
+                        "high"
+                    ))
+                
+                # Check for sitemap reference
+                if "sitemap:" in robots_content:
+                    data['seo_stats']['has_sitemap_in_robots'] = True
+            else:
+                data['seo_stats']['robots_missing'] = True
+        except Exception:
+            data['seo_stats']['robots_error'] = True
+        
+        # 2. Meta robots check
+        meta_robots = soup.find('meta', attrs={'name': 'robots'})
+        x_robots = response_headers.get('X-Robots-Tag', '')
+        
+        if meta_robots:
+            robots_content = meta_robots.get('content', '').lower()
+            if 'noindex' in robots_content:
+                data['score'] -= 20
+                data['issues'].append(create_issue(
+                    "SEO",
+                    "Site Set to NoIndex",
+                    "Google is explicitly told NOT to show your site in search results – zero organic visibility",
+                    "<meta name='robots' content='noindex'> found – this blocks all search engine indexing",
+                    "high"
+                ))
+        
+        if 'noindex' in x_robots.lower():
+            data['score'] -= 20
+            data['issues'].append(create_issue(
+                "SEO",
+                "X-Robots-Tag Blocks Indexing",
+                "Server headers tell Google not to index – you won't appear in search results",
+                "HTTP header X-Robots-Tag contains 'noindex'",
+                "high"
+            ))
+        
+        # 3. Canonical check
+        canonical = soup.find('link', attrs={'rel': 'canonical'})
+        if not canonical:
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "SEO",
+                "Missing Canonical Tag",
+                "Risk of duplicate content issues – Google may split your ranking power across multiple URLs",
+                "No <link rel='canonical'> tag found – search engines may index duplicate versions",
+                "medium"
+            ))
+        elif canonical:
+            canonical_href = canonical.get('href', '')
+            if canonical_href and domain not in canonical_href:
+                data['score'] -= 10
+                data['issues'].append(create_issue(
+                    "SEO",
+                    "Canonical Points to Different Domain",
+                    "Your SEO authority is being transferred to another website",
+                    f"Canonical tag points to {canonical_href[:50]}... instead of your domain",
+                    "high"
+                ))
+        
+        # 4. Sitemap check
+        sitemap_found = False
+        try:
+            sitemap_resp = requests.get(f"{base_url}/sitemap.xml", headers=headers, timeout=5)
+            if sitemap_resp.status_code == 200 and ('<?xml' in sitemap_resp.text or '<urlset' in sitemap_resp.text):
+                sitemap_found = True
+                data['tech_stack'].append("XML Sitemap")
+        except Exception:
+            pass
+        
+        if not sitemap_found and not data.get('seo_stats', {}).get('has_sitemap_in_robots'):
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "SEO",
+                "No XML Sitemap Found",
+                "Google has to guess which pages matter – slower indexing and potential missed pages",
+                "No sitemap.xml found at /sitemap.xml or referenced in robots.txt",
+                "medium"
+            ))
+        
+        # 5. Title tag analysis
+        title_tag = soup.title.string.strip() if soup.title and soup.title.string else ""
+        data['seo_stats']['title_length'] = len(title_tag)
+        
+        if not title_tag:
+            data['score'] -= 15
+            data['issues'].append(create_issue(
+                "SEO",
+                "Missing Page Title",
+                "No title = no click-worthy search result – severely hurts click-through rates",
+                "The <title> tag is missing or empty",
+                "high"
+            ))
+        elif len(title_tag) < 30:
+            data['score'] -= 8
+            data['issues'].append(create_issue(
+                "SEO",
+                f"Title Too Short ({len(title_tag)} chars)",
+                "Short titles waste valuable search result real estate and often look unprofessional",
+                f"Title '{title_tag[:40]}...' is under 30 characters (recommended: 50-65)",
+                "medium"
+            ))
+        elif len(title_tag) > 65:
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "SEO",
+                f"Title Too Long ({len(title_tag)} chars)",
+                "Google will truncate your title in search results, cutting off important keywords",
+                f"Title exceeds 65 characters and will be cut off in search results",
+                "low"
+            ))
+        
+        # Check for generic titles
+        generic_titles = ['home', 'welcome', 'untitled', 'homepage', 'index']
+        if title_tag.lower().strip() in generic_titles:
+            data['score'] -= 10
+            data['issues'].append(create_issue(
+                "SEO",
+                "Generic/Unhelpful Title Tag",
+                "Searchers can't tell what your business does – lower click-through rates",
+                f"Title '{title_tag}' is too generic – should describe your business/service",
+                "high"
+            ))
+        
+        # 6. Meta description analysis
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        meta_desc_content = meta_desc.get('content', '').strip() if meta_desc else ""
+        data['seo_stats']['meta_desc_length'] = len(meta_desc_content)
+        
+        if not meta_desc_content:
+            data['score'] -= 10
+            data['issues'].append(create_issue(
+                "SEO",
+                "Missing Meta Description",
+                "Google will auto-generate a snippet – usually looks worse and converts less",
+                "No <meta name='description'> tag found",
+                "high"
+            ))
+        elif len(meta_desc_content) < 50:
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "SEO",
+                f"Meta Description Too Short ({len(meta_desc_content)} chars)",
+                "You're missing the chance to sell your page in search results",
+                "Meta description should be 120-160 characters for optimal display",
+                "medium"
+            ))
+        
+        # =====================================================================
+        # B. ON-PAGE CONTENT & STRUCTURE
+        # =====================================================================
+        
+        # 1. Content depth (word count)
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "header", "footer"]):
+            script.decompose()
+        
+        text_content = soup.get_text(separator=' ', strip=True)
+        word_count = len(text_content.split())
+        data['content_stats']['word_count'] = word_count
+        
+        if word_count < 250:
+            data['score'] -= 10
+            data['issues'].append(create_issue(
+                "Content",
+                f"Thin Content ({word_count} words)",
+                "Google favors comprehensive content – thin pages rank poorly and don't convert well",
+                f"Homepage has only ~{word_count} words. Aim for 500+ words of quality content.",
+                "high"
+            ))
+        elif word_count < 400:
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "Content",
+                f"Light Content ({word_count} words)",
+                "May struggle to rank for competitive keywords – consider adding more value",
+                f"Homepage has ~{word_count} words. More detailed content often ranks better.",
+                "medium"
+            ))
+        
+        # 2. Heading hierarchy (H1)
+        h1_tags = soup.find_all('h1')
+        h1_count = len(h1_tags)
+        data['seo_stats']['h1_count'] = h1_count
+        
+        if h1_count == 0:
+            data['score'] -= 10
+            data['issues'].append(create_issue(
+                "SEO",
+                "No H1 Heading",
+                "Google uses H1 to understand your main topic – missing it hurts rankings",
+                "No <h1> tag found. Every page should have exactly one H1 describing the main topic.",
+                "high"
+            ))
+        elif h1_count > 1:
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "SEO",
+                f"Multiple H1 Tags ({h1_count} found)",
+                "Confuses search engines about your page's main topic",
+                f"Found {h1_count} H1 tags. Best practice is exactly one H1 per page.",
+                "medium"
+            ))
+        elif h1_count == 1:
+            h1_text = h1_tags[0].get_text(strip=True).lower()
+            if h1_text in ['home', 'welcome', 'homepage', '']:
+                data['score'] -= 8
+                data['issues'].append(create_issue(
+                    "SEO",
+                    "Generic H1 Heading",
+                    "Wasted opportunity to tell Google (and visitors) what you do",
+                    f"H1 is '{h1_text}' – should describe your service/value proposition",
+                    "medium"
+                ))
+        
+        # 3. Image alt text coverage
+        all_images = BeautifulSoup(html_original, 'html.parser').find_all('img')
+        total_images = len(all_images)
+        images_with_alt = len([img for img in all_images if img.get('alt') and img.get('alt').strip()])
+        data['content_stats']['total_images'] = total_images
+        data['content_stats']['images_with_alt'] = images_with_alt
+        
+        if total_images > 0:
+            alt_coverage = (images_with_alt / total_images) * 100
+            data['content_stats']['alt_coverage'] = round(alt_coverage, 1)
+            
+            if alt_coverage < 40:
+                data['score'] -= 8
+                data['issues'].append(create_issue(
+                    "SEO",
+                    f"Poor Image Alt Text ({int(alt_coverage)}% coverage)",
+                    "Google can't understand your images – missing image search traffic and accessibility issues",
+                    f"Only {images_with_alt} of {total_images} images have alt text. Screen readers also can't describe images.",
+                    "high"
+                ))
+            elif alt_coverage < 70:
+                data['score'] -= 4
+                data['issues'].append(create_issue(
+                    "SEO",
+                    f"Incomplete Image Alt Text ({int(alt_coverage)}% coverage)",
+                    "Missing some image SEO opportunities and accessibility",
+                    f"{total_images - images_with_alt} images are missing alt text",
+                    "medium"
+                ))
+        
+        # 4. Open Graph / Social metadata
+        og_title = soup.find('meta', attrs={'property': 'og:title'})
+        og_desc = soup.find('meta', attrs={'property': 'og:description'})
+        og_image = soup.find('meta', attrs={'property': 'og:image'})
+        
+        og_missing = []
+        if not og_title: og_missing.append('og:title')
+        if not og_desc: og_missing.append('og:description')
+        if not og_image: og_missing.append('og:image')
+        
+        if len(og_missing) >= 2:
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "Content",
+                "Missing Social Sharing Metadata",
+                "Links shared on Facebook/LinkedIn will look unprofessional with no preview image or description",
+                f"Missing Open Graph tags: {', '.join(og_missing)}",
+                "medium"
+            ))
+        
+        # =====================================================================
+        # C. TRACKING & ANALYTICS (Enhanced)
+        # =====================================================================
+        
+        tracking = {
+            'google_analytics': False,
+            'gtm': False,
+            'facebook_pixel': False,
+            'linkedin_insight': False,
+            'tiktok_pixel': False,
+            'hotjar': False
+        }
+        
+        # Google Analytics / GA4
+        if 'gtag(' in html or re.search(r'ua-\d{4,}-\d{1,}', html) or re.search(r'g-[a-z0-9]{10}', html):
+            tracking['google_analytics'] = True
+            data['tech_stack'].append("Google Analytics")
+        
+        # Google Tag Manager
+        if 'gtm.js' in html or 'googletagmanager' in html:
+            tracking['gtm'] = True
+            data['tech_stack'].append("Google Tag Manager")
+        
+        # Facebook/Meta Pixel
+        if 'fbq(' in html or 'facebook.com/tr' in html:
+            tracking['facebook_pixel'] = True
+            data['tech_stack'].append("Facebook Pixel")
+        
+        # LinkedIn Insight
+        if 'linkedin.com/px' in html or ('linkedin' in html and 'insight' in html):
+            tracking['linkedin_insight'] = True
+            data['tech_stack'].append("LinkedIn Insight")
+        
+        # TikTok Pixel
+        if 'tiktok.com/i18n/pixel' in html or 'analytics.tiktok.com' in html:
+            tracking['tiktok_pixel'] = True
+            data['tech_stack'].append("TikTok Pixel")
+        
+        # Hotjar
+        if 'hotjar' in html:
+            tracking['hotjar'] = True
+            data['tech_stack'].append("Hotjar")
+        
+        data['tracking'] = tracking
+        
+        # Issue: No analytics at all
+        has_any_analytics = tracking['google_analytics'] or tracking['gtm']
+        has_any_retargeting = tracking['facebook_pixel'] or tracking['linkedin_insight'] or tracking['tiktok_pixel']
+        
+        if not has_any_analytics:
+            data['score'] -= 15
+            data['issues'].append(create_issue(
+                "Tracking",
+                "No Analytics Tools Detected",
+                "You can't see where your visitors come from, what they do, or which channels drive leads",
+                "No Google Analytics, GA4, or Tag Manager found. You're flying blind.",
+                "high"
+            ))
+        
+        if has_any_analytics and not has_any_retargeting:
+            data['score'] -= 10
+            data['issues'].append(create_issue(
+                "Tracking",
+                "No Retargeting Pixels Installed",
+                "95%+ of visitors leave without contacting you – you can't follow up with targeted ads",
+                "No Facebook, LinkedIn, or TikTok retargeting pixels detected",
+                "high"
+            ))
+        
+        # =====================================================================
+        # D. CONVERSION & UX (Lead Capture & Trust)
+        # =====================================================================
+        
+        # Lead capture check
+        forms = soup.find_all('form')
+        has_form = len(forms) > 0
+        
+        # Contact methods
+        tel_links = soup.find_all('a', href=re.compile(r'^tel:'))
+        mailto_links = soup.find_all('a', href=re.compile(r'^mailto:'))
+        
+        # CTA buttons/links
+        cta_keywords = ['contact', 'get quote', 'request', 'book', 'schedule', 'call', 'free', 'demo', 'consultation']
+        cta_found = any(keyword in html for keyword in cta_keywords)
+        
+        data['conversion_stats'] = {
+            'has_form': has_form,
+            'tel_links': len(tel_links),
+            'mailto_links': len(mailto_links),
+            'cta_found': cta_found
+        }
+        
+        if not has_form and not tel_links and not mailto_links:
+            data['score'] -= 15
+            data['issues'].append(create_issue(
+                "Conversion",
+                "No Clear Contact Method",
+                "Visitors who want to buy can't easily reach you – losing potential customers",
+                "No contact form, phone link (tel:), or email link (mailto:) found on homepage",
+                "high"
+            ))
+        elif not has_form and not cta_found:
+            data['score'] -= 8
+            data['issues'].append(create_issue(
+                "Conversion",
+                "Weak Call-to-Action",
+                "Visitors don't know what action to take – lower conversion rates",
+                "No prominent contact form or CTA buttons like 'Get Quote' or 'Book Now'",
+                "medium"
+            ))
+        
+        # Trust signals check
+        trust_keywords = ['testimonial', 'review', 'client', 'customer', 'rating', 'stars', 'trust', 'certified', 'award']
+        has_trust_signals = any(keyword in html for keyword in trust_keywords)
+        
+        if not has_trust_signals:
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "Conversion",
+                "No Visible Trust Signals",
+                "New visitors have no proof you're legitimate – lower conversion rates",
+                "No testimonials, reviews, ratings, or trust badges detected on homepage",
+                "medium"
+            ))
+        
+        # Mobile viewport check
+        viewport = soup.find('meta', attrs={'name': 'viewport'})
+        if not viewport:
+            data['score'] -= 10
+            data['issues'].append(create_issue(
+                "UX",
+                "Not Mobile-Optimized",
+                "60%+ of traffic is mobile – your site may be unusable on phones",
+                "Missing <meta name='viewport'> tag. Layout likely breaks on mobile devices.",
+                "high"
+            ))
+        
+        # =====================================================================
+        # E. SECURITY & PROFESSIONALISM
+        # =====================================================================
+        
+        # HTTPS check
+        is_https = url.startswith('https')
+        if not is_https:
+            data['score'] -= 15
+            data['security_issues'].append("No SSL/HTTPS")
+            data['issues'].append(create_issue(
+                "Security",
+                "Site Not Using HTTPS",
+                "Browsers show 'Not Secure' warning – visitors lose trust and may leave",
+                "Site loads over HTTP instead of HTTPS. Modern browsers flag this as insecure.",
+                "high"
+            ))
+        
+        # Mixed content check (for HTTPS sites)
+        if is_https:
+            http_resources = re.findall(r'(src|href)=["\']http://', html_original)
+            if len(http_resources) > 2:
+                data['score'] -= 5
+                data['security_issues'].append("Mixed Content")
+                data['issues'].append(create_issue(
+                    "Security",
+                    "Mixed Content Warning",
+                    "Browser may block some resources or show security warnings",
+                    f"Found {len(http_resources)} HTTP resources on HTTPS page",
+                    "medium"
+                ))
+        
+        # Security headers check
+        security_headers = {
+            'Strict-Transport-Security': response_headers.get('Strict-Transport-Security'),
+            'Content-Security-Policy': response_headers.get('Content-Security-Policy'),
+            'X-Frame-Options': response_headers.get('X-Frame-Options'),
+            'X-Content-Type-Options': response_headers.get('X-Content-Type-Options')
+        }
+        
+        missing_security_headers = [h for h, v in security_headers.items() if not v]
+        if len(missing_security_headers) >= 3:
+            data['score'] -= 5
+            data['issues'].append(create_issue(
+                "Security",
+                "Missing Security Headers",
+                "Site is more vulnerable to common attacks – could hurt business reputation if compromised",
+                f"Missing: {', '.join(missing_security_headers[:3])}",
+                "medium"
+            ))
+        
+        # =====================================================================
+        # F. TECH STACK DETECTION (Enhanced)
+        # =====================================================================
+        
         tech_checks = [
-            ("wp-content", "WordPress", -10),
-            ("shopify", "Shopify", 0),
-            ("wix", "Wix", 0),
-            ("squarespace", "Squarespace", 0),
-            ("webflow", "Webflow", 0)
+            ("wp-content", "WordPress"),
+            ("shopify", "Shopify"),
+            ("wix", "Wix"),
+            ("squarespace", "Squarespace"),
+            ("webflow", "Webflow"),
+            ("react", "React"),
+            ("next", "Next.js"),
+            ("vue", "Vue.js"),
+            ("angular", "Angular"),
+            ("bootstrap", "Bootstrap"),
+            ("tailwind", "Tailwind CSS"),
+            ("jquery", "jQuery"),
+            ("cloudflare", "Cloudflare"),
+            ("stripe", "Stripe"),
+            ("intercom", "Intercom"),
+            ("hubspot", "HubSpot"),
+            ("mailchimp", "Mailchimp"),
+            ("zendesk", "Zendesk")
         ]
         
-        for check, tech, penalty in tech_checks:
-            if check in html:
+        for check, tech in tech_checks:
+            if check in html and tech not in data['tech_stack']:
                 data['tech_stack'].append(tech)
-                if penalty:
-                    data['score'] += penalty
-                    data['issues'].append({
-                        "title": f"{tech} Detected",
-                        "impact": "Requires regular maintenance",
-                        "solution": "Code Nest Maintenance"
-                    })
-                break
 
-        # Marketing tracking
-        pixels = []
-        if "fbq(" in html: pixels.append("Facebook Pixel")
-        if "gtag(" in html or "ua-" in html or "g-" in html: pixels.append("Google Analytics")
-        if "linkedin" in html and "insight" in html: pixels.append("LinkedIn Insight")
-        if "hotjar" in html: pixels.append("Hotjar")
+        # =====================================================================
+        # G. PERFORMANCE - Enhanced PageSpeed API
+        # =====================================================================
         
-        if not pixels:
-            data['score'] -= 20
-            data['issues'].append({
-                "title": "Zero Tracking Installed",
-                "impact": "No customer behavior data",
-                "solution": "Analytics Setup"
-            })
-        else:
-            data['tech_stack'].extend(pixels)
-
-        # SEO basics
-        title = soup.title.string if soup.title else ""
-        if len(title) < 10:
-            data['score'] -= 10
-            data['issues'].append({
-                "title": "Weak Title Tag",
-                "impact": "Poor search visibility",
-                "solution": "On-Page SEO"
-            })
-        
-        meta_desc = soup.find('meta', attrs={'name': 'description'})
-        if not meta_desc or not meta_desc.get('content'):
-            data['score'] -= 10
-            data['issues'].append({
-                "title": "Missing Meta Description",
-                "impact": "Poor search snippet",
-                "solution": "SEO Optimization"
-            })
-        
-        # NEW: Accessibility check
-        h1_tags = soup.find_all('h1')
-        alt_images = len([img for img in soup.find_all('img') if img.get('alt')])
-        total_images = len(soup.find_all('img'))
-        
-        if not h1_tags:
-            data['score'] -= 5
-            data['issues'].append({
-                "title": "No H1 Tag",
-                "impact": "Accessibility issue",
-                "solution": "Semantic HTML"
-            })
-        
-        if total_images > 0 and alt_images < total_images * 0.5:
-            data['score'] -= 5
-            data['issues'].append({
-                "title": "Missing Image Alt Text",
-                "impact": "Accessibility & SEO",
-                "solution": "Alt Text Optimization"
-            })
-        
-        accessibility_score = 100
-        if not h1_tags: accessibility_score -= 20
-        if alt_images < total_images * 0.5: accessibility_score -= 20
-        data['accessibility_score'] = accessibility_score
-
-        # NEW: Security check
-        if not url.startswith('https'):
-            data['score'] -= 15
-            data['security_issues'].append("No SSL Certificate")
-            data['issues'].append({
-                "title": "No SSL Certificate",
-                "impact": "Customers lose trust",
-                "solution": "SSL Installation"
-            })
-
-        # NEW: Broken links check (sample)
-        links = soup.find_all('a', href=True)
-        broken_count = 0
-        for link in links[:5]:  # Check first 5 links (reduced for speed)
-            try:
-                href = link['href']
-                if href.startswith('http'):
-                    r = requests.head(href, timeout=2)  # Reduced from 5s to 2s
-                    if r.status_code >= 400:
-                        broken_count += 1
-            except Exception:
-                pass
-        
-        data['broken_links'] = broken_count
-        if broken_count > 0:
-            data['score'] -= min(10, broken_count * 2)
-            data['issues'].append({
-                "title": f"{broken_count} Broken Links",
-                "impact": "Poor user experience",
-                "solution": "Link Audit & Fix"
-            })
-
         # Get domain age result from background thread
         try:
             data['domain_age'] = domain_age_future.result(timeout=3)[0]
@@ -5338,47 +5885,65 @@ def run_audit(url, openai_key, google_key):
         finally:
             executor.shutdown(wait=False)
         
-        # Performance (PageSpeed API - can be slow)
+        # PageSpeed API with detailed audits
         try:
-            psi_score, psi_msg = get_google_speed(url, google_key)
+            psi_result = get_google_speed_detailed(url, google_key)
+            if psi_result:
+                data['psi'] = psi_result.get('score')
+                data['psi_audits'] = psi_result.get('audits', [])
+                data['cwv_metrics'] = psi_result.get('cwv', {})
+                
+                # Add issues from PageSpeed audits
+                for audit in psi_result.get('audits', [])[:3]:  # Top 3 failing audits
+                    data['issues'].append(create_issue(
+                        "Performance",
+                        audit.get('title', 'Performance Issue'),
+                        audit.get('impact', 'Slower site = fewer conversions'),
+                        audit.get('detail', ''),
+                        "high" if audit.get('score', 1) < 0.5 else "medium"
+                    ))
+                
+                # Overall speed issue
+                if data['psi'] and data['psi'] < 50:
+                    data['score'] -= 15
+                    data['issues'].append(create_issue(
+                        "Performance",
+                        f"Critical Site Speed ({data['psi']}/100)",
+                        "53% of mobile users leave if page takes >3 seconds – losing half your visitors",
+                        f"Google PageSpeed score is {data['psi']}/100. Target 80+ for good performance.",
+                        "high"
+                    ))
+                elif data['psi'] and data['psi'] < 70:
+                    data['score'] -= 8
+                    data['issues'].append(create_issue(
+                        "Performance",
+                        f"Slow Site Speed ({data['psi']}/100)",
+                        "Site is slower than competitors – impacts both rankings and conversions",
+                        f"PageSpeed score {data['psi']}/100 is below recommended 70+",
+                        "medium"
+                    ))
         except Exception as e:
-            psi_score, psi_msg = None, f"API Error: {str(e)}"
-        
-        if psi_score:
-            data['psi'] = psi_score
-            if psi_score < 50:
-                data['score'] -= 20
-                data['issues'].append({
-                    "title": f"Critical Speed ({psi_score}/100)",
-                    "impact": "Users abandon slow sites",
-                    "solution": "Speed Optimization"
-                })
-        else:
-            data['psi_error'] = psi_msg
+            data['psi_error'] = str(e)
+            # Fall back to basic load time check
             if load_time > 3.0:
                 data['score'] -= 10
-                data['issues'].append({
-                    "title": "Slow Server",
-                    "impact": f"Load time {round(load_time,2)}s",
-                    "solution": "Speed Optimization"
-                })
+                data['issues'].append(create_issue(
+                    "Performance",
+                    f"Slow Server Response ({round(load_time, 1)}s)",
+                    "Slow initial response frustrates visitors before they even see your content",
+                    f"Server took {round(load_time, 2)} seconds to respond. Target <1.5s.",
+                    "high"
+                ))
 
-        # Mobile check
-        viewport = soup.find('meta', attrs={'name': 'viewport'})
-        if not viewport:
-            data['score'] -= 10
-            data['issues'].append({
-                "title": "Not Mobile Optimized",
-                "impact": "Missing 60% of traffic",
-                "solution": "Responsive Design"
-            })
-
-        # AI consultation (with caching - single API call)
-        # Note: get_ai_consultation now handles caching internally
+        # =====================================================================
+        # H. AI CONSULTATION (Caching + Single API Call)
+        # =====================================================================
+        
+        # AI consultation with rich issues data
         ai_executor = ThreadPoolExecutor(max_workers=1)
         ai_future = ai_executor.submit(get_ai_consultation, url, data, openai_key)
         try:
-            data['ai'] = ai_future.result(timeout=35)  # 35s timeout (single API call + caching)
+            data['ai'] = ai_future.result(timeout=40)
         except TimeoutError:
             logger.warning(f"AI consultation timed out for {url}")
             data['ai'] = {
@@ -5386,7 +5951,7 @@ def run_audit(url, openai_key, google_key):
                 "impact": "OpenAI took too long - try again",
                 "solutions": "Click 'Regenerate Email' to retry",
                 "email": "AI timed out - click 'Regenerate Email' to try again",
-                "email_subject": f"quick idea for {urlparse(url).netloc.replace('www.', '')}",
+                "email_subject": f"quick idea for {domain}",
                 "insights": None,
                 "from_cache": False
             }
@@ -5398,7 +5963,7 @@ def run_audit(url, openai_key, google_key):
                 "impact": f"Error: {error_str[:80]}",
                 "solutions": "Check API key or try again",
                 "email": f"AI error - {error_str[:40]}",
-                "email_subject": f"quick idea for {urlparse(url).netloc.replace('www.', '')}",
+                "email_subject": f"quick idea for {domain}",
                 "insights": None,
                 "from_cache": False
             }
@@ -5407,8 +5972,20 @@ def run_audit(url, openai_key, google_key):
 
     except Exception as e:
         data['error'] = str(e)
+        logger.error(f"Audit error for {url}: {str(e)}")
 
-    data['score'] = max(0, data['score'])
+    # Ensure score stays in bounds
+    data['score'] = max(0, min(100, data['score']))
+    
+    # Calculate accessibility score
+    accessibility_score = 100
+    if data.get('seo_stats', {}).get('h1_count', 0) == 0:
+        accessibility_score -= 20
+    if data.get('content_stats', {}).get('alt_coverage', 100) < 50:
+        accessibility_score -= 20
+    if not soup.find('meta', attrs={'name': 'viewport'}):
+        accessibility_score -= 20
+    data['accessibility_score'] = max(0, accessibility_score)
     
     # Add service scoring for lead enrichment
     try:
@@ -5424,6 +6001,114 @@ def run_audit(url, openai_key, google_key):
         logger.warning(f"Error calculating service scores: {str(e)}")
     
     return data
+
+
+def get_google_speed_detailed(url, api_key):
+    """
+    Get detailed Google PageSpeed results including specific failing audits.
+    Returns score, core web vitals, and top failing audits with business impact.
+    """
+    if not api_key:
+        return None
+    
+    api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile&key={api_key}&category=performance"
+    
+    try:
+        r = requests.get(api_url, timeout=20)
+        if r.status_code != 200:
+            return None
+        
+        data = r.json()
+        lighthouse = data.get('lighthouseResult', {})
+        
+        # Get overall score
+        perf_score = lighthouse.get('categories', {}).get('performance', {}).get('score')
+        if perf_score is not None:
+            perf_score = int(perf_score * 100)
+        
+        # Get Core Web Vitals
+        cwv = {}
+        audits = lighthouse.get('audits', {})
+        
+        if 'largest-contentful-paint' in audits:
+            cwv['LCP'] = audits['largest-contentful-paint'].get('displayValue', '')
+        if 'cumulative-layout-shift' in audits:
+            cwv['CLS'] = audits['cumulative-layout-shift'].get('displayValue', '')
+        if 'total-blocking-time' in audits:
+            cwv['TBT'] = audits['total-blocking-time'].get('displayValue', '')
+        
+        # Map technical audits to business impact
+        audit_impact_map = {
+            'render-blocking-resources': {
+                'title': 'Render-Blocking Resources',
+                'impact': 'Page appears blank for longer - visitors leave before seeing content'
+            },
+            'unused-javascript': {
+                'title': 'Unused JavaScript Code',
+                'impact': 'Loading code that is never used - wasting bandwidth and slowing everything'
+            },
+            'unused-css-rules': {
+                'title': 'Unused CSS Code',
+                'impact': 'Bloated stylesheets slow down page rendering'
+            },
+            'offscreen-images': {
+                'title': 'Images Not Lazy-Loaded',
+                'impact': 'Loading images visitors may never scroll to - wasting their data and time'
+            },
+            'uses-optimized-images': {
+                'title': 'Unoptimized Images',
+                'impact': 'Heavy images are the #1 cause of slow sites - directly hurts conversions'
+            },
+            'modern-image-formats': {
+                'title': 'Outdated Image Formats',
+                'impact': 'Using JPEG/PNG instead of WebP - images could be 50% smaller'
+            },
+            'uses-text-compression': {
+                'title': 'Text Compression Disabled',
+                'impact': 'HTML/CSS/JS could load much faster with gzip compression'
+            },
+            'server-response-time': {
+                'title': 'Slow Server Response',
+                'impact': 'Server takes too long to start sending data - delays everything'
+            },
+            'uses-responsive-images': {
+                'title': 'Non-Responsive Images',
+                'impact': 'Serving desktop-sized images to mobile users - wasting their data'
+            },
+            'efficient-animated-content': {
+                'title': 'Inefficient Animations',
+                'impact': 'Video/GIF animations slowing down page load'
+            }
+        }
+        
+        # Find failing audits (score < 0.9) and convert to business language
+        failing_audits = []
+        for audit_id, mapping in audit_impact_map.items():
+            if audit_id in audits:
+                audit = audits[audit_id]
+                score = audit.get('score', 1)
+                if score is not None and score < 0.9:
+                    failing_audits.append({
+                        'id': audit_id,
+                        'title': mapping['title'],
+                        'impact': mapping['impact'],
+                        'score': score,
+                        'detail': audit.get('displayValue', '')
+                    })
+        
+        # Sort by score (worst first) and take top 3
+        failing_audits.sort(key=lambda x: x.get('score', 1))
+        
+        return {
+            'score': perf_score,
+            'cwv': cwv,
+            'audits': failing_audits[:3]
+        }
+        
+    except Exception as e:
+        logger.warning(f"PageSpeed API error: {str(e)}")
+        return None
+
 
 def save_audit_to_db(data, comparison_group=None):
     """Save audit to database."""
