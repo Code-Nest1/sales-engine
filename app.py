@@ -4488,6 +4488,19 @@ SUBJECT: [lowercase subject]
 [complete email body with signature]"""
 
     try:
+        # Validate API key format
+        if not api_key or len(api_key) < 20:
+            logger.error(f"OpenAI API key is missing or invalid (length: {len(api_key) if api_key else 0})")
+            return {
+                "summary": "Invalid API Key",
+                "impact": "Please check your OpenAI API key in API Settings",
+                "solutions": "Go to API Settings and enter a valid OpenAI API key",
+                "email": "API key error - please configure OpenAI API key",
+                "email_subject": f"quick idea for {domain}",
+                "insights": None
+            }
+        
+        logger.info(f"Calling OpenAI API for {domain} with key starting: {api_key[:8]}...")
         client = OpenAI(api_key=api_key)
         
         # Get structured insights
@@ -4497,6 +4510,7 @@ SUBJECT: [lowercase subject]
             temperature=0.7
         )
         insights_text = insights_response.choices[0].message.content.strip()
+        logger.info(f"OpenAI insights response received for {domain}")
         
         # Parse JSON insights
         try:
@@ -4579,12 +4593,28 @@ Would you be open to a quick 10-15 minute call to discuss?
             "insights": insights
         }
     except Exception as e:
-        logger.error(f"AI consultation error: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"AI consultation error for {domain}: {error_msg}")
+        
+        # Provide specific error messages based on common issues
+        if "401" in error_msg or "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower():
+            error_detail = "Invalid API Key - please check your OpenAI API key in API Settings"
+        elif "429" in error_msg or "rate_limit" in error_msg.lower():
+            error_detail = "Rate limit exceeded - please wait a moment and try again"
+        elif "500" in error_msg or "502" in error_msg or "503" in error_msg:
+            error_detail = "OpenAI server error - please try again in a few minutes"
+        elif "timeout" in error_msg.lower():
+            error_detail = "Request timed out - please try again"
+        elif "insufficient_quota" in error_msg.lower() or "billing" in error_msg.lower():
+            error_detail = "OpenAI quota exceeded - please check your OpenAI billing/usage"
+        else:
+            error_detail = f"API Error: {error_msg}"
+        
         return {
             "summary": "AI analysis encountered an error",
-            "impact": "Manual review recommended",
-            "solutions": "Contact support for assistance",
-            "email": f"Error generating email: {str(e)}",
+            "impact": error_detail,
+            "solutions": "Check API Settings or contact support",
+            "email": f"Error generating email: {error_detail}",
             "email_subject": f"quick idea for {domain}",
             "insights": None
         }
