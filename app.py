@@ -113,6 +113,127 @@ if _missing_assets:
     for msg in _missing_assets:
         print(f"⚠️ BRANDING: {msg}")
 
+# ============================================================================
+# OPENAI CONFIGURATION & COST OPTIMIZATION
+# ============================================================================
+
+# Centralized AI Model Settings
+AI_MODEL = "gpt-4o-mini"  # Cheapest reliable model
+AI_MAX_TOKENS = 800       # Cap response size
+AI_TEMPERATURE = 0.7      # Balance creativity/consistency
+AI_TIMEOUT = 25.0         # Per-request timeout (seconds)
+AI_CLIENT_TIMEOUT = 30.0  # Client-level timeout
+
+# Regeneration Limits
+MAX_REGENERATIONS_PER_URL = 2  # Max times user can regenerate AI content per URL
+
+# AI Cache Configuration
+AI_CACHE_FILE = Path(__file__).parent / "ai_cache.json"
+
+def get_ai_cache_key(url: str, audit_hash: str = "") -> str:
+    """Generate a cache key for AI results."""
+    domain = urlparse(url).netloc.replace("www.", "").lower()
+    return f"{domain}:{audit_hash}" if audit_hash else domain
+
+def load_ai_cache() -> dict:
+    """Load AI results cache from disk."""
+    try:
+        if AI_CACHE_FILE.exists():
+            return json.loads(AI_CACHE_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def save_ai_cache(cache: dict):
+    """Save AI results cache to disk."""
+    try:
+        # Keep only last 100 entries to prevent unbounded growth
+        if len(cache) > 100:
+            sorted_keys = sorted(cache.keys(), key=lambda k: cache[k].get('timestamp', ''), reverse=True)
+            cache = {k: cache[k] for k in sorted_keys[:100]}
+        AI_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    except Exception as e:
+        logger = logging.getLogger("sales_engine")
+        logger.warning(f"Failed to save AI cache: {e}")
+
+def get_cached_ai_result(url: str, audit_data: dict = None) -> dict | None:
+    """Get cached AI result for a URL from session state or disk."""
+    # Generate cache key
+    cache_key = get_ai_cache_key(url)
+    
+    # Check session state first (fastest)
+    if 'ai_cache' not in st.session_state:
+        st.session_state.ai_cache = {}
+    
+    if cache_key in st.session_state.ai_cache:
+        logger = logging.getLogger("sales_engine")
+        logger.info(f"[AI CACHE HIT - Session] {cache_key}")
+        return st.session_state.ai_cache[cache_key]
+    
+    # Check disk cache
+    disk_cache = load_ai_cache()
+    if cache_key in disk_cache:
+        # Load into session state for faster future access
+        st.session_state.ai_cache[cache_key] = disk_cache[cache_key]
+        logger = logging.getLogger("sales_engine")
+        logger.info(f"[AI CACHE HIT - Disk] {cache_key}")
+        return disk_cache[cache_key]
+    
+    return None
+
+def cache_ai_result(url: str, ai_result: dict):
+    """Cache AI result in session state and disk."""
+    cache_key = get_ai_cache_key(url)
+    
+    # Add timestamp
+    ai_result['cached_at'] = datetime.now().isoformat()
+    ai_result['timestamp'] = datetime.now().isoformat()
+    
+    # Store in session state
+    if 'ai_cache' not in st.session_state:
+        st.session_state.ai_cache = {}
+    st.session_state.ai_cache[cache_key] = ai_result
+    
+    # Store on disk
+    disk_cache = load_ai_cache()
+    disk_cache[cache_key] = ai_result
+    save_ai_cache(disk_cache)
+    
+    logger = logging.getLogger("sales_engine")
+    logger.info(f"[AI CACHE STORE] {cache_key}")
+
+def get_regen_count(url: str) -> int:
+    """Get regeneration count for a URL."""
+    if 'ai_regen_counts' not in st.session_state:
+        st.session_state.ai_regen_counts = {}
+    cache_key = get_ai_cache_key(url)
+    return st.session_state.ai_regen_counts.get(cache_key, 0)
+
+def increment_regen_count(url: str) -> int:
+    """Increment and return regeneration count for a URL."""
+    if 'ai_regen_counts' not in st.session_state:
+        st.session_state.ai_regen_counts = {}
+    cache_key = get_ai_cache_key(url)
+    current = st.session_state.ai_regen_counts.get(cache_key, 0)
+    st.session_state.ai_regen_counts[cache_key] = current + 1
+    return current + 1
+
+def can_regenerate(url: str) -> bool:
+    """Check if regeneration is allowed for this URL."""
+    return get_regen_count(url) < MAX_REGENERATIONS_PER_URL
+
+def clear_ai_cache_for_url(url: str):
+    """Clear cached AI result for a specific URL (for forced regeneration)."""
+    cache_key = get_ai_cache_key(url)
+    
+    if 'ai_cache' in st.session_state and cache_key in st.session_state.ai_cache:
+        del st.session_state.ai_cache[cache_key]
+    
+    disk_cache = load_ai_cache()
+    if cache_key in disk_cache:
+        del disk_cache[cache_key]
+        save_ai_cache(disk_cache)
+
 # Initialize database
 DB_AVAILABLE = False
 if DATABASE_URL:
@@ -2834,7 +2955,13 @@ def show_single_audit():
         # AI analysis
         if data.get('ai'):
             st.markdown("---")
-            st.markdown("### 🤖 AI Analysis")
+            
+            # Show cache indicator
+            if data['ai'].get('from_cache'):
+                st.markdown("### 🤖 AI Analysis _(cached)_")
+                st.caption("💾 Using cached AI result to save API costs. Click 'Regenerate' for fresh analysis.")
+            else:
+                st.markdown("### 🤖 AI Analysis")
             
             # Check if we have structured insights
             insights = data['ai'].get('insights')
@@ -2944,10 +3071,21 @@ def show_single_audit():
                 send_email_btn = st.button("📤 Send Email", type="primary", use_container_width=True, disabled=not is_smtp_configured())
             
             with col2:
-                if st.button("🔄 Regenerate Email", use_container_width=True):
-                    if st.session_state.OPENAI_API_KEY:
+                # Check regeneration limit
+                regen_count = get_regen_count(data['url'])
+                can_regen = can_regenerate(data['url'])
+                regen_label = f"🔄 Regenerate ({MAX_REGENERATIONS_PER_URL - regen_count} left)" if can_regen else "🔄 Limit Reached"
+                
+                if st.button(regen_label, use_container_width=True, disabled=not can_regen):
+                    if not can_regen:
+                        st.warning(f"⚠️ Regeneration limit reached ({MAX_REGENERATIONS_PER_URL} max per audit) to control API costs.")
+                    elif st.session_state.OPENAI_API_KEY:
                         with st.spinner("Generating new email..."):
-                            new_ai = get_ai_consultation(data['url'], data, st.session_state.OPENAI_API_KEY)
+                            # Increment regen counter
+                            increment_regen_count(data['url'])
+                            # Force regenerate (skip cache)
+                            clear_ai_cache_for_url(data['url'])
+                            new_ai = get_ai_consultation(data['url'], data, st.session_state.OPENAI_API_KEY, force_regenerate=True)
                             data['ai'] = new_ai
                             st.session_state.current_audit_data = data
                             st.rerun()
@@ -4340,287 +4478,227 @@ def get_google_speed(url, api_key):
     except Exception as e:
         return None, str(e)
 
-def get_ai_consultation(url, data, api_key):
-    """Get AI analysis with structured insights for PDF and email outreach."""
+def get_ai_consultation(url, data, api_key, force_regenerate=False):
+    """
+    Get AI analysis with structured insights for PDF and email outreach.
+    
+    OPTIMIZED FOR COST:
+    - Single OpenAI call returns both insights AND email
+    - Results are cached per URL
+    - Shorter prompts with explicit word/token limits
+    - No conversation history (single user message)
+    
+    Args:
+        url: Website URL
+        data: Audit data dict
+        api_key: OpenAI API key
+        force_regenerate: If True, skip cache and make fresh API call
+    
+    Returns:
+        Dict with summary, impact, solutions, email, email_subject, insights
+    """
+    domain = urlparse(url).netloc.replace("www.", "")
+    
+    # Check for valid API key first
     if not api_key:
         return {
             "summary": "AI Analysis Disabled",
             "impact": "N/A",
             "solutions": "Upgrade to enable AI",
             "email": "N/A",
-            "insights": None
+            "email_subject": f"quick idea for {domain}",
+            "insights": None,
+            "from_cache": False
         }
-
-    domain = urlparse(url).netloc.replace("www.", "")
-    issues_list = [f"- {i['title']}: {i['impact']}" for i in data.get('issues', [])]
-    tech_list = ", ".join(data.get('tech_stack', []))
+    
+    # CHECK CACHE FIRST (unless force regenerate)
+    if not force_regenerate:
+        cached = get_cached_ai_result(url)
+        if cached:
+            cached['from_cache'] = True
+            return cached
+    
+    # Validate API key format
+    if len(api_key) < 20:
+        logger.error(f"OpenAI API key is invalid (length: {len(api_key)})")
+        return {
+            "summary": "Invalid API Key",
+            "impact": "Please check your OpenAI API key in API Settings",
+            "solutions": "Go to API Settings and enter a valid OpenAI API key",
+            "email": "API key error - please configure OpenAI API key",
+            "email_subject": f"quick idea for {domain}",
+            "insights": None,
+            "from_cache": False
+        }
+    
+    # Prepare minimal audit data for prompt (reduce tokens)
     health_score = data.get('score', 0)
     psi_score = data.get('psi', 'N/A')
+    tech_list = ", ".join(data.get('tech_stack', [])[:5])  # Max 5 techs
     
-    # Structured insights prompt
-    insights_prompt = f"""You are a Senior Digital Strategist at Code Nest agency. Analyze this website audit data and provide structured insights.
-
-WEBSITE: {url}
-DOMAIN: {domain}
-HEALTH SCORE: {health_score}/100
-PAGESPEED SCORE: {psi_score}
-TECH STACK: {tech_list}
-ISSUES FOUND:
-{chr(10).join(issues_list) if issues_list else "No critical issues detected"}
-
-Respond in EXACTLY this JSON format (no markdown, just valid JSON):
-{{
-    "snapshot_summary": [
-        "bullet 1 (max 15 words)",
-        "bullet 2 (max 15 words)",
-        "bullet 3 (max 15 words)"
-    ],
-    "top_3_issues": [
-        {{"issue": "Issue name", "impact": "One-line business impact"}},
-        {{"issue": "Issue name", "impact": "One-line business impact"}},
-        {{"issue": "Issue name", "impact": "One-line business impact"}}
-    ],
-    "quick_wins": [
-        "Action 1 (achievable in 30 days)",
-        "Action 2",
-        "Action 3",
-        "Action 4 (optional)",
-        "Action 5 (optional)"
-    ],
-    "code_nest_services": [
-        {{"issue": "Problem area", "service": "Our service that solves it"}},
-        {{"issue": "Problem area", "service": "Our service that solves it"}},
-        {{"issue": "Problem area", "service": "Our service that solves it"}}
-    ],
-    "next_step": "1-2 line clear CTA to review audit or schedule a call"
-}}
-
-Be specific, data-driven, and focus on business impact. If health score is above 70, focus on optimization opportunities rather than critical issues."""
-
-    # Premium Agency-Level Cold Email Prompt
-    # Build dynamic issue bullets from audit data
-    issue_bullets = []
+    # Only top 3 issues with short descriptions
+    issues_short = []
     for issue in data.get('issues', [])[:3]:
-        title = issue.get('title', '')
-        if 'speed' in title.lower() or 'slow' in title.lower():
-            issue_bullets.append(f"Site speed issues affecting user experience and conversions")
-        elif 'seo' in title.lower() or 'meta' in title.lower() or 'title' in title.lower():
-            issue_bullets.append(f"SEO gaps limiting organic visibility and traffic")
-        elif 'mobile' in title.lower() or 'responsive' in title.lower():
-            issue_bullets.append(f"Mobile optimization needed (60%+ of traffic is mobile)")
-        elif 'ssl' in title.lower() or 'security' in title.lower():
-            issue_bullets.append(f"Security concerns impacting trust and rankings")
-        elif 'analytics' in title.lower() or 'pixel' in title.lower() or 'tracking' in title.lower():
-            issue_bullets.append(f"Missing tracking/pixels limiting ad performance data")
-        elif 'wordpress' in title.lower() or 'plugin' in title.lower():
-            issue_bullets.append(f"WordPress/CMS optimization opportunities")
-        elif 'broken' in title.lower() or 'link' in title.lower():
-            issue_bullets.append(f"Broken links hurting UX and SEO authority")
-        else:
-            issue_bullets.append(f"{title}")
+        title = issue.get('title', '')[:40]  # Truncate long titles
+        issues_short.append(title)
+    issues_text = "; ".join(issues_short) if issues_short else "Minor optimization opportunities"
     
-    # Ensure we have at least 2 bullets
-    if len(issue_bullets) < 2:
-        if health_score < 50:
-            issue_bullets.append("Overall site performance below industry standards")
-        if psi_score and psi_score != 'N/A' and int(psi_score) < 60:
-            issue_bullets.append("Page speed scores impacting bounce rates")
-        if not any('seo' in b.lower() for b in issue_bullets):
-            issue_bullets.append("SEO structure improvements for better rankings")
-    
-    issue_bullets = issue_bullets[:3]  # Max 3 bullets
-    issue_bullets_text = chr(10).join([f"• {b}" for b in issue_bullets])
-    
-    email_prompt = f"""You are a senior strategist at Code Nest LLC, a US-registered digital agency in New Mexico. Write a premium cold outreach email for {domain}.
+    # SINGLE COMBINED PROMPT - Returns both insights AND email in one call
+    combined_prompt = f"""You are a senior strategist at Code Nest LLC (New Mexico). Analyze this audit and provide BOTH insights AND a cold email in ONE JSON response.
 
 AUDIT DATA:
 - Domain: {domain}
-- Health Score: {health_score}/100
-- PageSpeed: {psi_score}
-- Key Issues Found: {', '.join([i['title'] for i in data.get('issues', [])[:3]]) if data.get('issues') else 'Optimization opportunities identified'}
+- Score: {health_score}/100
+- Speed: {psi_score}
+- Tech: {tech_list}
+- Issues: {issues_text}
 
-STRICT EMAIL STRUCTURE (follow exactly):
-
-1. SUBJECT LINE:
-   - Lowercase only
-   - 3-5 words maximum
-   - Personalized to their domain
-   - Example: "quick note about {domain}"
-
-2. GREETING:
-   - Simple, professional (e.g., "Hi there," or "Hi [Team],")
-
-3. PERSONALIZED OPENER (1 sentence):
-   - Mention you reviewed their website
-   - Reference their domain by name
-
-4. KEY FINDINGS (2-3 short bullets):
-{issue_bullets_text}
-
-5. BUSINESS IMPACT (1 sentence):
-   - Explain how fixing these improves leads, visibility, or conversions
-
-6. CREDIBILITY STATEMENT (use exactly):
-   "For context, I'm reaching out from Code Nest LLC (New Mexico), where we help businesses improve website performance, SEO visibility, social media presence, and paid ad results through data-backed optimization across Web Development, SEO, Social Media Management, and PPC campaigns."
-
-7. SINGLE CTA:
-   - Either ask them to reply OR schedule a 10-15 min call
-   - Only ONE call to action
-
-8. SIGNATURE (use exactly):
-Best regards,
-Code Nest Team
-Code Nest LLC – New Mexico
-Contact@codenest.us.com
-www.codenest.us.com
+Return ONLY valid JSON (no markdown):
+{{
+  "insights": {{
+    "snapshot_summary": ["bullet1 (<15 words)", "bullet2", "bullet3"],
+    "top_3_issues": [
+      {{"issue": "name", "impact": "1-line impact"}},
+      {{"issue": "name", "impact": "1-line impact"}},
+      {{"issue": "name", "impact": "1-line impact"}}
+    ],
+    "quick_wins": ["action1", "action2", "action3"],
+    "code_nest_services": [
+      {{"issue": "problem", "service": "solution"}},
+      {{"issue": "problem", "service": "solution"}},
+      {{"issue": "problem", "service": "solution"}}
+    ],
+    "next_step": "Clear CTA to schedule call or reply"
+  }},
+  "email": {{
+    "subject": "lowercase 3-5 word subject about {domain}",
+    "body": "Full email body (85-130 words). Start with 'Hi there,' and include: 1) mention reviewing their site, 2) 2-3 bullet findings, 3) business impact line, 4) credibility: 'For context, I'm reaching out from Code Nest LLC (New Mexico), where we help businesses improve website performance, SEO, social media, and paid ads.' 5) single CTA. End with: Best regards,\\nCode Nest Team\\nCode Nest LLC – New Mexico\\nContact@codenest.us.com\\nwww.codenest.us.com"
+  }}
+}}
 
 RULES:
-- Total email: 85-130 words (excluding signature)
-- High-trust, consulting tone
-- NO fluff phrases like "I hope this finds you well"
-- NO multiple CTAs
-- Sound like a professional US agency, not a freelancer
-- Focus on client outcomes: visibility, leads, conversions
-
-Format your response as:
-SUBJECT: [lowercase subject]
----
-[complete email body with signature]"""
+- All bullets under 18 words
+- Email body: 85-130 words (excluding signature)
+- Focus on business impact
+- If score >70, focus on optimization not problems
+- No fluff phrases"""
 
     try:
-        # Validate API key format
-        if not api_key or len(api_key) < 20:
-            logger.error(f"OpenAI API key is missing or invalid (length: {len(api_key) if api_key else 0})")
-            return {
-                "summary": "Invalid API Key",
-                "impact": "Please check your OpenAI API key in API Settings",
-                "solutions": "Go to API Settings and enter a valid OpenAI API key",
-                "email": "API key error - please configure OpenAI API key",
-                "email_subject": f"quick idea for {domain}",
-                "insights": None
-            }
+        log_source = "regeneration" if force_regenerate else "initial"
+        logger.info(f"[OPENAI CALL - {log_source}] {domain} (key: {api_key[:8]}...)")
         
-        logger.info(f"Calling OpenAI API for {domain} with key starting: {api_key[:8]}...")
-        client = OpenAI(api_key=api_key, timeout=30.0)  # 30s timeout per request
+        client = OpenAI(api_key=api_key, timeout=AI_CLIENT_TIMEOUT)
         
-        # Get structured insights
-        insights_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": insights_prompt}],
-            temperature=0.7,
-            timeout=20.0  # 20s for this specific request
+        response = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a concise business analyst. Return only valid JSON."},
+                {"role": "user", "content": combined_prompt}
+            ],
+            temperature=AI_TEMPERATURE,
+            max_tokens=AI_MAX_TOKENS,
+            timeout=AI_TIMEOUT
         )
-        insights_text = insights_response.choices[0].message.content.strip()
-        logger.info(f"OpenAI insights response received for {domain}")
         
-        # Parse JSON insights
+        result_text = response.choices[0].message.content.strip()
+        logger.info(f"[OPENAI RESPONSE] {domain} - {len(result_text)} chars")
+        
+        # Parse JSON response
         try:
             # Clean up potential markdown code blocks
-            if insights_text.startswith("```"):
-                insights_text = insights_text.split("```")[1]
-                if insights_text.startswith("json"):
-                    insights_text = insights_text[4:]
-            insights = json.loads(insights_text)
-        except json.JSONDecodeError:
+            if result_text.startswith("```"):
+                result_text = result_text.split("```")[1]
+                if result_text.startswith("json"):
+                    result_text = result_text[4:]
+                result_text = result_text.strip()
+            
+            parsed = json.loads(result_text)
+            insights = parsed.get("insights", {})
+            email_data = parsed.get("email", {})
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON parse error for {domain}: {e}")
             insights = None
+            email_data = {}
         
-        # Get premium cold email
-        logger.info(f"Generating cold email for {domain}...")
-        email_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": email_prompt}],
-            temperature=0.7,
-            timeout=20.0  # 20s for this specific request
-        )
-        email_content = email_response.choices[0].message.content.strip()
-        logger.info(f"Cold email generated for {domain}")
+        # Extract email parts
+        email_subject = email_data.get("subject", f"quick note about {domain}").lower()
+        email_body = email_data.get("body", "")
         
-        # Parse email response
-        email_subject = ""
-        email_body = ""
-        
-        if "---" in email_content:
-            email_parts = email_content.split("---", 1)
-            subject_line = email_parts[0].strip()
-            if "SUBJECT:" in subject_line.upper():
-                email_subject = subject_line.split(":", 1)[1].strip().lower()
-            else:
-                email_subject = subject_line.strip().lower()
-            email_body = email_parts[1].strip()
-        else:
-            email_body = email_content
-            email_subject = f"quick note about {domain}"
-        
-        # Ensure signature is present, add if missing
+        # Ensure signature is present
         signature = """Best regards,
 Code Nest Team
 Code Nest LLC – New Mexico
 Contact@codenest.us.com
 www.codenest.us.com"""
         
-        if "Code Nest LLC" not in email_body or "Contact@codenest.us.com" not in email_body:
+        if email_body and ("Code Nest LLC" not in email_body or "Contact@codenest.us.com" not in email_body):
             email_body = email_body.rstrip() + "\n\n" + signature
         
-        # Fallback if email is malformed or too short
-        if len(email_body) < 100:
+        # Fallback if email is missing/malformed
+        if not email_body or len(email_body) < 50:
             email_body = f"""Hi there,
 
 I recently reviewed {domain} and noticed a few areas where improvements could drive better results:
 
-{issue_bullets_text}
+• {issues_short[0] if issues_short else 'Site optimization opportunities'}
+• Overall performance could be enhanced for better conversions
 
-These quick fixes can significantly improve your site's visibility, user experience, and conversion rates.
+These quick fixes can significantly improve your site's visibility and conversion rates.
 
-For context, I'm reaching out from Code Nest LLC (New Mexico), where we help businesses improve website performance, SEO visibility, social media presence, and paid ad results through data-backed optimization across Web Development, SEO, Social Media Management, and PPC campaigns.
+For context, I'm reaching out from Code Nest LLC (New Mexico), where we help businesses improve website performance, SEO, social media, and paid ads.
 
-Would you be open to a quick 10-15 minute call to discuss?
+Would you be open to a quick 10-minute call to discuss?
 
 {signature}"""
             email_subject = f"quick note about {domain}"
         
         # Build legacy format for backward compatibility
-        summary = ""
-        impact = ""
-        solutions = ""
+        summary = " ".join(insights.get("snapshot_summary", [])) if insights else "Analysis complete"
+        impact = "; ".join([f"{i['issue']}: {i['impact']}" for i in insights.get("top_3_issues", [])]) if insights else ""
+        solutions = "; ".join(insights.get("quick_wins", [])) if insights else ""
         
-        if insights:
-            summary = " ".join(insights.get("snapshot_summary", []))
-            impact = "; ".join([f"{i['issue']}: {i['impact']}" for i in insights.get("top_3_issues", [])])
-            solutions = "; ".join(insights.get("quick_wins", []))
-        
-        return {
+        result = {
             "summary": summary or "Analysis complete",
             "impact": impact or "Impact assessed",
             "solutions": solutions or "Solutions provided",
             "email": email_body,
             "email_subject": email_subject,
-            "insights": insights
+            "insights": insights,
+            "from_cache": False
         }
+        
+        # CACHE THE RESULT
+        cache_ai_result(url, result)
+        
+        return result
+        
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"AI consultation error for {domain}: {error_msg}")
+        logger.error(f"[OPENAI ERROR] {domain}: {error_msg}")
         
-        # Provide specific error messages based on common issues
-        if "401" in error_msg or "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower():
-            error_detail = "Invalid API Key - please check your OpenAI API key in API Settings"
+        # Specific error messages
+        if "401" in error_msg or "invalid_api_key" in error_msg.lower():
+            error_detail = "Invalid API Key - check API Settings"
         elif "429" in error_msg or "rate_limit" in error_msg.lower():
-            error_detail = "Rate limit exceeded - please wait a moment and try again"
+            error_detail = "Rate limit exceeded - wait and retry"
         elif "500" in error_msg or "502" in error_msg or "503" in error_msg:
-            error_detail = "OpenAI server error - please try again in a few minutes"
+            error_detail = "OpenAI server error - try again later"
         elif "timeout" in error_msg.lower():
-            error_detail = "Request timed out - please try again"
+            error_detail = "Request timed out - try again"
         elif "insufficient_quota" in error_msg.lower() or "billing" in error_msg.lower():
-            error_detail = "OpenAI quota exceeded - please check your OpenAI billing/usage"
+            error_detail = "OpenAI quota exceeded - check billing"
         else:
-            error_detail = f"API Error: {error_msg}"
+            error_detail = f"API Error: {error_msg[:50]}"
         
         return {
-            "summary": "AI analysis encountered an error",
+            "summary": "AI analysis error",
             "impact": error_detail,
-            "solutions": "Check API Settings or contact support",
-            "email": f"Error generating email: {error_detail}",
+            "solutions": "Check API Settings or try again",
+            "email": f"Error: {error_detail}",
             "email_subject": f"quick idea for {domain}",
-            "insights": None
+            "insights": None,
+            "from_cache": False
         }
 
 def calculate_opportunity_score(data):
@@ -4949,48 +5027,47 @@ Fully-managed campaigns on Google, Facebook, and Instagram with:
     return pitches.get(service_name, "Service pitch unavailable")
 
 def enrich_lead_with_ai(lead_data, audit_data, openai_key):
-    """Use AI to generate comprehensive lead enrichment and recommendations."""
+    """Use AI to generate comprehensive lead enrichment and recommendations.
+    
+    Uses centralized AI settings for cost efficiency.
+    """
     if not openai_key:
         return None
     
     try:
-        client = OpenAI(api_key=openai_key)
+        client = OpenAI(api_key=openai_key, timeout=AI_CLIENT_TIMEOUT)
         
-        prompt = f"""
-Analyze this business lead and provide strategic recommendations:
+        # Shortened prompt for cost efficiency
+        prompt = f"""Analyze lead and provide strategic recommendations (JSON only):
 
-**Company:** {lead_data.get('company_name', 'Unknown')}
-**Industry:** {lead_data.get('industry', 'Unknown')}
-**Company Size:** {lead_data.get('company_size', 'Unknown')}
-**Location:** {lead_data.get('city', 'Unknown')}, {lead_data.get('state', 'Unknown')}
+Company: {lead_data.get('company_name', 'Unknown')}
+Industry: {lead_data.get('industry', 'Unknown')}
+Location: {lead_data.get('city', 'Unknown')}, {lead_data.get('state', 'Unknown')}
+Health Score: {audit_data.get('score', 0)}/100
+Top Issues: {', '.join([i['title'][:30] for i in audit_data.get('issues', [])[:3]])}
 
-**Website Audit Results:**
-- Health Score: {audit_data.get('score', 0)}/100
-- Performance Score: {audit_data.get('psi', 'N/A')}/100
-- Accessibility Score: {audit_data.get('accessibility_score', 'N/A')}/100
-- Critical Issues: {len(audit_data.get('issues', []))}
-
-**Top 3 Issues:** {', '.join([i['title'] for i in audit_data.get('issues', [])[:3]])}
-
-Provide a JSON response with:
-1. "key_challenges": [list of 3-5 main business challenges based on website audit]
-2. "quick_wins": [3-5 quick improvements that could be made in 30 days]
-3. "recommended_services": [list of top 3 Code Nest services with priority 1-10]
-4. "estimated_impact": Brief description of potential business impact
-5. "conversation_starters": [3 compelling reasons to talk to this prospect]
-
-Return ONLY valid JSON, no other text.
-"""
+Return JSON:
+{{"key_challenges": ["challenge1", "challenge2", "challenge3"],
+"quick_wins": ["win1", "win2", "win3"],
+"recommended_services": ["service1", "service2", "service3"],
+"estimated_impact": "1-2 sentence impact",
+"conversation_starters": ["reason1", "reason2", "reason3"]}}"""
         
         response = client.chat.completions.create(
-            model="gpt-4",
+            model=AI_MODEL,  # Use centralized model setting
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=800
+            temperature=AI_TEMPERATURE,
+            max_tokens=500,  # Reduced for cost
+            timeout=AI_TIMEOUT
         )
         
         result = response.choices[0].message.content
-        return json.loads(result)
+        # Clean up potential markdown
+        if result.startswith("```"):
+            result = result.split("```")[1]
+            if result.startswith("json"):
+                result = result[4:]
+        return json.loads(result.strip())
     
     except Exception as e:
         logger.error(f"Error enriching lead with AI: {str(e)}")
@@ -5277,31 +5354,34 @@ def run_audit(url, openai_key, google_key):
                 "solution": "Responsive Design"
             })
 
-        # AI consultation (with timeout to prevent hanging)
+        # AI consultation (with caching - single API call)
+        # Note: get_ai_consultation now handles caching internally
         ai_executor = ThreadPoolExecutor(max_workers=1)
         ai_future = ai_executor.submit(get_ai_consultation, url, data, openai_key)
         try:
-            data['ai'] = ai_future.result(timeout=45)  # 45s timeout for AI (2 API calls)
+            data['ai'] = ai_future.result(timeout=35)  # 35s timeout (single API call + caching)
         except TimeoutError:
             logger.warning(f"AI consultation timed out for {url}")
             data['ai'] = {
                 "summary": "AI analysis timed out",
-                "impact": "OpenAI took too long to respond - this can happen during high traffic",
-                "solutions": "Try running the audit again",
+                "impact": "OpenAI took too long - try again",
+                "solutions": "Click 'Regenerate Email' to retry",
                 "email": "AI timed out - click 'Regenerate Email' to try again",
                 "email_subject": f"quick idea for {urlparse(url).netloc.replace('www.', '')}",
-                "insights": None
+                "insights": None,
+                "from_cache": False
             }
         except Exception as e:
             error_str = str(e)
             logger.error(f"AI consultation failed for {url}: {error_str}")
             data['ai'] = {
                 "summary": "AI analysis failed",
-                "impact": f"Error: {error_str[:100]}",
-                "solutions": "Check API key in API Settings or try again",
-                "email": f"AI error - check API Settings. Error: {error_str[:50]}",
+                "impact": f"Error: {error_str[:80]}",
+                "solutions": "Check API key or try again",
+                "email": f"AI error - {error_str[:40]}",
                 "email_subject": f"quick idea for {urlparse(url).netloc.replace('www.', '')}",
-                "insights": None
+                "insights": None,
+                "from_cache": False
             }
         finally:
             ai_executor.shutdown(wait=False)
