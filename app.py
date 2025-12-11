@@ -93,7 +93,7 @@ COLORS = {
 # Brand Assets Paths
 ASSETS_DIR = Path(__file__).parent / "assets"
 PDF_LOGO_PATH = ASSETS_DIR / "codenest-logo.png"
-EMAIL_LOGO_URL = "https://www.codenest.agency/logo.png"  # Update with actual hosted URL
+EMAIL_LOGO_URL = "https://raw.githubusercontent.com/Code-Nest1/sales-engine/main/assets/codenest-logo.png"
 
 # Ensure assets directory exists
 ASSETS_DIR.mkdir(exist_ok=True)
