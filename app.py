@@ -58,9 +58,9 @@ if 'user_theme' not in st.session_state:
 
 # Company Information
 COMPANY_NAME = "Code Nest LLC"
-COMPANY_TAGLINE = "Launch. Scale. Optimize."
-COMPANY_WEBSITE = "https://www.codenest.agency"
-CONTACT_EMAIL = "services@codenest.agency"
+COMPANY_TAGLINE = "Nest Idea | Code Success"
+COMPANY_WEBSITE = "https://codenest.us.com"
+CONTACT_EMAIL = "contact@codenest.us.com"
 COMPANY_LOCATION = "New Mexico, USA"
 
 # Brand Colors
@@ -473,11 +473,11 @@ def init_email_config():
             "enabled": True,
             "smtp_server": "smtp.hostinger.com",
             "smtp_port": 587,
-            "sender_email": "contact@codenest.com",
+            "sender_email": "contact@codenest.us.com",
             "sender_password": os.environ.get("EMAIL_PASSWORD", ""),  # Set via environment variable
-            "from_name": "Code Nest - Digital Audits",
+            "from_name": "Code Nest LLC - Digital Audits",
             "auto_send_reports": True,
-            "reply_to": "contact@codenest.com",
+            "reply_to": "contact@codenest.us.com",
             "notifications": {
                 "audit_complete": True,
                 "report_sent": True,
@@ -1032,9 +1032,9 @@ def send_audit_report_email(recipient_email, audit_data):
                         </div>
                         
                         <div class="footer">
-                            <p>Code Nest | Digital Solutions & Audits</p>
-                            <p>© 2025 Code Nest. All rights reserved.</p>
-                            <p>Questions? Reply to this email or contact us at contact@codenest.com</p>
+                            <p>Code Nest LLC | Nest Idea | Code Success</p>
+                            <p>© 2025 Code Nest LLC. All rights reserved.</p>
+                            <p>Questions? Reply to this email or contact us at contact@codenest.us.com</p>
                         </div>
                     </div>
                 </div>
@@ -1254,104 +1254,123 @@ def show_dashboard():
 # ============================================================================
 
 def generate_pdf_report(audit_data, filename="audit_report.pdf"):
-    """Generate professional PDF report for an audit with complete details."""
+    """
+    Generate professional branded PDF report for an audit.
+    Uses the PDFReport class for consistent Code Nest branding.
+    
+    Brand Info:
+    - Company: Code Nest LLC
+    - Tagline: Nest Idea | Code Success
+    - Website: https://codenest.us.com
+    - Email: contact@codenest.us.com
+    """
     try:
-        pdf = FPDF()
+        pdf = PDFReport()
+        
+        # Extract domain for cover page
+        domain = audit_data.get("domain", audit_data.get("url", "Unknown"))
+        if '://' in domain:
+            domain = domain.split('://')[1].split('/')[0]
+        domain = domain.replace('www.', '')
+        
+        score = audit_data.get('score', audit_data.get('health_score', 0))
+        
+        # =====================================================================
+        # COVER PAGE
+        # =====================================================================
+        pdf.add_cover_page(domain, score)
+        
+        # =====================================================================
+        # AUDIT DETAILS PAGE
+        # =====================================================================
         pdf.add_page()
         
-        # Header
-        pdf.set_font("Arial", "B", 16)
-        pdf.cell(0, 10, "Code Nest Sales Engine - Audit Report", ln=True, align="C")
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(0, 5, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
-        pdf.ln(5)
-        
-        # Audit Details
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 8, "Audit Summary", ln=True)
-        pdf.set_font("Arial", "", 10)
+        # Audit Summary Section
+        pdf.section_title("Audit Summary")
         
         details = [
-            ("Domain", audit_data.get("domain", audit_data.get("url", "N/A"))),
-            ("Health Score", f"{audit_data.get('score', audit_data.get('health_score', 'N/A'))}/100"),
+            ("Domain", domain),
+            ("Health Score", f"{score}/100"),
             ("Page Speed Score", str(audit_data.get('psi', audit_data.get('psi_score', 'N/A')))),
             ("Domain Age", str(audit_data.get('domain_age', 'N/A'))),
-            ("Date", audit_data.get('timestamp', audit_data.get('created_at', 'N/A'))),
+            ("Report Date", audit_data.get('timestamp', audit_data.get('created_at', datetime.now().strftime('%Y-%m-%d %H:%M')))),
         ]
         
         for label, value in details:
-            pdf.set_font("Arial", "", 10)
-            pdf.cell(50, 6, f"{label}:", 0)
             pdf.set_font("Arial", "B", 10)
-            pdf.cell(0, 6, str(value)[:50], ln=True)
+            pdf.set_text_color(*pdf.brand_dark_green)
+            pdf.cell(60, 6, f"{label}:", 0, 0)
+            pdf.set_font("Arial", "", 10)
+            pdf.set_text_color(*pdf.brand_grey)
+            pdf.cell(0, 6, str(value)[:50], 0, 1)
         
         pdf.ln(5)
         
         # Tech Stack
         if "tech_stack" in audit_data and audit_data["tech_stack"]:
-            pdf.set_font("Arial", "B", 11)
-            pdf.cell(0, 7, "Technology Stack", ln=True)
-            pdf.set_font("Arial", "", 9)
+            pdf.section_title("Technology Stack")
             tech_text = ", ".join(audit_data["tech_stack"][:15])
-            pdf.multi_cell(0, 4, tech_text)
-            pdf.ln(3)
+            pdf.chapter_body(f"Detected technologies: {tech_text}")
         
-        # Issues
+        # =====================================================================
+        # CRITICAL FINDINGS
+        # =====================================================================
         if "issues" in audit_data and audit_data["issues"]:
-            pdf.set_font("Arial", "B", 11)
-            pdf.cell(0, 7, f"Issues Found ({len(audit_data['issues'])})", ln=True)
-            pdf.set_font("Arial", "", 9)
+            pdf.section_title("Critical Findings", color_type="issues")
             
             for i, issue in enumerate(audit_data["issues"][:15], 1):
+                pdf.set_font("Arial", "B", 10)
+                pdf.set_text_color(180, 60, 60)
                 issue_text = str(issue)[:80]
-                pdf.multi_cell(0, 4, f"{i}. {issue_text}")
+                pdf.cell(0, 5, f"[!] {clean_text(issue_text)}", 0, 1)
             pdf.ln(2)
         
         # Emails Found
         if "emails" in audit_data and audit_data["emails"]:
-            pdf.set_font("Arial", "B", 11)
-            pdf.cell(0, 7, "Contact Emails", ln=True)
-            pdf.set_font("Arial", "", 10)
+            pdf.section_title("Contact Emails Found")
             for email in audit_data["emails"][:5]:
-                pdf.cell(0, 5, f"• {email}", ln=True)
+                pdf.bullet_point(email)
             pdf.ln(2)
         
-        # AI Insights
+        # =====================================================================
+        # AI INSIGHTS PAGE
+        # =====================================================================
         if "ai" in audit_data and audit_data["ai"]:
             ai_data = audit_data["ai"]
             
+            pdf.add_page()
+            
+            # AI Insights header
+            pdf.set_font('Arial', 'B', 20)
+            pdf.set_text_color(*pdf.brand_dark_green)
+            pdf.cell(0, 12, "AI-Powered Insights", 0, 1, 'C')
+            
+            # Decorative line
+            pdf.set_draw_color(*pdf.brand_accent_green)
+            pdf.set_line_width(1)
+            y = pdf.get_y()
+            pdf.line(70, y, 140, y)
+            pdf.ln(10)
+            
             if ai_data.get("summary"):
-                pdf.set_font("Arial", "B", 11)
-                pdf.cell(0, 7, "AI Summary", ln=True)
-                pdf.set_font("Arial", "", 9)
-                pdf.multi_cell(0, 4, str(ai_data.get("summary", ""))[:400])
-                pdf.ln(2)
+                pdf.section_title("Executive Summary", color_type="ai_insights")
+                pdf.chapter_body(str(ai_data.get("summary", ""))[:400])
             
             if ai_data.get("impact"):
-                pdf.set_font("Arial", "B", 11)
-                pdf.cell(0, 7, "Business Impact", ln=True)
-                pdf.set_font("Arial", "", 9)
-                pdf.multi_cell(0, 4, str(ai_data.get("impact", ""))[:400])
-                pdf.ln(2)
+                pdf.section_title("Business Impact", color_type="issues")
+                pdf.chapter_body(str(ai_data.get("impact", ""))[:400])
             
             if ai_data.get("solutions"):
-                pdf.set_font("Arial", "B", 11)
-                pdf.cell(0, 7, "Recommended Solutions", ln=True)
-                pdf.set_font("Arial", "", 9)
-                pdf.multi_cell(0, 4, str(ai_data.get("solutions", ""))[:400])
-                pdf.ln(2)
+                pdf.section_title("Recommended Solutions", color_type="quick_wins")
+                pdf.chapter_body(str(ai_data.get("solutions", ""))[:400])
             
             if ai_data.get("email"):
-                pdf.set_font("Arial", "B", 11)
-                pdf.cell(0, 7, "AI Email Draft", ln=True)
-                pdf.set_font("Arial", "", 8)
-                pdf.multi_cell(0, 3, str(ai_data.get("email", ""))[:600])
-                pdf.ln(2)
+                pdf.section_title("AI Email Draft", color_type="ai_insights")
+                pdf.set_font("Arial", "", 9)
+                pdf.set_text_color(*pdf.brand_grey)
+                pdf.multi_cell(0, 4, clean_text(str(ai_data.get("email", ""))[:600]))
         
-        # Footer
-        pdf.ln(5)
-        pdf.set_font("Arial", "I", 8)
-        pdf.cell(0, 5, "© 2025 Code Nest. All rights reserved. | www.codenest.dev", align="C")
+        # Footer is handled automatically by PDFReport class
         
         # Save to bytes
         pdf_bytes = pdf.output(dest='S').encode('latin-1')
@@ -5558,11 +5577,19 @@ class PDFReport(FPDF):
     """
     Enhanced PDF report generator with Code Nest branding.
     
+    Brand Info:
+    - Company: Code Nest LLC
+    - Tagline: Nest Idea | Code Success
+    - Website: https://codenest.us.com
+    - Email: contact@codenest.us.com
+    - Location: New Mexico, USA
+    
     Features:
     - Professional cover page with logo
     - Branded color scheme (dark green #0c3740, accent green #2b945f)
-    - Section-specific styling
+    - Section-specific styling with color-coded headers
     - Consistent typography and spacing
+    - Single footer per page (no duplicates)
     """
     
     def __init__(self):
@@ -5574,104 +5601,141 @@ class PDFReport(FPDF):
         self.brand_white = (254, 255, 255)        # #feffff
         self.brand_light_bg = (245, 250, 248)     # Light greenish tint
         
+        # Track if we're on the cover page (to skip header/footer)
+        self.is_cover_page = False
+        
         # Check for logo file
         self.logo_available = PDF_LOGO_PATH.exists()
         if not self.logo_available:
-            print(f"⚠️ BRANDING: Please upload: {PDF_LOGO_PATH}")
+            print(f"⚠️ Logo not found at {PDF_LOGO_PATH} – please upload your Code Nest logo to this path.")
     
     def header(self):
-        """Branded header with logo and accent line."""
+        """
+        Branded header with logo and company info.
+        Only renders on content pages (not cover page).
+        """
+        # Skip header on cover page
+        if self.is_cover_page:
+            return
+        
         # Add logo if available
         if self.logo_available:
             try:
-                self.image(str(PDF_LOGO_PATH), 10, 8, 40)
-                self.set_xy(55, 10)
+                self.image(str(PDF_LOGO_PATH), 10, 8, 35)
+                self.set_xy(50, 10)
             except Exception:
                 self.set_xy(10, 10)
         else:
             self.set_xy(10, 10)
         
         # Company name in dark green
-        self.set_font('Arial', 'B', 22)
+        self.set_font('Arial', 'B', 18)
         self.set_text_color(*self.brand_dark_green)
-        self.cell(0, 10, clean_text(COMPANY_NAME), 0, 1, 'L' if self.logo_available else 'L')
+        self.cell(0, 8, clean_text(COMPANY_NAME), 0, 1, 'L')
         
         # Tagline in accent green
         if self.logo_available:
-            self.set_x(55)
-        self.set_font('Arial', 'I', 11)
+            self.set_x(50)
+        self.set_font('Arial', 'I', 10)
         self.set_text_color(*self.brand_accent_green)
-        self.cell(0, 6, clean_text(COMPANY_TAGLINE), 0, 1, 'L')
+        self.cell(0, 5, clean_text(COMPANY_TAGLINE), 0, 1, 'L')
         
         # Branded accent line
         self.set_draw_color(*self.brand_dark_green)
         self.set_line_width(1.5)
-        self.line(10, 30, 200, 30)
+        self.line(10, 28, 200, 28)
         
         # Thin accent line below
         self.set_draw_color(*self.brand_accent_green)
         self.set_line_width(0.5)
-        self.line(10, 32, 200, 32)
+        self.line(10, 30, 200, 30)
         
-        self.ln(15)
+        self.ln(20)
     
     def footer(self):
-        """Branded footer with contact info."""
-        self.set_y(-25)
+        """
+        Branded footer with contact info.
+        Only renders on content pages (not cover page).
+        Single clean footer - no duplicates.
+        """
+        # Skip footer on cover page
+        if self.is_cover_page:
+            return
+        
+        self.set_y(-20)
         
         # Accent line above footer
         self.set_draw_color(*self.brand_accent_green)
         self.set_line_width(0.3)
         self.line(10, self.get_y(), 200, self.get_y())
-        self.ln(3)
+        self.ln(2)
         
-        # Footer text
+        # Footer Line 1: Company | Website
         self.set_font('Arial', '', 8)
         self.set_text_color(*self.brand_grey)
         self.cell(0, 4, f"{COMPANY_NAME} | {COMPANY_WEBSITE}", 0, 1, 'C')
+        
+        # Footer Line 2: Email | Location
         self.cell(0, 4, f"{CONTACT_EMAIL} | {COMPANY_LOCATION}", 0, 1, 'C')
         
-        # Page number
+        # Page number (right-aligned)
         self.set_font('Arial', 'I', 8)
-        self.cell(0, 4, f"Page {self.page_no()}", 0, 0, 'C')
+        self.set_text_color(*self.brand_accent_green)
+        self.cell(0, 4, f"Page {self.page_no()}", 0, 0, 'R')
     
     def add_cover_page(self, domain: str, score: int):
-        """Add professional branded cover page."""
+        """
+        Add professional branded cover page.
+        Cover page has its own layout without the standard header/footer.
+        """
+        # Mark as cover page to skip header/footer
+        self.is_cover_page = True
         self.add_page()
         
-        # Large logo at top center
+        # Large centered logo at top
         if self.logo_available:
             try:
-                self.image(str(PDF_LOGO_PATH), 75, 30, 60)
-                self.ln(70)
+                self.image(str(PDF_LOGO_PATH), 75, 25, 60)
+                self.set_y(90)
             except Exception:
-                self.ln(40)
+                self.set_y(50)
         else:
-            self.ln(40)
+            self.set_y(50)
+        
+        # Company name centered
+        self.set_font('Arial', 'B', 24)
+        self.set_text_color(*self.brand_dark_green)
+        self.cell(0, 12, clean_text(COMPANY_NAME), 0, 1, 'C')
+        
+        # Tagline centered
+        self.set_font('Arial', 'I', 14)
+        self.set_text_color(*self.brand_accent_green)
+        self.cell(0, 8, clean_text(COMPANY_TAGLINE), 0, 1, 'C')
+        self.ln(10)
         
         # Main title
-        self.set_font('Arial', 'B', 28)
+        self.set_font('Arial', 'B', 26)
         self.set_text_color(*self.brand_dark_green)
-        self.cell(0, 15, "Website Performance", 0, 1, 'C')
-        self.cell(0, 15, "& Growth Audit", 0, 1, 'C')
+        self.cell(0, 14, "Website Performance", 0, 1, 'C')
+        self.cell(0, 14, "& Growth Audit", 0, 1, 'C')
         self.ln(5)
         
-        # Accent line
+        # Decorative accent line
         self.set_draw_color(*self.brand_accent_green)
         self.set_line_width(2)
         self.line(60, self.get_y(), 150, self.get_y())
-        self.ln(15)
+        self.ln(12)
         
-        # Client domain
-        self.set_font('Arial', 'B', 18)
+        # "Prepared for:" + domain
+        self.set_font('Arial', 'B', 16)
         self.set_text_color(*self.brand_grey)
         self.cell(0, 10, "Prepared for:", 0, 1, 'C')
-        self.set_font('Arial', 'B', 22)
+        self.set_font('Arial', 'B', 20)
         self.set_text_color(*self.brand_dark_green)
-        self.cell(0, 12, clean_text(domain), 0, 1, 'C')
-        self.ln(10)
+        self.cell(0, 10, clean_text(domain), 0, 1, 'C')
+        self.ln(8)
         
-        # Health score badge
+        # Health score section
         self.set_font('Arial', 'B', 14)
         self.set_text_color(*self.brand_grey)
         self.cell(0, 8, "Overall Health Score", 0, 1, 'C')
@@ -5684,26 +5748,29 @@ class PDFReport(FPDF):
             self.set_text_color(255, 165, 0)  # Orange
         else:
             self.set_text_color(200, 60, 60)  # Red
-        self.cell(0, 25, f"{score}/100", 0, 1, 'C')
-        self.ln(15)
+        self.cell(0, 22, f"{score}/100", 0, 1, 'C')
+        self.ln(5)
         
-        # Date
+        # Report date
         self.set_font('Arial', '', 12)
         self.set_text_color(*self.brand_grey)
         self.cell(0, 8, f"Report Date: {datetime.now().strftime('%B %d, %Y')}", 0, 1, 'C')
         
-        # Bottom contact block
-        self.set_y(-60)
+        # Bottom branded contact block (replaces footer on cover)
+        self.set_y(-55)
         self.set_fill_color(*self.brand_dark_green)
         self.rect(0, self.get_y(), 210, 50, 'F')
         
-        self.set_y(-55)
+        self.set_y(-48)
         self.set_font('Arial', 'B', 12)
         self.set_text_color(*self.brand_white)
-        self.cell(0, 8, COMPANY_NAME, 0, 1, 'C')
+        self.cell(0, 7, COMPANY_NAME, 0, 1, 'C')
         self.set_font('Arial', '', 10)
         self.cell(0, 6, COMPANY_WEBSITE, 0, 1, 'C')
         self.cell(0, 6, f"{CONTACT_EMAIL} | {COMPANY_LOCATION}", 0, 1, 'C')
+        
+        # Reset cover page flag for subsequent pages
+        self.is_cover_page = False
     
     def section_title(self, label, color_type="default"):
         """
@@ -6283,7 +6350,7 @@ def show_email_settings():
         **SMTP Configuration for Hostinger:**
         - **SMTP Server:** `smtp.hostinger.com`
         - **SMTP Port:** `587` (TLS) or `465` (SSL)
-        - **Sender Email:** Your Hostinger email (e.g., `contact@codenest.com`)
+        - **Sender Email:** Your Hostinger email (e.g., `contact@codenest.us.com`)
         - **Password:** Your Hostinger email password
         
         **Steps to get your credentials:**
