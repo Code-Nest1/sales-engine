@@ -3341,14 +3341,181 @@ def show_single_audit():
             st.error(f"PDF Error: {e}")
 
 # ============================================================================
-# BULK SCAN BACKGROUND PROCESSING FUNCTIONS
+# BULK SCAN - CONSTANTS & CONFIGURATION
 # ============================================================================
 
-def create_bulk_scan_session(urls: list) -> str:
-    """Create a new bulk scan session and store in database."""
+# Bulk Scan Session State Keys (centralized)
+BULK_SCAN_SESSION_KEYS = [
+    "bulk_scan_session_id",
+    "bulk_scan_active", 
+    "bulk_scan_current_url",
+    "bulk_scan_error_count"
+]
+
+# Rate limiting configuration
+BULK_SCAN_DELAY_SECONDS = 0.5  # Delay between scans to prevent rate limiting
+BULK_SCAN_MAX_ERRORS = 5  # Max consecutive errors before pausing
+
+# ============================================================================
+# BULK SCAN - URL VALIDATION & SANITIZATION
+# ============================================================================
+
+def validate_and_clean_url(url: str) -> tuple:
+    """Validate and sanitize a URL for bulk scanning.
+    
+    Args:
+        url: Raw URL string from CSV
+        
+    Returns:
+        Tuple of (cleaned_url, is_valid, error_message)
+    """
+    if not url or not isinstance(url, str):
+        return None, False, "Empty or invalid URL"
+    
+    # Strip whitespace
+    url = url.strip()
+    
+    # Skip empty or nan values
+    if url.lower() in ['nan', 'none', '', 'null', 'n/a']:
+        return None, False, "Empty value"
+    
+    # Remove common prefixes that might cause issues
+    url = url.replace('www.', '') if url.startswith('www.') else url
+    
+    # Add https:// if no protocol
+    if not url.startswith(('http://', 'https://')):
+        url = f"https://{url}"
+    
+    # Basic domain validation
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return None, False, "Invalid domain"
+        
+        # Check for valid TLD (basic check)
+        domain_parts = parsed.netloc.split('.')
+        if len(domain_parts) < 2:
+            return None, False, "Invalid domain format"
+        
+        return url, True, None
+    except Exception as e:
+        return None, False, str(e)
+
+
+def detect_website_column(df) -> str:
+    """Detect the column containing website URLs in a DataFrame.
+    
+    Args:
+        df: Pandas DataFrame
+        
+    Returns:
+        Column name or None if not found
+    """
+    # Check for common column names (case-insensitive)
+    common_names = ['website', 'url', 'domain', 'site', 'web', 'link', 'homepage']
+    
+    for col in df.columns:
+        if col.lower().strip() in common_names:
+            return col
+    
+    # Check if any column contains mostly URL-like values
+    for col in df.columns:
+        sample = df[col].dropna().head(10).astype(str)
+        url_count = sum(1 for v in sample if '.' in v and len(v) > 5)
+        if url_count >= len(sample) * 0.7:  # 70% look like URLs
+            return col
+    
+    return None
+
+
+def extract_urls_from_dataframe(df, column_name: str) -> tuple:
+    """Extract and validate URLs from a DataFrame column.
+    
+    Args:
+        df: Pandas DataFrame
+        column_name: Name of the column containing URLs
+        
+    Returns:
+        Tuple of (valid_urls_list, invalid_count, errors_list)
+    """
+    valid_urls = []
+    errors = []
+    invalid_count = 0
+    
+    for idx, raw_url in enumerate(df[column_name].tolist()):
+        url, is_valid, error = validate_and_clean_url(str(raw_url))
+        
+        if is_valid:
+            valid_urls.append(url)
+        else:
+            invalid_count += 1
+            if error and error != "Empty value":
+                errors.append(f"Row {idx + 1}: {error}")
+    
+    return valid_urls, invalid_count, errors[:10]  # Limit error messages
+
+
+# ============================================================================
+# BULK SCAN - SAFE AUDIT RUNNER
+# ============================================================================
+
+def run_bulk_audit_safe(url: str, openai_key: str, google_key: str) -> tuple:
+    """Safely run an audit with error handling for bulk processing.
+    
+    Args:
+        url: URL to audit
+        openai_key: OpenAI API key
+        google_key: Google API key
+        
+    Returns:
+        Tuple of (audit_id, success, error_message)
+    """
+    logger = logging.getLogger("sales_engine")
+    
+    try:
+        # Run the audit
+        audit_data = run_audit(url, openai_key, google_key)
+        
+        if not audit_data:
+            logger.warning(f"Bulk audit returned no data for: {url}")
+            return None, False, "Audit returned no data"
+        
+        # Save to database
+        audit_id = save_audit_to_db(audit_data)
+        
+        if audit_id:
+            logger.info(f"Bulk audit success: {url} -> audit_id={audit_id}")
+            return audit_id, True, None
+        else:
+            logger.warning(f"Bulk audit save failed for: {url}")
+            return None, False, "Failed to save audit"
+            
+    except Exception as e:
+        logger.error(f"Bulk audit error for {url}: {str(e)}")
+        return None, False, str(e)
+
+
+# ============================================================================
+# BULK SCAN BACKGROUND PROCESSING FUNCTIONS (FIXED)
+# ============================================================================
+
+def create_bulk_scan_session(urls: list, username: str = None) -> str:
+    """Create a new bulk scan session and store in database.
+    
+    Args:
+        urls: List of validated URLs to scan
+        username: Optional username of the creator
+        
+    Returns:
+        Session ID string or None on failure
+    """
     import uuid
+    logger = logging.getLogger("sales_engine")
     db = get_db()
+    
     if not db:
+        logger.error("Database unavailable for bulk scan session creation")
         return None
     
     try:
@@ -3364,26 +3531,66 @@ def create_bulk_scan_session(urls: list) -> str:
         )
         db.add(bulk_scan)
         db.commit()
+        
+        logger.info(f"Bulk scan session created: {session_id[:8]}... ({len(urls)} URLs)")
         return session_id
+        
     except Exception as e:
         logger.error(f"Error creating bulk scan session: {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
         return None
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except:
+                pass
+
 
 def get_bulk_scan_session(session_id: str):
-    """Retrieve bulk scan session from database."""
+    """Retrieve bulk scan session from database.
+    
+    Args:
+        session_id: UUID of the session
+        
+    Returns:
+        BulkScan object or None
+    """
     db = get_db()
     if not db:
         return None
     try:
         return db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
     finally:
-        db.close()
+        try:
+            db.close()
+        except:
+            pass
 
-def update_bulk_scan_progress(session_id: str, processed_count: int, results: dict, status: str = "running"):
-    """Update bulk scan progress in database."""
+
+def update_bulk_scan_progress(session_id: str, processed_count: int, results: dict, 
+                               paused_at_index: int = None, status: str = "running") -> bool:
+    """Update bulk scan progress in database.
+    
+    FIXED: Now updates paused_at_index to enable proper resume functionality.
+    
+    Args:
+        session_id: UUID of the session
+        processed_count: Number of URLs processed
+        results: Dictionary of {url: audit_id}
+        paused_at_index: Current index for resume (defaults to processed_count)
+        status: Session status
+        
+    Returns:
+        True on success, False on failure
+    """
+    logger = logging.getLogger("sales_engine")
     db = get_db()
+    
     if not db:
         return False
     
@@ -3393,19 +3600,41 @@ def update_bulk_scan_progress(session_id: str, processed_count: int, results: di
             scan.processed_urls = processed_count
             scan.results = results
             scan.status = status
+            # FIX: Update paused_at_index for proper resume
+            scan.paused_at_index = paused_at_index if paused_at_index is not None else processed_count
             scan.updated_at = datetime.utcnow()
             db.commit()
             return True
         return False
     except Exception as e:
         logger.error(f"Error updating bulk scan: {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
         return False
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except:
+                pass
 
-def pause_bulk_scan(session_id: str, current_index: int):
-    """Pause a bulk scan at a specific index."""
+
+def pause_bulk_scan(session_id: str, current_index: int) -> bool:
+    """Pause a bulk scan at a specific index.
+    
+    Args:
+        session_id: UUID of the session
+        current_index: Current processing index to resume from
+        
+    Returns:
+        True on success, False on failure
+    """
+    logger = logging.getLogger("sales_engine")
     db = get_db()
+    
     if not db:
         return False
     
@@ -3416,17 +3645,37 @@ def pause_bulk_scan(session_id: str, current_index: int):
             scan.paused_at_index = current_index
             scan.updated_at = datetime.utcnow()
             db.commit()
+            logger.info(f"Bulk scan paused: {session_id[:8]}... at index {current_index}")
             return True
         return False
     except Exception as e:
         logger.error(f"Error pausing bulk scan: {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
         return False
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except:
+                pass
 
-def resume_bulk_scan(session_id: str):
-    """Resume a paused bulk scan."""
+
+def resume_bulk_scan(session_id: str) -> bool:
+    """Resume a paused bulk scan.
+    
+    Args:
+        session_id: UUID of the session
+        
+    Returns:
+        True on success, False on failure
+    """
+    logger = logging.getLogger("sales_engine")
     db = get_db()
+    
     if not db:
         return False
     
@@ -3436,17 +3685,37 @@ def resume_bulk_scan(session_id: str):
             scan.status = "running"
             scan.updated_at = datetime.utcnow()
             db.commit()
+            logger.info(f"Bulk scan resumed: {session_id[:8]}... from index {scan.paused_at_index}")
             return True
         return False
     except Exception as e:
         logger.error(f"Error resuming bulk scan: {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
         return False
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except:
+                pass
 
-def stop_bulk_scan(session_id: str):
-    """Stop a bulk scan permanently."""
+
+def stop_bulk_scan(session_id: str) -> bool:
+    """Stop a bulk scan permanently.
+    
+    Args:
+        session_id: UUID of the session
+        
+    Returns:
+        True on success, False on failure
+    """
+    logger = logging.getLogger("sales_engine")
     db = get_db()
+    
     if not db:
         return False
     
@@ -3456,17 +3725,37 @@ def stop_bulk_scan(session_id: str):
             scan.status = "stopped"
             scan.updated_at = datetime.utcnow()
             db.commit()
+            logger.info(f"Bulk scan stopped: {session_id[:8]}...")
             return True
         return False
     except Exception as e:
         logger.error(f"Error stopping bulk scan: {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
         return False
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except:
+                pass
 
-def complete_bulk_scan(session_id: str):
-    """Mark a bulk scan as completed."""
+
+def complete_bulk_scan(session_id: str) -> bool:
+    """Mark a bulk scan as completed.
+    
+    Args:
+        session_id: UUID of the session
+        
+    Returns:
+        True on success, False on failure
+    """
+    logger = logging.getLogger("sales_engine")
     db = get_db()
+    
     if not db:
         return False
     
@@ -3476,173 +3765,624 @@ def complete_bulk_scan(session_id: str):
             scan.status = "completed"
             scan.updated_at = datetime.utcnow()
             db.commit()
+            logger.info(f"Bulk scan completed: {session_id[:8]}...")
             return True
         return False
     except Exception as e:
         logger.error(f"Error completing bulk scan: {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
         return False
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except:
+                pass
 
-def get_bulk_scan_sessions(limit=10):
-    """Get list of recent bulk scan sessions."""
+
+def get_bulk_scan_sessions(limit: int = 10, status_filter: str = None) -> list:
+    """Get list of recent bulk scan sessions.
+    
+    Args:
+        limit: Maximum number of sessions to return
+        status_filter: Optional status to filter by
+        
+    Returns:
+        List of BulkScan objects
+    """
     db = get_db()
     if not db:
         return []
     
     try:
-        sessions = db.query(BulkScan).order_by(BulkScan.created_at.desc()).limit(limit).all()
-        return sessions
+        query = db.query(BulkScan).order_by(BulkScan.created_at.desc())
+        if status_filter:
+            query = query.filter(BulkScan.status == status_filter)
+        return query.limit(limit).all()
+    except Exception:
+        return []
     finally:
-        db.close()
+        try:
+            db.close()
+        except:
+            pass
+
+
+def export_bulk_scan_results(session_id: str) -> bytes:
+    """Export bulk scan results as CSV.
+    
+    Args:
+        session_id: UUID of the session
+        
+    Returns:
+        CSV data as bytes, or empty bytes on failure
+    """
+    logger = logging.getLogger("sales_engine")
+    db = get_db()
+    
+    if not db:
+        return b""
+    
+    try:
+        session = db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
+        if not session or not session.results:
+            return b""
+        
+        results_list = []
+        for url, audit_id in session.results.items():
+            if audit_id:
+                audit = db.query(Audit).filter(Audit.id == audit_id).first()
+                if audit:
+                    results_list.append({
+                        "Website": url,
+                        "Domain": audit.domain or url,
+                        "Health Score": audit.health_score or "N/A",
+                        "PSI Speed": audit.psi_score or "N/A",
+                        "Issues Found": len(audit.issues) if audit.issues else 0,
+                        "Domain Age": audit.domain_age or "N/A",
+                        "Tech Stack": ", ".join(audit.tech_stack[:5]) if audit.tech_stack else "N/A",
+                        "Emails Found": ", ".join(audit.emails_found) if audit.emails_found else "N/A",
+                        "AI Summary": (audit.ai_summary[:100] + "...") if audit.ai_summary else "N/A",
+                        "Scanned At": audit.created_at.strftime("%Y-%m-%d %H:%M") if audit.created_at else "N/A"
+                    })
+            else:
+                results_list.append({
+                    "Website": url,
+                    "Domain": url,
+                    "Health Score": "FAILED",
+                    "PSI Speed": "N/A",
+                    "Issues Found": "N/A",
+                    "Domain Age": "N/A",
+                    "Tech Stack": "N/A",
+                    "Emails Found": "N/A",
+                    "AI Summary": "Audit failed",
+                    "Scanned At": "N/A"
+                })
+        
+        if results_list:
+            df = pd.DataFrame(results_list)
+            return df.to_csv(index=False).encode('utf-8')
+        return b""
+        
+    except Exception as e:
+        logger.error(f"Error exporting bulk scan results: {e}")
+        return b""
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+# ============================================================================
+# BULK AUDIT UI - CODE NEST BRANDED (COMPLETE REWRITE)
+# ============================================================================
 
 def show_bulk_audit():
-    """Bulk audit processor page with background processing, pause/resume support."""
-    st.title("📂 Bulk Website Audit")
-    st.markdown("Upload CSV with 'Website' column to analyze multiple sites at once")
-    st.markdown("**Features:** Background processing • Pause/Resume • Real-time progress • PDF downloads")
-    st.markdown("---")
+    """Bulk Website Audit - Code Nest branded interface with reliable processing.
     
-    tab1, tab2 = st.tabs(["New Scan", "Active Sessions"])
+    Features:
+    - CSV upload with smart column detection
+    - URL validation and sanitization
+    - Background processing with auto-continue
+    - Pause/Resume/Stop controls
+    - Real-time progress tracking
+    - CSV export of results
+    - Professional Code Nest branding
+    """
+    logger = logging.getLogger("sales_engine")
+    logger.debug("Rendering Bulk Audit page")
     
+    # =========================================================================
+    # CODE NEST BRANDING - CSS STYLES
+    # =========================================================================
+    st.markdown("""
+    <style>
+    /* Code Nest Brand Colors */
+    :root {
+        --cn-dark-green: #0c3740;
+        --cn-accent-green: #2b945f;
+        --cn-font-grey: #5a5a5a;
+        --cn-white: #feffff;
+        --cn-light-bg: #f8faf9;
+    }
+    
+    /* Bulk Audit Container */
+    .bulk-audit-header {
+        background: linear-gradient(135deg, #0c3740 0%, #1a5a6e 100%);
+        padding: 2rem;
+        border-radius: 12px;
+        margin-bottom: 1.5rem;
+        color: white;
+    }
+    .bulk-audit-header h1 {
+        font-family: 'Poppins', sans-serif;
+        font-size: 2rem;
+        margin: 0;
+        font-weight: 600;
+    }
+    .bulk-audit-header p {
+        font-family: 'Lato', sans-serif;
+        opacity: 0.9;
+        margin: 0.5rem 0 0 0;
+    }
+    
+    /* Upload Card */
+    .upload-card {
+        background: white;
+        border: 2px dashed #2b945f;
+        border-radius: 12px;
+        padding: 2rem;
+        text-align: center;
+        transition: all 0.3s ease;
+    }
+    .upload-card:hover {
+        border-color: #0c3740;
+        box-shadow: 0 4px 20px rgba(12, 55, 64, 0.1);
+    }
+    
+    /* Session Card */
+    .session-card {
+        background: white;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+        border-left: 4px solid #2b945f;
+    }
+    .session-card.paused {
+        border-left-color: #f0ad4e;
+    }
+    .session-card.stopped {
+        border-left-color: #d9534f;
+    }
+    .session-card.completed {
+        border-left-color: #2b945f;
+    }
+    
+    /* Status Badges */
+    .status-badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 20px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        font-family: 'Lato', sans-serif;
+    }
+    .status-running {
+        background: #d4edda;
+        color: #155724;
+    }
+    .status-paused {
+        background: #fff3cd;
+        color: #856404;
+    }
+    .status-completed {
+        background: #cce5ff;
+        color: #004085;
+    }
+    .status-stopped {
+        background: #f8d7da;
+        color: #721c24;
+    }
+    
+    /* Progress Bar Custom */
+    .bulk-progress {
+        background: #e9ecef;
+        border-radius: 10px;
+        height: 12px;
+        overflow: hidden;
+        margin: 0.5rem 0;
+    }
+    .bulk-progress-bar {
+        background: linear-gradient(90deg, #2b945f 0%, #3dc978 100%);
+        height: 100%;
+        border-radius: 10px;
+        transition: width 0.5s ease;
+    }
+    
+    /* Empty State */
+    .empty-state {
+        text-align: center;
+        padding: 3rem 2rem;
+        background: #f8faf9;
+        border-radius: 12px;
+        border: 1px dashed #dee2e6;
+    }
+    .empty-state h3 {
+        font-family: 'Poppins', sans-serif;
+        color: #0c3740;
+        margin-bottom: 0.5rem;
+    }
+    .empty-state p {
+        font-family: 'Lato', sans-serif;
+        color: #5a5a5a;
+    }
+    
+    /* Processing Indicator */
+    .processing-indicator {
+        background: linear-gradient(135deg, #2b945f 0%, #3dc978 100%);
+        color: white;
+        padding: 1rem 1.5rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+        animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.8; }
+    }
+    
+    /* Button Styling */
+    .stButton > button {
+        font-family: 'Lato', sans-serif;
+        border-radius: 8px;
+        transition: all 0.2s ease;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # =========================================================================
+    # HEADER
+    # =========================================================================
+    st.markdown("""
+    <div class="bulk-audit-header">
+        <h1>📂 Bulk Website Audit</h1>
+        <p>Upload your lead list and let Code Nest analyze them all. Background processing means you can navigate away and return anytime.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # =========================================================================
+    # TABS: NEW SCAN | ACTIVE SESSIONS
+    # =========================================================================
+    tab1, tab2 = st.tabs(["📤 New Scan", "📊 Active Sessions"])
+    
+    # =========================================================================
+    # TAB 1: NEW SCAN
+    # =========================================================================
     with tab1:
-        uploaded = st.file_uploader("Upload CSV", type="csv", key="bulk_csv")
+        st.markdown("### Upload Your Lead List")
+        st.markdown("Upload a CSV file with a column containing website URLs. We'll detect and validate them automatically.")
+        
+        uploaded = st.file_uploader(
+            "Choose CSV file",
+            type=["csv"],
+            key="bulk_csv_upload",
+            help="CSV should have a column named 'Website', 'URL', 'Domain', or similar"
+        )
         
         if uploaded:
-            df = pd.read_csv(uploaded)
-            st.write(f"**Loaded {len(df)} rows**")
-            
-            if "Website" not in df.columns:
-                st.error("CSV must have 'Website' column")
-            else:
-                st.dataframe(df.head(), use_container_width=True)
+            try:
+                df = pd.read_csv(uploaded)
                 
-                if st.button("▶️ Start Background Scan", type="primary", use_container_width=True):
-                    # Create new bulk scan session
-                    urls = [str(url).strip() for url in df['Website'].tolist()]
-                    session_id = create_bulk_scan_session(urls)
+                # Detect website column
+                website_col = detect_website_column(df)
+                
+                if not website_col:
+                    st.error("❌ Could not find a website column. Please ensure your CSV has a column named 'Website', 'URL', 'Domain', or 'Site'.")
+                    st.markdown("**Your columns:** " + ", ".join(df.columns.tolist()))
+                else:
+                    # Show detected column
+                    if website_col.lower() != 'website':
+                        st.info(f"ℹ️ Using column **'{website_col}'** as website source")
                     
-                    if session_id:
-                        st.session_state['bulk_scan_session_id'] = session_id
-                        st.session_state['bulk_scan_urls'] = urls
-                        st.session_state['bulk_scan_results'] = {}
-                        st.session_state['bulk_scan_status'] = 'running'
-                        st.success(f"✓ Bulk scan session created! Session ID: {session_id[:8]}...")
-                        st.info("📌 You can now navigate to other sections. Progress will continue in the background!")
-                        st.rerun()
+                    # Extract and validate URLs
+                    valid_urls, invalid_count, errors = extract_urls_from_dataframe(df, website_col)
+                    
+                    # Summary metrics
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Rows", len(df))
+                    with col2:
+                        st.metric("Valid URLs", len(valid_urls), delta=None if invalid_count == 0 else f"-{invalid_count} invalid")
+                    with col3:
+                        estimated_time = len(valid_urls) * 15  # ~15 seconds per URL
+                        st.metric("Est. Time", f"{estimated_time // 60}m {estimated_time % 60}s")
+                    
+                    # Show validation errors if any
+                    if errors:
+                        with st.expander(f"⚠️ {invalid_count} URLs could not be validated", expanded=False):
+                            for err in errors:
+                                st.caption(err)
+                    
+                    # Preview table
+                    st.markdown("#### Preview (first 10 rows)")
+                    preview_df = df.head(10)[[website_col]].copy()
+                    preview_df['Status'] = preview_df[website_col].apply(
+                        lambda x: "✓ Valid" if validate_and_clean_url(str(x))[1] else "✗ Invalid"
+                    )
+                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                    
+                    # Start button
+                    st.markdown("---")
+                    
+                    if len(valid_urls) == 0:
+                        st.error("No valid URLs found. Please check your CSV file.")
+                    else:
+                        col_start, col_space = st.columns([2, 3])
+                        with col_start:
+                            if st.button("🚀 Start Bulk Scan", type="primary", use_container_width=True):
+                                # Create session
+                                session_id = create_bulk_scan_session(valid_urls)
+                                
+                                if session_id:
+                                    st.session_state['bulk_scan_session_id'] = session_id
+                                    st.session_state['bulk_scan_active'] = True
+                                    
+                                    st.success(f"✅ Scan started! Processing {len(valid_urls)} websites...")
+                                    st.markdown("""
+                                    <div class="processing-indicator">
+                                        🔄 <strong>Scan in Progress</strong> — You can navigate to other pages. Progress will continue in the background.
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                    
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to create scan session. Please try again.")
+                        
+                        with col_space:
+                            st.caption("Scanning will run in the background. Results are saved automatically.")
+                            
+            except Exception as e:
+                logger.error(f"Error reading CSV: {e}")
+                st.error(f"Error reading CSV file: {str(e)}")
+        
+        else:
+            # Empty state
+            st.markdown("""
+            <div class="empty-state">
+                <h3>📋 No File Uploaded</h3>
+                <p>Upload your lead list and let Code Nest do the heavy lifting.<br>
+                We'll analyze each website and generate actionable insights.</p>
+            </div>
+            """, unsafe_allow_html=True)
     
+    # =========================================================================
+    # TAB 2: ACTIVE SESSIONS
+    # =========================================================================
     with tab2:
-        st.subheader("Active Scanning Sessions")
+        st.markdown("### Your Scanning Sessions")
+        
+        # Refresh button
+        col_refresh, col_space = st.columns([1, 4])
+        with col_refresh:
+            if st.button("🔄 Refresh", key="refresh_sessions"):
+                st.rerun()
+        
         sessions = get_bulk_scan_sessions(limit=20)
         
         if not sessions:
-            st.info("No active sessions")
+            st.markdown("""
+            <div class="empty-state">
+                <h3>📭 No Sessions Yet</h3>
+                <p>Start a new bulk scan to see your sessions here.<br>
+                Sessions are saved automatically and persist across page reloads.</p>
+            </div>
+            """, unsafe_allow_html=True)
         else:
             for session in sessions:
+                progress_pct = (session.processed_urls / session.total_urls * 100) if session.total_urls > 0 else 0
+                
+                # Session container
                 with st.container(border=True):
-                    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+                    # Header row
+                    col1, col2, col3 = st.columns([3, 1, 2])
                     
                     with col1:
-                        progress_pct = (session.processed_urls / session.total_urls * 100) if session.total_urls > 0 else 0
-                        st.write(f"**Session:** {session.session_id[:12]}...")
-                        st.write(f"**Status:** {session.status.upper()}")
+                        # Status badge
+                        status_map = {
+                            "running": ("🟢 Running", "status-running"),
+                            "paused": ("⏸️ Paused", "status-paused"),
+                            "completed": ("✅ Completed", "status-completed"),
+                            "stopped": ("🔴 Stopped", "status-stopped")
+                        }
+                        status_text, status_class = status_map.get(session.status, ("Unknown", ""))
+                        st.markdown(f"**{status_text}** • Session `{session.session_id[:8]}...`")
+                        
+                        # Progress bar
                         st.progress(progress_pct / 100)
-                        st.write(f"{session.processed_urls}/{session.total_urls} completed ({progress_pct:.0f}%)")
+                        st.caption(f"{session.processed_urls} of {session.total_urls} URLs processed ({progress_pct:.1f}%)")
                     
                     with col2:
-                        st.metric("Total URLs", session.total_urls)
+                        success_count = len([v for v in (session.results or {}).values() if v]) if session.results else 0
+                        fail_count = session.processed_urls - success_count
+                        st.metric("✓ Success", success_count)
+                        if fail_count > 0:
+                            st.caption(f"✗ {fail_count} failed")
                     
                     with col3:
-                        st.metric("Processed", session.processed_urls)
-                    
-                    with col4:
-                        st.write("")  # Spacing
-                        col_btn1, col_btn2, col_btn3 = st.columns(3)
-                        
-                        with col_btn1:
-                            if session.status == "running":
-                                if st.button("⏸️ Pause", key=f"pause_{session.id}"):
+                        # Action buttons based on status
+                        if session.status == "running":
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                if st.button("⏸️ Pause", key=f"pause_{session.id}", use_container_width=True):
                                     pause_bulk_scan(session.session_id, session.processed_urls)
+                                    # Clear active flag if this is the active session
+                                    if st.session_state.get('bulk_scan_session_id') == session.session_id:
+                                        st.session_state.pop('bulk_scan_active', None)
                                     st.rerun()
-                            elif session.status == "paused":
-                                if st.button("▶️ Resume", key=f"resume_{session.id}"):
-                                    resume_bulk_scan(session.session_id)
+                            with c2:
+                                if st.button("⏹️ Stop", key=f"stop_{session.id}", use_container_width=True):
+                                    stop_bulk_scan(session.session_id)
+                                    if st.session_state.get('bulk_scan_session_id') == session.session_id:
+                                        st.session_state.pop('bulk_scan_session_id', None)
+                                        st.session_state.pop('bulk_scan_active', None)
                                     st.rerun()
                         
-                        with col_btn2:
-                            if session.status != "stopped" and session.status != "completed":
-                                if st.button("⏹️ Stop", key=f"stop_{session.id}"):
+                        elif session.status == "paused":
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                if st.button("▶️ Resume", key=f"resume_{session.id}", use_container_width=True):
+                                    resume_bulk_scan(session.session_id)
+                                    st.session_state['bulk_scan_session_id'] = session.session_id
+                                    st.session_state['bulk_scan_active'] = True
+                                    st.rerun()
+                            with c2:
+                                if st.button("⏹️ Stop", key=f"stop2_{session.id}", use_container_width=True):
                                     stop_bulk_scan(session.session_id)
                                     st.rerun()
                         
-                        with col_btn3:
-                            if session.status == "completed":
-                                if st.button("📥 Export", key=f"export_{session.id}"):
-                                    # Create CSV export of results
-                                    results_list = []
-                                    db = get_db()
-                                    for url, audit_id in session.results.items():
-                                        audit = db.query(Audit).filter(Audit.id == audit_id).first()
-                                        if audit:
-                                            results_list.append({
-                                                "Website": url,
-                                                "Health Score": audit.health_score,
-                                                "Speed": audit.psi_score or "N/A",
-                                                "Issues": len(audit.issues) if audit.issues else 0,
-                                                "Tech": ", ".join(audit.tech_stack[:3]) if audit.tech_stack else "Standard",
-                                                "Email": ", ".join(audit.emails_found) if audit.emails_found else "N/A"
-                                            })
-                                    
-                                    if results_list:
-                                        res_df = pd.DataFrame(results_list)
-                                        csv = res_df.to_csv(index=False).encode('utf-8')
-                                        st.download_button(
-                                            "📥 Download CSV",
-                                            csv,
-                                            f"scan_{session.session_id[:8]}.csv",
-                                            "text/csv"
-                                        )
+                        elif session.status == "completed":
+                            # Export button
+                            csv_data = export_bulk_scan_results(session.session_id)
+                            if csv_data:
+                                st.download_button(
+                                    "📥 Download Results",
+                                    csv_data,
+                                    f"bulk_scan_{session.session_id[:8]}.csv",
+                                    "text/csv",
+                                    key=f"download_{session.id}",
+                                    use_container_width=True
+                                )
+                        
+                        elif session.status == "stopped":
+                            st.caption("Scan was stopped")
                     
-                    # Show recently scanned URLs
-                    if session.results:
-                        st.write("**Recently scanned:**")
-                        recent_urls = list(session.results.keys())[-5:]
-                        for url in recent_urls:
-                            st.write(f"  ✓ {url}")
+                    # Recently scanned URLs (expandable)
+                    if session.results and len(session.results) > 0:
+                        with st.expander(f"📋 View scanned URLs ({len(session.results)})", expanded=False):
+                            cols = st.columns(2)
+                            urls_list = list(session.results.items())[-20:]  # Last 20
+                            for idx, (url, audit_id) in enumerate(urls_list):
+                                with cols[idx % 2]:
+                                    icon = "✅" if audit_id else "❌"
+                                    # Truncate long URLs
+                                    display_url = url[:50] + "..." if len(url) > 50 else url
+                                    st.caption(f"{icon} {display_url}")
     
-    # Background processing logic (runs every page load)
-    if 'bulk_scan_session_id' in st.session_state:
+    # =========================================================================
+    # BACKGROUND PROCESSING LOGIC (FIXED - RUNS ON EVERY PAGE LOAD)
+    # =========================================================================
+    
+    if st.session_state.get('bulk_scan_active') and st.session_state.get('bulk_scan_session_id'):
         session_id = st.session_state['bulk_scan_session_id']
-        session = get_bulk_scan_session(session_id)
         
-        if session and session.status == "running":
-            urls = session.urls
-            start_idx = session.paused_at_index
+        # Get fresh session data with open DB connection
+        db = get_db()
+        if not db:
+            st.error("Database unavailable")
+            st.session_state.pop('bulk_scan_active', None)
+            return
+        
+        try:
+            session = db.query(BulkScan).filter(BulkScan.session_id == session_id).first()
             
-            # Process URLs from the resume point
-            for i in range(start_idx, min(start_idx + 1, len(urls))):  # Process one URL per page load
-                url = urls[i]
+            if not session:
+                logger.warning(f"Bulk scan session not found: {session_id}")
+                st.session_state.pop('bulk_scan_session_id', None)
+                st.session_state.pop('bulk_scan_active', None)
+                db.close()
+                return
+            
+            # Check if paused/stopped externally
+            if session.status != "running":
+                st.session_state.pop('bulk_scan_active', None)
+                db.close()
+                return
+            
+            urls = session.urls
+            current_idx = session.processed_urls  # FIX: Use processed_urls as current index
+            results = dict(session.results) if session.results else {}
+            
+            # Check if all done
+            if current_idx >= len(urls):
+                session.status = "completed"
+                session.updated_at = datetime.utcnow()
+                db.commit()
+                db.close()
+                
+                st.session_state.pop('bulk_scan_session_id', None)
+                st.session_state.pop('bulk_scan_active', None)
+                
+                st.success("🎉 Bulk scan completed!")
+                st.balloons()
+                return
+            
+            # Get current URL
+            url = urls[current_idx]
+            
+            # Show processing indicator
+            st.markdown(f"""
+            <div class="processing-indicator">
+                🔄 <strong>Processing ({current_idx + 1}/{len(urls)})</strong>: {url[:60]}{'...' if len(url) > 60 else ''}
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Process ONE URL with safe runner
+            audit_id, success, error = run_bulk_audit_safe(
+                url,
+                st.session_state.get('OPENAI_API_KEY', ''),
+                st.session_state.get('GOOGLE_API_KEY', '')
+            )
+            
+            # Store result (even if failed)
+            results[url] = audit_id
+            
+            # Update session in database (keeping connection open)
+            session.processed_urls = current_idx + 1
+            session.results = results
+            session.paused_at_index = current_idx + 1  # FIX: Update resume point
+            session.updated_at = datetime.utcnow()
+            
+            # Check if completed
+            if current_idx + 1 >= len(urls):
+                session.status = "completed"
+                st.session_state.pop('bulk_scan_session_id', None)
+                st.session_state.pop('bulk_scan_active', None)
+                logger.info(f"Bulk scan completed: {session_id[:8]}...")
+            
+            db.commit()
+            db.close()
+            
+            # Rate limiting
+            time.sleep(BULK_SCAN_DELAY_SECONDS)
+            
+            # FIX: Trigger next URL processing via rerun
+            if st.session_state.get('bulk_scan_active'):
+                st.rerun()
+                
+        except Exception as e:
+            logger.error(f"Bulk scan processing error: {str(e)}")
+            if db:
                 try:
-                    # Run audit
-                    audit_data = run_audit(url, st.session_state.OPENAI_API_KEY, st.session_state.GOOGLE_API_KEY)
-                    audit_id = save_audit_to_db(audit_data)
-                    
-                    # Update session results
-                    if audit_id:
-                        session.results[url] = audit_id
-                        session.processed_urls = i + 1
-                        
-                        # Update database
-                        update_bulk_scan_progress(session_id, i + 1, session.results)
-                        
-                        if i + 1 >= len(urls):
-                            # All done!
-                            complete_bulk_scan(session_id)
-                            del st.session_state['bulk_scan_session_id']
-                except Exception as e:
-                    logger.error(f"Error processing {url}: {e}")
-                    session.processed_urls = i + 1
-                    update_bulk_scan_progress(session_id, i + 1, session.results)
+                    db.rollback()
+                    db.close()
+                except:
+                    pass
+            # Don't stop the whole process - just log and continue
+            st.session_state['bulk_scan_error_count'] = st.session_state.get('bulk_scan_error_count', 0) + 1
+            
+            if st.session_state.get('bulk_scan_error_count', 0) >= BULK_SCAN_MAX_ERRORS:
+                st.error("Too many consecutive errors. Scan paused.")
+                st.session_state.pop('bulk_scan_active', None)
+            else:
+                time.sleep(1)
+                st.rerun()
 
 def show_audit_history():
     """Audit history page for all users - with pagination and user-based filtering.
