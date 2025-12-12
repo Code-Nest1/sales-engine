@@ -24,7 +24,7 @@ class Audit(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     url = Column(String(500), nullable=False)
-    domain = Column(String(255), nullable=False)
+    domain = Column(String(255), nullable=False, index=True)  # Added index for faster lookups
     health_score = Column(Integer, default=100)
     psi_score = Column(Integer, nullable=True)
     domain_age = Column(String(100), nullable=True)
@@ -35,7 +35,10 @@ class Audit(Base):
     ai_impact = Column(Text, nullable=True)
     ai_solutions = Column(Text, nullable=True)
     ai_email = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)  # Added index for date filtering
+    
+    # User tracking - associates audit with user who created it
+    username = Column(String(150), nullable=True, index=True)  # Username of creator (nullable for backwards compat)
     
     # For competitor analysis grouping
     comparison_group = Column(String(100), nullable=True)
@@ -123,8 +126,50 @@ def init_db():
         # Migrate existing tables to add missing columns
         migrate_leads_table()
         migrate_users_table()
+        migrate_audits_table()
         return True
     return False
+
+def migrate_audits_table():
+    """Add username column to audits table if it doesn't exist (for user tracking)."""
+    if not engine:
+        return
+    
+    inspector = __import__('sqlalchemy').inspect(engine)
+    if 'audits' not in inspector.get_table_names():
+        return
+    
+    audits_columns = [c['name'] for c in inspector.get_columns('audits')]
+    
+    with engine.connect() as conn:
+        # Add username column for user tracking
+        if 'username' not in audits_columns:
+            try:
+                conn.execute(__import__('sqlalchemy').text('ALTER TABLE audits ADD COLUMN username VARCHAR(150)'))
+                conn.commit()
+            except Exception:
+                pass
+        
+        # Create index on username for faster queries (SQLite syntax)
+        try:
+            conn.execute(__import__('sqlalchemy').text('CREATE INDEX IF NOT EXISTS ix_audits_username ON audits (username)'))
+            conn.commit()
+        except Exception:
+            pass
+        
+        # Create index on domain for faster queries
+        try:
+            conn.execute(__import__('sqlalchemy').text('CREATE INDEX IF NOT EXISTS ix_audits_domain ON audits (domain)'))
+            conn.commit()
+        except Exception:
+            pass
+        
+        # Create index on created_at for faster date filtering
+        try:
+            conn.execute(__import__('sqlalchemy').text('CREATE INDEX IF NOT EXISTS ix_audits_created_at ON audits (created_at)'))
+            conn.commit()
+        except Exception:
+            pass
 
 def migrate_users_table():
     """Add api_keys and api_keys_updated_at columns to users table if they don't exist."""
