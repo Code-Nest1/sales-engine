@@ -3678,6 +3678,12 @@ def show_audit_history():
     
     st.markdown('<div class="sticky-bar">', unsafe_allow_html=True)
     
+    # Clear Filters button - MUST be rendered BEFORE filter widgets to avoid StreamlitAPIException
+    col_clear, col_spacer = st.columns([1, 7])
+    with col_clear:
+        if st.button("✖️ Clear All Filters", key="clear_all_filters_btn", help="Reset all filters to default"):
+            clear_audit_history_filters()
+    
     # Initialize date variables
     selected_date = None
     date_from = None
@@ -3708,19 +3714,13 @@ def show_audit_history():
                                       help="Unchecked: shows only most recent scan per domain. Checked: all historical scans.")
     
     # Search and score filters row
-    col1, col2, col3, col4 = st.columns([2, 1, 1, 0.5])
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         search = st.text_input("🔍 Search domain", key="hist_search", help="Filter audits by domain name")
     with col2:
         min_score = st.number_input("Min Score", 0, 100, 0, help="Show audits with score above this value")
     with col3:
         max_score = st.number_input("Max Score", 0, 100, 100, help="Show audits with score below this value")
-    with col4:
-        # Clear filters button
-        st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
-        if st.button("✖️", key="clear_filters_btn", help="Clear all filters"):
-            st.session_state.hist_search = ""
-            st.rerun()
     
     # Show active filters as chips
     active_filters = []
@@ -6436,6 +6436,26 @@ def invalidate_audit_cache():
         get_audit_history_cached.clear()
     except Exception:
         pass  # Cache might not exist yet
+
+
+# Filter keys used in Audit History page
+AUDIT_HISTORY_FILTER_KEYS = [
+    "hist_search", "min_score", "max_score", "time_filter",
+    "hist_calendar_date", "hist_date_from", "hist_date_to",
+    "show_all_scans", "audit_history_page"
+]
+
+
+def clear_audit_history_filters():
+    """Safely clear all audit history filters by popping widget keys.
+    
+    This avoids StreamlitAPIException by using pop() instead of direct assignment.
+    Must be called BEFORE filter widgets are rendered.
+    """
+    for key in AUDIT_HISTORY_FILTER_KEYS:
+        st.session_state.pop(key, None)
+    st.rerun()
+
 
 # ============================================================================
 # AUDIT HISTORY - DATABASE FUNCTIONS (FIXED)
