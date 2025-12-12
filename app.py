@@ -1628,7 +1628,8 @@ TWO_FA_PATH = Path(__file__).parent / "two_fa.json"
 SESSIONS_PATH = Path(__file__).parent / "sessions.json"
 LOGIN_ATTEMPTS_PATH = Path(__file__).parent / "login_attempts.json"
 ENCRYPTION_KEY_PATH = Path(__file__).parent / ".encryption_key"
-SESSION_TIMEOUT_HOURS = 168  # 7 days
+SESSION_MAX_LIFETIME_HOURS = 168  # 7 days max session lifetime
+SESSION_IDLE_TIMEOUT_MINUTES = 60  # 1 hour idle timeout - user logged out after 1 hour of inactivity
 LOGIN_ATTEMPT_LIMIT = 5
 LOGIN_ATTEMPT_WINDOW_MINUTES = 5
 
@@ -1742,27 +1743,50 @@ def create_session(username: str, role: str) -> str:
     return session_token
 
 def validate_session(session_token: str) -> dict:
-    """Validate session token and return user info if valid. Checks for timeout."""
+    """Validate session token and return user info if valid. Checks for idle timeout and max lifetime."""
+    logger = logging.getLogger("sales_engine")
     sessions = load_sessions()
     
-    if session_token in sessions:
-        session_data = sessions[session_token]
-        
-        # Check if session has expired
+    if session_token not in sessions:
+        return None
+    
+    session_data = sessions[session_token]
+    now = datetime.now()
+    
+    try:
         created_at = datetime.fromisoformat(session_data["created_at"])
-        if datetime.now() - created_at > timedelta(hours=SESSION_TIMEOUT_HOURS):
-            # Session expired, remove it
+        # Use last_access if available, otherwise fall back to created_at
+        last_access_str = session_data.get("last_access", session_data["created_at"])
+        last_access = datetime.fromisoformat(last_access_str)
+        
+        # Check 1: Max session lifetime (7 days absolute limit)
+        if now - created_at > timedelta(hours=SESSION_MAX_LIFETIME_HOURS):
+            logger.info(f"Session expired (max lifetime): {session_data.get('username')}")
             del sessions[session_token]
             save_sessions(sessions)
             return None
         
-        # Update last access time
-        session_data["last_access"] = datetime.now().isoformat()
+        # Check 2: Idle timeout (1 hour of inactivity)
+        if now - last_access > timedelta(minutes=SESSION_IDLE_TIMEOUT_MINUTES):
+            logger.info(f"Session expired (idle timeout): {session_data.get('username')}")
+            del sessions[session_token]
+            save_sessions(sessions)
+            return None
+        
+        # Session is valid - update last access time
+        session_data["last_access"] = now.isoformat()
         sessions[session_token] = session_data
         save_sessions(sessions)
+        
+        logger.debug(f"Session validated for user: {session_data.get('username')}")
         return session_data
-    
-    return None
+        
+    except Exception as e:
+        logger.error(f"Error validating session: {str(e)}")
+        # Invalid session data, remove it
+        del sessions[session_token]
+        save_sessions(sessions)
+        return None
 
 def destroy_session(session_token: str):
     """Destroy a session."""
@@ -1825,49 +1849,79 @@ def decrypt_key(encrypted_key: str) -> str:
         return ""
 
 def get_user_api_keys(username: str) -> dict:
-    """Get API keys for a user from database."""
+    """Get API keys for a user from database. Returns dict with keys and error status."""
+    logger = logging.getLogger("sales_engine")
+    default_keys = {"openai": "", "google": "", "slack": "", "_db_error": False}
+    
+    if not username:
+        logger.warning("get_user_api_keys called with empty username")
+        return default_keys
+    
     try:
         db = get_db()
         if not db:
-            return {"openai": "", "google": "", "slack": ""}
+            logger.error(f"Database unavailable when loading API keys for {username}")
+            return {"openai": "", "google": "", "slack": "", "_db_error": True}
         
         user = db.query(User).filter(User.username == username).first()
         if not user:
-            return {"openai": "", "google": "", "slack": ""}
+            logger.warning(f"User not found in database when loading API keys: {username}")
+            db.close()
+            return default_keys
         
         api_keys = user.api_keys or {}
         # Decrypt keys when retrieving - always return all three keys
-        decrypted = {"openai": "", "google": "", "slack": ""}
+        decrypted = {"openai": "", "google": "", "slack": "", "_db_error": False}
         for key_name, encrypted_value in api_keys.items():
+            if key_name.startswith("_"):
+                continue  # Skip internal flags
             try:
-                decrypted[key_name] = decrypt_key(encrypted_value)
-            except:
+                if encrypted_value:
+                    decrypted[key_name] = decrypt_key(encrypted_value)
+            except Exception as decrypt_err:
+                logger.error(f"Failed to decrypt {key_name} for {username}: {str(decrypt_err)}")
                 decrypted[key_name] = ""
         
         db.close()
+        logger.debug(f"Loaded API keys for {username}: openai={'yes' if decrypted.get('openai') else 'no'}, google={'yes' if decrypted.get('google') else 'no'}, slack={'yes' if decrypted.get('slack') else 'no'}")
         return decrypted
     except Exception as e:
-        logger = logging.getLogger("sales_engine")
-        logger.error(f"Error loading API keys for {username}: {str(e)}")
-        return {"openai": "", "google": "", "slack": ""}
+        logger.error(f"Error loading API keys for {username}: {str(e)}", exc_info=True)
+        return {"openai": "", "google": "", "slack": "", "_db_error": True}
 
-def save_user_api_key(username: str, key_name: str, key_value: str):
-    """Save API key for a user to database (encrypted)."""
+def save_user_api_key(username: str, key_name: str, key_value: str) -> tuple:
+    """Save API key for a user to database (encrypted). Returns (success, error_message)."""
+    logger = logging.getLogger("sales_engine")
+    db = None
+    
+    if not username or not key_name:
+        logger.error("save_user_api_key called with empty username or key_name")
+        return False, "Invalid username or key name"
+    
     try:
         db = get_db()
         if not db:
-            return False
+            logger.error(f"Database unavailable when saving API key {key_name} for {username}")
+            return False, "Database connection unavailable"
         
         user = db.query(User).filter(User.username == username).first()
         if not user:
+            logger.error(f"User not found in database when saving API key: {username}")
             db.close()
-            return False
+            return False, "User not found in database"
         
+        # Initialize api_keys dict if needed
         if not user.api_keys:
             user.api_keys = {}
         
-        # Encrypt key before saving
-        user.api_keys[key_name] = encrypt_key(key_value)
+        # Encrypt key before saving (handle empty value for deletion)
+        if key_value:
+            user.api_keys[key_name] = encrypt_key(key_value)
+        else:
+            # Empty value means delete the key
+            if key_name in user.api_keys:
+                del user.api_keys[key_name]
+        
         user.api_keys_updated_at = datetime.utcnow()
         
         # Force SQLAlchemy to detect the change in JSON column
@@ -1875,14 +1929,18 @@ def save_user_api_key(username: str, key_name: str, key_value: str):
         flag_modified(user, "api_keys")
         
         db.commit()
+        logger.info(f"Successfully saved API key {key_name} for {username}")
         db.close()
-        return True
+        return True, None
     except Exception as e:
-        logger = logging.getLogger("sales_engine")
-        logger.error(f"Error saving API key for {username}: {str(e)}")
+        logger.error(f"Error saving API key {key_name} for {username}: {str(e)}", exc_info=True)
         if db:
-            db.close()
-        return False
+            try:
+                db.rollback()
+                db.close()
+            except:
+                pass
+        return False, str(e)
 
 def delete_user_api_key(username: str, key_name: str):
     """Delete API key for a user from database."""
@@ -2009,20 +2067,51 @@ def verify_2fa_token(secret: str, token: str) -> bool:
     except Exception:
         return False
 
-def reload_user_api_keys():
-    """Reload API keys from database (called after login or session restore)."""
-    if st.session_state.get("current_user"):
-        user_keys = get_user_api_keys(st.session_state.get("current_user"))
-        
-        # Check environment variables first (highest priority)
-        env_openai = os.environ.get("OPENAI_API_KEY")
-        env_google = os.environ.get("GOOGLE_API_KEY")
-        env_slack = os.environ.get("SLACK_WEBHOOK")
-        
-        # Set from env or user account (env overrides user keys)
-        st.session_state.OPENAI_API_KEY = env_openai or user_keys.get("openai", "")
-        st.session_state.GOOGLE_API_KEY = env_google or user_keys.get("google", "")
-        st.session_state.SLACK_WEBHOOK = env_slack or user_keys.get("slack", "")
+def reload_user_api_keys() -> dict:
+    """Reload API keys from database for current user. Returns status dict."""
+    logger = logging.getLogger("sales_engine")
+    current_user = st.session_state.get("current_user")
+    
+    if not current_user:
+        logger.warning("reload_user_api_keys called with no current_user")
+        return {"success": False, "error": "No user logged in"}
+    
+    logger.info(f"Reloading API keys for user: {current_user}")
+    user_keys = get_user_api_keys(current_user)
+    
+    # Check for database errors
+    db_error = user_keys.pop("_db_error", False)
+    if db_error:
+        st.session_state["_api_keys_db_error"] = True
+        logger.error(f"Database error while loading API keys for {current_user}")
+    else:
+        st.session_state["_api_keys_db_error"] = False
+    
+    # Check environment variables - ONLY use if they are non-empty strings
+    env_openai = os.environ.get("OPENAI_API_KEY", "").strip()
+    env_google = os.environ.get("GOOGLE_API_KEY", "").strip()
+    env_slack = os.environ.get("SLACK_WEBHOOK", "").strip()
+    
+    # Priority: non-empty env var > user's saved key > empty string
+    # This ensures env vars only override if they actually have a value
+    db_openai = user_keys.get("openai", "")
+    db_google = user_keys.get("google", "")
+    db_slack = user_keys.get("slack", "")
+    
+    st.session_state.OPENAI_API_KEY = env_openai if env_openai else db_openai
+    st.session_state.GOOGLE_API_KEY = env_google if env_google else db_google
+    st.session_state.SLACK_WEBHOOK = env_slack if env_slack else db_slack
+    
+    # Track which source each key came from (for debugging)
+    st.session_state["_api_key_sources"] = {
+        "openai": "env" if env_openai else ("db" if db_openai else "none"),
+        "google": "env" if env_google else ("db" if db_google else "none"),
+        "slack": "env" if env_slack else ("db" if db_slack else "none")
+    }
+    
+    logger.info(f"API keys loaded for {current_user}: openai={st.session_state['_api_key_sources']['openai']}, google={st.session_state['_api_key_sources']['google']}, slack={st.session_state['_api_key_sources']['slack']}")
+    
+    return {"success": not db_error, "error": "Database error" if db_error else None}
 
 def show_auth_page():
     """Enhanced login/signup UI with 2FA support."""
@@ -2214,34 +2303,61 @@ if not st.session_state.get("_api_keys_migrated"):
     migrate_api_keys_from_json_to_db()
     st.session_state["_api_keys_migrated"] = True
 
-# Initialize authentication state first
-if 'authenticated' not in st.session_state:
-    st.session_state['authenticated'] = False
-    st.session_state['current_user'] = None
-    st.session_state['is_admin'] = False
-    st.session_state['user_role'] = 'user'
-    st.session_state['2fa_pending'] = False
-    st.session_state['2fa_username'] = None
+# --- SESSION RESTORATION LOGIC ---
+# Try to restore session BEFORE initializing auth state to prevent logout on refresh
+# Priority: 1) st.session_state['session_token'], 2) st.query_params['session_token']
 
-# --- Try to restore session from query params ---
-query_params = st.query_params
-if 'session_token' in query_params:
-    try:
-        token = query_params['session_token'][0]
-        session_info = validate_session(token)
-        if session_info:
-            st.session_state['session_token'] = token
-            st.session_state['authenticated'] = True
-            st.session_state['current_user'] = session_info['username']
-            st.session_state['is_admin'] = session_info['role'] == 'admin'
-            st.session_state['user_role'] = session_info['role']
-            st.session_state['2fa_pending'] = False
-            st.session_state['2fa_username'] = None
-            
-            # Reload API keys from user account after session restore
-            reload_user_api_keys()
-    except Exception as e:
-        pass  # Session token invalid or expired, continue to login page
+def restore_session_from_token(token: str) -> bool:
+    """Attempt to restore session from a token. Returns True if successful."""
+    logger = logging.getLogger("sales_engine")
+    if not token:
+        return False
+    
+    session_info = validate_session(token)
+    if session_info:
+        logger.info(f"Session restored for user: {session_info['username']}")
+        st.session_state['session_token'] = token
+        st.session_state['authenticated'] = True
+        st.session_state['current_user'] = session_info['username']
+        st.session_state['is_admin'] = session_info['role'] == 'admin'
+        st.session_state['user_role'] = session_info['role']
+        st.session_state['2fa_pending'] = False
+        st.session_state['2fa_username'] = None
+        
+        # Reload API keys from user account after session restore
+        reload_user_api_keys()
+        return True
+    else:
+        logger.debug(f"Session token invalid or expired")
+        return False
+
+# Step 1: Try to restore from existing session_state token
+session_restored = False
+if st.session_state.get('session_token'):
+    session_restored = restore_session_from_token(st.session_state['session_token'])
+
+# Step 2: If not restored, try from query params
+if not session_restored:
+    query_params = st.query_params
+    if 'session_token' in query_params:
+        try:
+            # st.query_params returns string directly, not a list
+            token = query_params.get('session_token', '')
+            if isinstance(token, list):
+                token = token[0] if token else ''
+            session_restored = restore_session_from_token(token)
+        except Exception as e:
+            logging.getLogger("sales_engine").error(f"Error restoring session from query params: {str(e)}")
+
+# Step 3: Only initialize default auth state if session was NOT restored
+if not session_restored:
+    if 'authenticated' not in st.session_state:
+        st.session_state['authenticated'] = False
+        st.session_state['current_user'] = None
+        st.session_state['is_admin'] = False
+        st.session_state['user_role'] = 'user'
+        st.session_state['2fa_pending'] = False
+        st.session_state['2fa_username'] = None
 
 # Check authentication
 if not st.session_state.get('authenticated'):
@@ -2257,31 +2373,29 @@ if 'current_section' not in st.session_state:
     st.session_state.current_section = 'Single Audit'
 
 # Store API keys in session state (from session or temporary input)
-# IMPORTANT: Always reload from database if user is logged in to ensure fresh data
+# IMPORTANT: Use the centralized reload_user_api_keys() function for consistency
+# This ensures proper env var handling and per-user isolation
 
-if st.session_state.get("current_user"):
-    # User is logged in - always reload from database to ensure we have latest keys
-    user_keys = get_user_api_keys(st.session_state.get("current_user"))
-    
-    # Check environment variables first (highest priority)
-    env_openai = os.environ.get("OPENAI_API_KEY")
-    env_google = os.environ.get("GOOGLE_API_KEY")
-    env_slack = os.environ.get("SLACK_WEBHOOK")
-    
-    # Set from env or user account (env overrides user keys)
-    st.session_state.OPENAI_API_KEY = env_openai or user_keys.get("openai", "")
-    st.session_state.GOOGLE_API_KEY = env_google or user_keys.get("google", "")
-    st.session_state.SLACK_WEBHOOK = env_slack or user_keys.get("slack", "")
+if st.session_state.get("current_user") and st.session_state.get("authenticated"):
+    # User is logged in - reload keys using the centralized function
+    # This only reloads if keys haven't been loaded yet this session run
+    if not st.session_state.get("_api_keys_loaded_this_run"):
+        reload_user_api_keys()
+        st.session_state["_api_keys_loaded_this_run"] = True
 else:
     # User is not logged in - initialize from environment variables only
     if 'OPENAI_API_KEY' not in st.session_state:
-        st.session_state.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+        st.session_state.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
     
     if 'GOOGLE_API_KEY' not in st.session_state:
-        st.session_state.GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+        st.session_state.GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
     
     if 'SLACK_WEBHOOK' not in st.session_state:
-        st.session_state.SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "")
+        st.session_state.SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "").strip()
+
+# Reset the per-run flag at start of each run (for next rerun)
+# This is placed here to ensure it's reset after keys are loaded
+st.session_state["_api_keys_loaded_this_run"] = False
 
 # Get current API keys from session
 OPENAI_API_KEY = st.session_state.OPENAI_API_KEY
@@ -2400,6 +2514,12 @@ def show_api_settings():
     # Get current user's API keys
     current_keys = get_user_api_keys(username)
     
+    # Check for database errors and show warning
+    db_error = current_keys.pop("_db_error", False)
+    if db_error:
+        st.error("⚠️ Could not load your API keys from the database. Please check your connection and try again.")
+        st.info("Your keys may still be saved - this could be a temporary connection issue.")
+    
     # Custom CSS for API settings cards
     st.markdown("""
     <style>
@@ -2511,11 +2631,14 @@ def show_api_settings():
                 with col_save:
                     if st.button("✅ Save OpenAI Key", key="save_openai_btn", use_container_width=True):
                         if new_openai_key:
-                            save_user_api_key(username, "openai", new_openai_key)
-                            st.session_state.OPENAI_API_KEY = new_openai_key
-                            st.success("✓ OpenAI key saved securely and loaded into session")
-                            st.session_state.edit_openai = False
-                            st.rerun()
+                            success, error = save_user_api_key(username, "openai", new_openai_key)
+                            if success:
+                                st.session_state.OPENAI_API_KEY = new_openai_key
+                                st.success("✓ OpenAI key saved securely and loaded into session")
+                                st.session_state.edit_openai = False
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to save key: {error or 'Unknown error'}")
                         else:
                             st.error("Please enter an API key")
                 
@@ -2595,11 +2718,14 @@ def show_api_settings():
                 with col_save:
                     if st.button("✅ Save Google Key", key="save_google_btn", use_container_width=True):
                         if new_google_key:
-                            save_user_api_key(username, "google", new_google_key)
-                            st.session_state.GOOGLE_API_KEY = new_google_key
-                            st.success("✓ Google key saved securely and loaded into session")
-                            st.session_state.edit_google = False
-                            st.rerun()
+                            success, error = save_user_api_key(username, "google", new_google_key)
+                            if success:
+                                st.session_state.GOOGLE_API_KEY = new_google_key
+                                st.success("✓ Google key saved securely and loaded into session")
+                                st.session_state.edit_google = False
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to save key: {error or 'Unknown error'}")
                         else:
                             st.error("Please enter an API key")
                 
@@ -2679,11 +2805,14 @@ def show_api_settings():
                 with col_save:
                     if st.button("✅ Save Slack URL", key="save_slack_btn", use_container_width=True):
                         if new_slack_key:
-                            save_user_api_key(username, "slack", new_slack_key)
-                            st.session_state.SLACK_WEBHOOK = new_slack_key
-                            st.success("✓ Slack webhook saved securely and loaded into session")
-                            st.session_state.edit_slack = False
-                            st.rerun()
+                            success, error = save_user_api_key(username, "slack", new_slack_key)
+                            if success:
+                                st.session_state.SLACK_WEBHOOK = new_slack_key
+                                st.success("✓ Slack webhook saved securely and loaded into session")
+                                st.session_state.edit_slack = False
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to save webhook: {error or 'Unknown error'}")
                         else:
                             st.error("Please enter a webhook URL")
                 
