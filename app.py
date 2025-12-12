@@ -1642,8 +1642,478 @@ LOGIN_ATTEMPTS_PATH = Path(__file__).parent / "login_attempts.json"
 ENCRYPTION_KEY_PATH = Path(__file__).parent / ".encryption_key"
 SESSION_MAX_LIFETIME_HOURS = 168  # 7 days max session lifetime
 SESSION_IDLE_TIMEOUT_MINUTES = 60  # 1 hour idle timeout - user logged out after 1 hour of inactivity
+TOKEN_EXPIRES_SECONDS = 3600  # 1 hour login token expiry
 LOGIN_ATTEMPT_LIMIT = 5
 LOGIN_ATTEMPT_WINDOW_MINUTES = 5
+
+# Cookie name for persistent auth
+AUTH_COOKIE_NAME = "codenest_auth"
+
+
+# ============================================================================
+# CENTRALIZED SESSION INITIALIZATION (MUST RUN FIRST)
+# ============================================================================
+
+def init_app_session():
+    """
+    Initializes all persistent session variables.
+    This function MUST run before any page rendering.
+    Should never reset values once set.
+    
+    This is the single source of truth for session state initialization.
+    All session keys are defined here with their default values.
+    Keys are only set if they don't already exist, preserving existing values.
+    """
+    logger = logging.getLogger("sales_engine")
+    
+    # -------------------------------------------------------------------------
+    # AUTHENTICATION STATE (critical - never overwrite if set)
+    # -------------------------------------------------------------------------
+    if 'user_authenticated' not in st.session_state:
+        st.session_state.user_authenticated = False
+    
+    if 'user_role' not in st.session_state:
+        st.session_state.user_role = "user"
+    
+    if 'user_email' not in st.session_state:
+        st.session_state.user_email = None
+    
+    if 'current_user' not in st.session_state:
+        st.session_state.current_user = None
+    
+    if 'is_admin' not in st.session_state:
+        st.session_state.is_admin = False
+    
+    # Legacy compatibility - map authenticated to user_authenticated
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = st.session_state.user_authenticated
+    
+    # -------------------------------------------------------------------------
+    # LOGIN TOKEN STATE (for persistent sessions)
+    # -------------------------------------------------------------------------
+    if 'LOGIN_TOKEN' not in st.session_state:
+        st.session_state.LOGIN_TOKEN = None
+    
+    if 'TOKEN_CREATED_AT' not in st.session_state:
+        st.session_state.TOKEN_CREATED_AT = None
+    
+    if 'session_token' not in st.session_state:
+        st.session_state.session_token = None
+    
+    # -------------------------------------------------------------------------
+    # API KEYS (CRITICAL - never overwrite if set, even on logout)
+    # -------------------------------------------------------------------------
+    if 'OPENAI_API_KEY' not in st.session_state:
+        st.session_state.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+    
+    if 'GOOGLE_API_KEY' not in st.session_state:
+        st.session_state.GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
+    
+    if 'SLACK_WEBHOOK' not in st.session_state:
+        st.session_state.SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "").strip()
+    
+    # -------------------------------------------------------------------------
+    # 2FA STATE
+    # -------------------------------------------------------------------------
+    if '2fa_pending' not in st.session_state:
+        st.session_state['2fa_pending'] = False
+    
+    if '2fa_username' not in st.session_state:
+        st.session_state['2fa_username'] = None
+    
+    # -------------------------------------------------------------------------
+    # NAVIGATION STATE
+    # -------------------------------------------------------------------------
+    if 'current_section' not in st.session_state:
+        st.session_state.current_section = 'Single Audit'
+    
+    # -------------------------------------------------------------------------
+    # AUDIT/CRM DATA STATE (preserve across login/logout)
+    # -------------------------------------------------------------------------
+    if 'current_audit_data' not in st.session_state:
+        st.session_state.current_audit_data = None
+    
+    if 'audit_bulk_selected' not in st.session_state:
+        st.session_state.audit_bulk_selected = set()
+    
+    if 'bulk_scan_active' not in st.session_state:
+        st.session_state.bulk_scan_active = False
+    
+    if 'bulk_scan_session_id' not in st.session_state:
+        st.session_state.bulk_scan_session_id = None
+    
+    # -------------------------------------------------------------------------
+    # INTERNAL FLAGS (tracking state)
+    # -------------------------------------------------------------------------
+    if '_api_keys_loaded_this_run' not in st.session_state:
+        st.session_state._api_keys_loaded_this_run = False
+    
+    if '_api_keys_migrated' not in st.session_state:
+        st.session_state._api_keys_migrated = False
+    
+    if '_session_initialized' not in st.session_state:
+        st.session_state._session_initialized = True
+        logger.debug("Session state initialized for first time")
+
+
+def save_login_state(username: str, role: str, email: str = None) -> str:
+    """
+    Saves login state and creates persistent session.
+    
+    This should:
+    - Generate a secure login token (uuid4)
+    - Save LOGIN_TOKEN
+    - Save TOKEN_CREATED_AT
+    - Save user email + role
+    - Create persistent cookie (via session file - Streamlit doesn't have native cookies)
+    - Never clear API keys automatically
+    
+    Args:
+        username: The authenticated username
+        role: User role ("admin" or "user")
+        email: Optional user email
+    
+    Returns:
+        The generated session token
+    """
+    import uuid
+    logger = logging.getLogger("sales_engine")
+    
+    # Generate secure login token
+    login_token = uuid.uuid4().hex
+    token_created_at = datetime.now()
+    
+    # Save to session state (memory)
+    st.session_state.LOGIN_TOKEN = login_token
+    st.session_state.TOKEN_CREATED_AT = token_created_at.isoformat()
+    st.session_state.user_authenticated = True
+    st.session_state.authenticated = True  # Legacy compatibility
+    st.session_state.current_user = username
+    st.session_state.user_email = email
+    st.session_state.user_role = role
+    st.session_state.is_admin = (role == "admin")
+    st.session_state['2fa_pending'] = False
+    st.session_state['2fa_username'] = None
+    
+    # Create persistent session (file-based for Streamlit)
+    sessions = load_sessions()
+    sessions[login_token] = {
+        "username": username,
+        "role": role,
+        "email": email,
+        "created_at": token_created_at.isoformat(),
+        "last_access": token_created_at.isoformat(),
+        "expires_at": (token_created_at + timedelta(seconds=TOKEN_EXPIRES_SECONDS)).isoformat()
+    }
+    save_sessions(sessions)
+    
+    # Store token in session_state for URL persistence
+    st.session_state.session_token = login_token
+    
+    # Set query parameter for URL persistence (Streamlit's cookie alternative)
+    try:
+        st.query_params['session_token'] = login_token
+    except Exception as e:
+        logger.warning(f"Could not set query params: {e}")
+    
+    logger.info(f"Login state saved for user: {username}, role: {role}")
+    
+    # DO NOT clear or modify API keys here - they should persist
+    
+    return login_token
+
+
+def load_login_state() -> bool:
+    """
+    Loads and validates login state from persistent storage.
+    
+    This should:
+    - Read session token from session_state or query params
+    - If token missing → return NOT logged in
+    - Compare TOKEN_CREATED_AT with TOKEN_EXPIRES_SECONDS
+    - If expired → clear session + cookie
+    - If valid → restore user email + role + authenticated state
+    - Must NOT reset API keys or delete user data
+    
+    Returns:
+        True if user is logged in and session is valid, False otherwise
+    """
+    logger = logging.getLogger("sales_engine")
+    
+    # Priority 1: Check session_state for existing valid session
+    if st.session_state.get('user_authenticated') and st.session_state.get('current_user'):
+        # Validate the session token is still valid
+        token = st.session_state.get('session_token') or st.session_state.get('LOGIN_TOKEN')
+        if token:
+            session_info = validate_session(token)
+            if session_info:
+                # Session still valid, update last access
+                logger.debug(f"Session valid for user: {st.session_state.current_user}")
+                return True
+            else:
+                # Session expired, but don't clear API keys
+                logger.info(f"Session expired for user: {st.session_state.current_user}")
+                _clear_auth_state_only()
+                return False
+        else:
+            # No token but authenticated - trust session state
+            return True
+    
+    # Priority 2: Try to restore from session_state token
+    token = st.session_state.get('session_token') or st.session_state.get('LOGIN_TOKEN')
+    if token:
+        if _restore_from_token(token):
+            return True
+    
+    # Priority 3: Try to restore from query params
+    try:
+        query_params = st.query_params
+        if 'session_token' in query_params:
+            token = query_params.get('session_token', '')
+            if isinstance(token, list):
+                token = token[0] if token else ''
+            if token and _restore_from_token(token):
+                return True
+    except Exception as e:
+        logger.warning(f"Error reading query params: {e}")
+    
+    # No valid session found
+    return False
+
+
+def _restore_from_token(token: str) -> bool:
+    """Internal helper to restore session from token."""
+    logger = logging.getLogger("sales_engine")
+    
+    if not token:
+        return False
+    
+    session_info = validate_session(token)
+    if not session_info:
+        logger.debug(f"Token validation failed: {token[:8]}...")
+        return False
+    
+    # Restore session state from validated token
+    st.session_state.session_token = token
+    st.session_state.LOGIN_TOKEN = token
+    st.session_state.TOKEN_CREATED_AT = session_info.get('created_at')
+    st.session_state.user_authenticated = True
+    st.session_state.authenticated = True  # Legacy
+    st.session_state.current_user = session_info['username']
+    st.session_state.user_email = session_info.get('email')
+    st.session_state.user_role = session_info['role']
+    st.session_state.is_admin = (session_info['role'] == 'admin')
+    st.session_state['2fa_pending'] = False
+    st.session_state['2fa_username'] = None
+    
+    logger.info(f"Session restored from token for user: {session_info['username']}")
+    
+    # Reload API keys for user (from database, preserving existing if any)
+    reload_user_api_keys()
+    
+    return True
+
+
+def _clear_auth_state_only():
+    """Clear only authentication state, preserving API keys and other data."""
+    logger = logging.getLogger("sales_engine")
+    
+    # Get current user for logging
+    current_user = st.session_state.get('current_user', 'unknown')
+    
+    # Clear ONLY auth-related keys using pop (safe removal)
+    st.session_state.pop('user_authenticated', None)
+    st.session_state.pop('authenticated', None)
+    st.session_state.pop('current_user', None)
+    st.session_state.pop('user_email', None)
+    st.session_state.pop('user_role', None)
+    st.session_state.pop('is_admin', None)
+    st.session_state.pop('session_token', None)
+    st.session_state.pop('LOGIN_TOKEN', None)
+    st.session_state.pop('TOKEN_CREATED_AT', None)
+    st.session_state.pop('2fa_pending', None)
+    st.session_state.pop('2fa_username', None)
+    
+    # Clear query params token
+    try:
+        if 'session_token' in st.query_params:
+            del st.query_params['session_token']
+    except Exception:
+        pass
+    
+    logger.debug(f"Auth state cleared for user: {current_user}")
+    
+    # DO NOT clear these keys:
+    # - OPENAI_API_KEY, GOOGLE_API_KEY, SLACK_WEBHOOK
+    # - current_audit_data, audit_bulk_selected
+    # - bulk_scan_active, bulk_scan_session_id
+    # - current_section (navigation)
+
+
+def logout_user():
+    """
+    Logs out the current user.
+    
+    This must:
+    - Delete only auth-related keys
+    - Keep all other session keys (including API keys & audit data)
+    - Delete session from file storage
+    - Not delete cached audit results, CRM data, bulk scan states, etc.
+    """
+    logger = logging.getLogger("sales_engine")
+    
+    current_user = st.session_state.get('current_user', 'unknown')
+    session_token = st.session_state.get('session_token') or st.session_state.get('LOGIN_TOKEN')
+    
+    logger.info(f"Logging out user: {current_user}")
+    
+    # Destroy session in file storage
+    if session_token:
+        destroy_session(session_token)
+    
+    # Clear only auth state
+    _clear_auth_state_only()
+    
+    # Re-initialize auth defaults (not authenticated)
+    st.session_state.user_authenticated = False
+    st.session_state.authenticated = False
+    st.session_state.user_role = "user"
+    st.session_state.is_admin = False
+    
+    logger.info(f"User logged out successfully: {current_user}")
+
+
+def store_api_keys(username: str, openai_key: str = None, google_key: str = None, slack_webhook: str = None) -> bool:
+    """
+    Stores API keys securely in the database with encryption.
+    
+    This must:
+    - Save API keys to database under user account table
+    - Encrypt keys at rest using Fernet
+    - Update session state with new keys
+    - Never clear them on refresh
+    
+    Args:
+        username: The username to store keys for
+        openai_key: OpenAI API key (optional)
+        google_key: Google API key (optional)
+        slack_webhook: Slack webhook URL (optional)
+    
+    Returns:
+        True if all keys saved successfully, False otherwise
+    """
+    logger = logging.getLogger("sales_engine")
+    success = True
+    
+    if not username:
+        logger.error("store_api_keys called without username")
+        return False
+    
+    # Save each key if provided
+    if openai_key is not None:
+        ok, err = save_user_api_key(username, "openai", openai_key)
+        if ok:
+            st.session_state.OPENAI_API_KEY = openai_key
+        else:
+            logger.error(f"Failed to save OpenAI key: {err}")
+            success = False
+    
+    if google_key is not None:
+        ok, err = save_user_api_key(username, "google", google_key)
+        if ok:
+            st.session_state.GOOGLE_API_KEY = google_key
+        else:
+            logger.error(f"Failed to save Google key: {err}")
+            success = False
+    
+    if slack_webhook is not None:
+        ok, err = save_user_api_key(username, "slack", slack_webhook)
+        if ok:
+            st.session_state.SLACK_WEBHOOK = slack_webhook
+        else:
+            logger.error(f"Failed to save Slack webhook: {err}")
+            success = False
+    
+    if success:
+        logger.info(f"API keys stored successfully for user: {username}")
+    
+    return success
+
+
+def require_role(required_role: str):
+    """
+    Decorator to require a specific role for accessing a function/page.
+    
+    Usage:
+        @require_role("admin")
+        def show_admin_page():
+            ...
+    
+    Functionality:
+    - If user is not logged in → redirect to Login page
+    - If user role doesn't match required role → show Access Denied
+    - Works with Streamlit routing
+    - Does not break tabs or navigation
+    
+    Args:
+        required_role: The role required ("admin" or "user")
+    
+    Returns:
+        Decorated function
+    """
+    from functools import wraps
+    
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Check if user is logged in
+            if not load_login_state():
+                st.warning("🔒 Please log in to access this page.")
+                show_auth_page()
+                st.stop()
+                return None
+            
+            # Check role
+            user_role = st.session_state.get('user_role', 'user')
+            
+            # Admin can access everything
+            if user_role == 'admin':
+                return func(*args, **kwargs)
+            
+            # Check if role matches
+            if required_role == 'user':
+                # User role can access user pages
+                return func(*args, **kwargs)
+            
+            # Role doesn't match
+            st.error("🚫 **Access Denied**")
+            st.markdown(f"You need **{required_role}** permissions to access this page.")
+            st.markdown("Please contact an administrator for access.")
+            st.stop()
+            return None
+        
+        return wrapper
+    return decorator
+
+
+def check_auth() -> bool:
+    """
+    Quick auth check for use at the top of pages.
+    Returns True if authenticated, False otherwise.
+    Does not render anything - use for conditional logic.
+    """
+    return load_login_state()
+
+
+def require_auth():
+    """
+    Guard function to require authentication.
+    Call at the top of any page that requires login.
+    Will show login page and stop execution if not authenticated.
+    """
+    if not load_login_state():
+        show_auth_page()
+        st.stop()
 
 def init_users_file():
     """Create users.json if it doesn't exist."""
@@ -2179,13 +2649,9 @@ def show_auth_page():
                         st.session_state["2fa_username"] = username
                         st.rerun()
                     else:
-                        # Create persistent session
-                        session_token = create_session(username, user_role)
-                        st.query_params['session_token'] = session_token
-                        st.session_state["authenticated"] = True
-                        st.session_state["current_user"] = username
-                        st.session_state["is_admin"] = user_role == "admin"
-                        st.session_state["user_role"] = user_role
+                        # Create persistent session using new centralized function
+                        user_email = users[username].get("email")
+                        save_login_state(username, user_role, user_email)
                         
                         # Reload API keys from user account after login
                         reload_user_api_keys()
@@ -2203,20 +2669,16 @@ def show_auth_page():
             if st.button("Verify 2FA", type="primary"):
                 secrets_2fa = load_2fa_secrets()
                 if token and verify_2fa_token(secrets_2fa[st.session_state["2fa_username"]]["secret"], token):
-                    # Create persistent session
+                    # Create persistent session using new centralized function
                     username_2fa = st.session_state["2fa_username"]
                     user_role = users[username_2fa].get("role", "user")
+                    user_email = users[username_2fa].get("email")
                     
                     # Ensure user exists in database (for users who only exist in JSON)
                     ensure_user_in_database(username_2fa, users[username_2fa]["password_hash"], is_admin=(user_role == "admin"))
                     
-                    session_token = create_session(username_2fa, user_role)
-                    st.query_params['session_token'] = session_token
-                    st.session_state["authenticated"] = True
-                    st.session_state["current_user"] = username_2fa
-                    st.session_state["is_admin"] = user_role == "admin"
-                    st.session_state["user_role"] = user_role
-                    st.session_state["2fa_pending"] = False
+                    # Use centralized save_login_state
+                    save_login_state(username_2fa, user_role, user_email)
                     
                     # Reload API keys from user account after login
                     reload_user_api_keys()
@@ -2315,104 +2777,40 @@ if not st.session_state.get("_api_keys_migrated"):
     migrate_api_keys_from_json_to_db()
     st.session_state["_api_keys_migrated"] = True
 
-# --- SESSION RESTORATION LOGIC ---
-# Try to restore session BEFORE initializing auth state to prevent logout on refresh
-# Priority: 1) st.session_state['session_token'], 2) st.query_params['session_token']
+# ============================================================================
+# CENTRALIZED SESSION INITIALIZATION & AUTHENTICATION CHECK
+# ============================================================================
+# This section MUST run before any page rendering.
+# Uses the new init_app_session() and load_login_state() functions.
 
-def restore_session_from_token(token: str) -> bool:
-    """Attempt to restore session from a token. Returns True if successful."""
-    logger = logging.getLogger("sales_engine")
-    if not token:
-        return False
-    
-    session_info = validate_session(token)
-    if session_info:
-        logger.info(f"Session restored for user: {session_info['username']}")
-        st.session_state['session_token'] = token
-        st.session_state['authenticated'] = True
-        st.session_state['current_user'] = session_info['username']
-        st.session_state['is_admin'] = session_info['role'] == 'admin'
-        st.session_state['user_role'] = session_info['role']
-        st.session_state['2fa_pending'] = False
-        st.session_state['2fa_username'] = None
-        
-        # Reload API keys from user account after session restore
-        reload_user_api_keys()
-        return True
-    else:
-        logger.debug(f"Session token invalid or expired")
-        return False
+# Step 1: Initialize all session state variables (never overwrites existing values)
+init_app_session()
 
-# Step 1: Try to restore from existing session_state token
-session_restored = False
-if st.session_state.get('session_token'):
-    session_restored = restore_session_from_token(st.session_state['session_token'])
+# Step 2: Try to restore/validate login state
+# This checks session_state, then query params, validates tokens, and restores user info
+session_valid = load_login_state()
 
-# Step 2: If not restored, try from query params
-if not session_restored:
-    query_params = st.query_params
-    if 'session_token' in query_params:
-        try:
-            # st.query_params returns string directly, not a list
-            token = query_params.get('session_token', '')
-            if isinstance(token, list):
-                token = token[0] if token else ''
-            session_restored = restore_session_from_token(token)
-        except Exception as e:
-            logging.getLogger("sales_engine").error(f"Error restoring session from query params: {str(e)}")
-
-# Step 3: Only initialize default auth state if session was NOT restored
-if not session_restored:
-    if 'authenticated' not in st.session_state:
-        st.session_state['authenticated'] = False
-        st.session_state['current_user'] = None
-        st.session_state['is_admin'] = False
-        st.session_state['user_role'] = 'user'
-        st.session_state['2fa_pending'] = False
-        st.session_state['2fa_username'] = None
-
-# Check authentication
-if not st.session_state.get('authenticated'):
+# Step 3: If not authenticated, show login page
+if not session_valid:
     show_auth_page()
     st.stop()
+
+# Step 4: Reload API keys for authenticated user (if not already loaded this run)
+if st.session_state.get("current_user") and not st.session_state.get("_api_keys_loaded_this_run"):
+    reload_user_api_keys()
+    st.session_state["_api_keys_loaded_this_run"] = True
+
+# Reset the per-run flag at start of each run (for next rerun)
+st.session_state["_api_keys_loaded_this_run"] = False
+
+# Get current API keys from session (for backward compatibility)
+OPENAI_API_KEY = st.session_state.get('OPENAI_API_KEY', '')
+GOOGLE_API_KEY = st.session_state.get('GOOGLE_API_KEY', '')
+SLACK_WEBHOOK = st.session_state.get('SLACK_WEBHOOK', '')
 
 # ============================================================================
 # SIDEBAR & NAVIGATION
 # ============================================================================
-
-# Initialize session state for navigation
-if 'current_section' not in st.session_state:
-    st.session_state.current_section = 'Single Audit'
-
-# Store API keys in session state (from session or temporary input)
-# IMPORTANT: Use the centralized reload_user_api_keys() function for consistency
-# This ensures proper env var handling and per-user isolation
-
-if st.session_state.get("current_user") and st.session_state.get("authenticated"):
-    # User is logged in - reload keys using the centralized function
-    # This only reloads if keys haven't been loaded yet this session run
-    if not st.session_state.get("_api_keys_loaded_this_run"):
-        reload_user_api_keys()
-        st.session_state["_api_keys_loaded_this_run"] = True
-else:
-    # User is not logged in - initialize from environment variables only
-    if 'OPENAI_API_KEY' not in st.session_state:
-        st.session_state.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-    
-    if 'GOOGLE_API_KEY' not in st.session_state:
-        st.session_state.GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
-    
-    if 'SLACK_WEBHOOK' not in st.session_state:
-        st.session_state.SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "").strip()
-
-# Reset the per-run flag at start of each run (for next rerun)
-# This is placed here to ensure it's reset after keys are loaded
-st.session_state["_api_keys_loaded_this_run"] = False
-
-# Get current API keys from session
-OPENAI_API_KEY = st.session_state.OPENAI_API_KEY
-GOOGLE_API_KEY = st.session_state.GOOGLE_API_KEY
-SLACK_WEBHOOK = st.session_state.SLACK_WEBHOOK
 
 with st.sidebar:
     st.header("🦅 Code Nest Panel")
@@ -2458,25 +2856,19 @@ with st.sidebar:
     
     # User info & logout
     st.markdown(f"**User:** {st.session_state.get('current_user')}")
-    st.markdown(f"**Role:** {st.session_state.get('user_role').capitalize()}")
+    st.markdown(f"**Role:** {st.session_state.get('user_role', 'user').capitalize()}")
     
     if st.button("🚪 Logout", use_container_width=True):
-        # Destroy session token
-        if 'session_token' in st.session_state:
-            destroy_session(st.session_state['session_token'])
-            del st.session_state['session_token']
-        
-        # Clear authentication
-        st.session_state['authenticated'] = False
-        st.session_state['current_user'] = None
-        st.session_state['is_admin'] = False
-        st.session_state['user_role'] = 'user'
-        st.session_state.current_section = 'Single Audit'
-        st.session_state['2fa_pending'] = False
-        st.session_state['2fa_username'] = None
+        # Use the centralized logout_user function
+        # This preserves API keys and audit data while clearing auth state
+        logout_user()
         
         # Clear query params to remove session token from URL
-        st.query_params.clear()
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        
         st.rerun()
     
     # 2FA setup (if admin)
