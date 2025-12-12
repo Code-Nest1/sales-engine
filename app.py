@@ -411,6 +411,10 @@ def get_leads_cached():
     """Cached version of leads query."""
     return get_leads()
 
+def get_scheduled_audits():
+    """Get scheduled audits from database. (Placeholder for future feature)"""
+    return []
+
 @st.cache_data(ttl=CACHE_TTL)
 def get_scheduled_audits_cached():
     """Cached version of scheduled audits query."""
@@ -3357,6 +3361,249 @@ BULK_SCAN_DELAY_SECONDS = 0.5  # Delay between scans to prevent rate limiting
 BULK_SCAN_MAX_ERRORS = 5  # Max consecutive errors before pausing
 
 # ============================================================================
+# CRM - PHONE EXTRACTION HELPER
+# ============================================================================
+
+def extract_phone_from_html(html_content: str) -> str:
+    """Extract phone number from HTML content using regex patterns.
+    
+    Args:
+        html_content: Raw HTML string
+        
+    Returns:
+        Phone number string or None if not found
+    """
+    if not html_content:
+        return None
+    
+    # Common phone number patterns
+    phone_patterns = [
+        # US formats: (555) 555-5555, 555-555-5555, 555.555.5555
+        r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
+        # International: +1 555 555 5555, +44 20 7123 4567
+        r'\+\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}',
+        # Simple: 5555555555
+        r'\b\d{10,11}\b',
+        # With tel: prefix from href
+        r'tel:([+\d\-\s\(\)]+)',
+    ]
+    
+    for pattern in phone_patterns:
+        matches = re.findall(pattern, html_content)
+        if matches:
+            # Clean up the first match
+            phone = matches[0] if isinstance(matches[0], str) else matches[0][0] if matches[0] else None
+            if phone:
+                # Remove common non-phone prefixes
+                phone = re.sub(r'^tel:', '', phone).strip()
+                # Basic validation: should have at least 10 digits
+                digits_only = re.sub(r'\D', '', phone)
+                if len(digits_only) >= 10:
+                    return phone[:50]  # Truncate to fit DB column
+    
+    return None
+
+
+# ============================================================================
+# CRM - LEAD MANAGEMENT HELPER FUNCTIONS
+# ============================================================================
+
+def get_lead_for_domain(domain: str):
+    """Get Lead record for a domain.
+    
+    Args:
+        domain: Domain name (without protocol)
+        
+    Returns:
+        Lead object or None
+    """
+    db = get_db()
+    if not db:
+        return None
+    try:
+        return db.query(Lead).filter(Lead.domain == domain).first()
+    except Exception:
+        return None
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+def get_lead_for_audit(audit_id: int):
+    """Get Lead record associated with an Audit.
+    
+    Args:
+        audit_id: ID of the audit
+        
+    Returns:
+        Lead object or None
+    """
+    logger = logging.getLogger("sales_engine")
+    db = get_db()
+    if not db:
+        return None
+    try:
+        audit = db.query(Audit).filter(Audit.id == audit_id).first()
+        if not audit:
+            return None
+        return db.query(Lead).filter(Lead.domain == audit.domain).first()
+    except Exception as e:
+        logger.warning(f"Could not get lead for audit {audit_id}: {e}")
+        return None
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+def update_lead_crm_fields(lead_id: int, **kwargs) -> bool:
+    """Update CRM fields on a Lead.
+    
+    Args:
+        lead_id: Lead database ID
+        **kwargs: Field names and values to update
+        
+    Supported fields:
+        approached, approached_date, follow_up_date, lead_status,
+        interested, pipeline_stage, assigned_user, notes
+        
+    Returns:
+        True on success, False on failure
+    """
+    logger = logging.getLogger("sales_engine")
+    db = get_db()
+    if not db:
+        return False
+    
+    try:
+        lead = db.query(Lead).filter(Lead.id == lead_id).first()
+        if not lead:
+            logger.warning(f"Lead {lead_id} not found for CRM update")
+            return False
+        
+        # List of allowed CRM fields
+        allowed_fields = [
+            'approached', 'approached_date', 'follow_up_date', 'lead_status',
+            'interested', 'pipeline_stage', 'assigned_user', 'notes', 
+            'phone', 'email', 'company_name'
+        ]
+        
+        for field, value in kwargs.items():
+            if field in allowed_fields and hasattr(lead, field):
+                setattr(lead, field, value)
+                logger.debug(f"Lead {lead_id}: set {field}={value}")
+        
+        lead.updated_at = datetime.utcnow()
+        db.commit()
+        logger.info(f"Lead {lead_id} CRM fields updated: {list(kwargs.keys())}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to update lead {lead_id} CRM fields: {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
+        return False
+    finally:
+        if db:
+            try:
+                db.close()
+            except:
+                pass
+
+
+def mark_lead_as_approached(lead_id: int, update_pipeline: bool = True) -> bool:
+    """Mark a lead as approached (contacted).
+    
+    Args:
+        lead_id: Lead database ID
+        update_pipeline: If True, also move pipeline_stage to "contacted" if it was "new"
+        
+    Returns:
+        True on success, False on failure
+    """
+    logger = logging.getLogger("sales_engine")
+    db = get_db()
+    if not db:
+        return False
+    
+    try:
+        lead = db.query(Lead).filter(Lead.id == lead_id).first()
+        if not lead:
+            return False
+        
+        lead.approached = True
+        lead.approached_date = datetime.utcnow()
+        
+        # Move pipeline forward if still at "new"
+        if update_pipeline and lead.pipeline_stage == "new":
+            lead.pipeline_stage = "contacted"
+        
+        lead.updated_at = datetime.utcnow()
+        db.commit()
+        logger.info(f"Lead {lead_id} ({lead.domain}) marked as approached")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to mark lead {lead_id} as approached: {e}")
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass
+        return False
+    finally:
+        if db:
+            try:
+                db.close()
+            except:
+                pass
+
+
+def get_crm_metrics() -> dict:
+    """Get CRM dashboard metrics.
+    
+    Returns:
+        Dict with counts: total, not_approached, approached, hot, follow_up_due
+    """
+    db = get_db()
+    if not db:
+        return {"total": 0, "not_approached": 0, "approached": 0, "hot": 0, "follow_up_due": 0}
+    
+    try:
+        total = db.query(Lead).count()
+        not_approached = db.query(Lead).filter(Lead.approached == False).count()
+        approached = db.query(Lead).filter(Lead.approached == True).count()
+        hot = db.query(Lead).filter(Lead.lead_status == "hot").count()
+        
+        # Follow-ups due today or earlier
+        today = datetime.utcnow().replace(hour=23, minute=59, second=59)
+        follow_up_due = db.query(Lead).filter(
+            Lead.follow_up_date <= today,
+            Lead.pipeline_stage == "follow-up"
+        ).count()
+        
+        return {
+            "total": total,
+            "not_approached": not_approached,
+            "approached": approached,
+            "hot": hot,
+            "follow_up_due": follow_up_due
+        }
+    except Exception:
+        return {"total": 0, "not_approached": 0, "approached": 0, "hot": 0, "follow_up_due": 0}
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+# ============================================================================
 # BULK SCAN - URL VALIDATION & SANITIZATION
 # ============================================================================
 
@@ -3481,8 +3728,8 @@ def run_bulk_audit_safe(url: str, openai_key: str, google_key: str) -> tuple:
             logger.warning(f"Bulk audit returned no data for: {url}")
             return None, False, "Audit returned no data"
         
-        # Save to database
-        audit_id = save_audit_to_db(audit_data)
+        # Save to database with source="bulk"
+        audit_id = save_audit_to_db(audit_data, source="bulk")
         
         if audit_id:
             logger.info(f"Bulk audit success: {url} -> audit_id={audit_id}")
@@ -4263,17 +4510,115 @@ def show_bulk_audit():
                         elif session.status == "stopped":
                             st.caption("Scan was stopped")
                     
-                    # Recently scanned URLs (expandable)
+                    # Recently scanned URLs (expandable) with CRM navigation
                     if session.results and len(session.results) > 0:
                         with st.expander(f"📋 View scanned URLs ({len(session.results)})", expanded=False):
-                            cols = st.columns(2)
-                            urls_list = list(session.results.items())[-20:]  # Last 20
+                            st.markdown("""
+                            <style>
+                            .bulk-url-row {
+                                display: flex;
+                                align-items: center;
+                                padding: 0.5rem;
+                                border-bottom: 1px solid #eee;
+                                background: #fafafa;
+                                border-radius: 4px;
+                                margin-bottom: 4px;
+                            }
+                            .bulk-url-row:hover { background: #f0f0f0; }
+                            .url-status-icon { margin-right: 8px; font-size: 1.1em; }
+                            .url-domain { flex: 1; font-family: 'Lato', sans-serif; color: #333; }
+                            .url-actions { display: flex; gap: 4px; }
+                            </style>
+                            """, unsafe_allow_html=True)
+                            
+                            # Show all URLs with navigation buttons
+                            urls_list = list(session.results.items())
                             for idx, (url, audit_id) in enumerate(urls_list):
-                                with cols[idx % 2]:
-                                    icon = "✅" if audit_id else "❌"
-                                    # Truncate long URLs
-                                    display_url = url[:50] + "..." if len(url) > 50 else url
-                                    st.caption(f"{icon} {display_url}")
+                                icon = "✅" if audit_id else "❌"
+                                # Extract domain for display
+                                try:
+                                    domain = urlparse(url).netloc.replace("www.", "")[:40]
+                                except:
+                                    domain = url[:40]
+                                
+                                col_icon, col_domain, col_btn1, col_btn2 = st.columns([0.5, 4, 2, 2])
+                                
+                                with col_icon:
+                                    st.markdown(f"<span class='url-status-icon'>{icon}</span>", unsafe_allow_html=True)
+                                
+                                with col_domain:
+                                    if audit_id:
+                                        st.markdown(f"**{domain}**")
+                                    else:
+                                        st.markdown(f"~~{domain}~~ (failed)")
+                                
+                                with col_btn1:
+                                    if audit_id:
+                                        if st.button("📊 History", key=f"bulk_hist_{session.id}_{idx}", use_container_width=True,
+                                                     help="View this audit in Audit History"):
+                                            # Navigate to audit history with domain pre-filled
+                                            st.session_state.hist_search = domain
+                                            st.session_state.current_section = 'Audit History'
+                                            st.rerun()
+                                    else:
+                                        st.button("📊 History", key=f"bulk_hist_d_{session.id}_{idx}", disabled=True, use_container_width=True)
+                                
+                                with col_btn2:
+                                    if audit_id:
+                                        if st.button("🔍 Open", key=f"bulk_open_{session.id}_{idx}", use_container_width=True,
+                                                     help="Load this audit in Single Audit view"):
+                                            # Load audit data and navigate to Single Audit
+                                            db = get_db()
+                                            if db:
+                                                try:
+                                                    audit = db.query(Audit).filter(Audit.id == audit_id).first()
+                                                    if audit:
+                                                        data = convert_audit_to_data_dict(audit)
+                                                        st.session_state.current_audit_data = data
+                                                        st.session_state.current_section = 'Single Audit'
+                                                        st.toast(f"✓ Loaded {domain}")
+                                                except Exception as e:
+                                                    logger.warning(f"Error loading audit {audit_id}: {e}")
+                                                finally:
+                                                    db.close()
+                                            st.rerun()
+                                    else:
+                                        # Retry button for failed URLs
+                                        if st.button("🔄 Retry", key=f"bulk_retry_{session.id}_{idx}", use_container_width=True,
+                                                     help="Retry auditing this URL"):
+                                            with st.spinner(f"Retrying {domain}..."):
+                                                new_audit_id, success, error = run_bulk_audit_safe(
+                                                    url,
+                                                    st.session_state.get('OPENAI_API_KEY', ''),
+                                                    st.session_state.get('GOOGLE_API_KEY', '')
+                                                )
+                                                if success and new_audit_id:
+                                                    # Update session results
+                                                    db = get_db()
+                                                    if db:
+                                                        try:
+                                                            sess = db.query(BulkScan).filter(BulkScan.id == session.id).first()
+                                                            if sess:
+                                                                results = dict(sess.results) if sess.results else {}
+                                                                results[url] = new_audit_id
+                                                                sess.results = results
+                                                                db.commit()
+                                                                st.success(f"✅ {domain} audit complete!")
+                                                        except Exception as e:
+                                                            logger.warning(f"Error updating session: {e}")
+                                                        finally:
+                                                            db.close()
+                                                    st.rerun()
+                                                else:
+                                                    st.error(f"Retry failed: {error}")
+                            
+                            # Summary stats for the session
+                            success_count = sum(1 for _, aid in urls_list if aid)
+                            fail_count = len(urls_list) - success_count
+                            st.markdown(f"""
+                            ---
+                            **Summary:** ✅ {success_count} successful | ❌ {fail_count} failed | 📊 Total: {len(urls_list)}
+                            """)
     
     # =========================================================================
     # BACKGROUND PROCESSING LOGIC (FIXED - RUNS ON EVERY PAGE LOAD)
@@ -4385,13 +4730,15 @@ def show_bulk_audit():
                 st.rerun()
 
 def show_audit_history():
-    """Audit history page for all users - with pagination and user-based filtering.
+    """Audit history page with CRM lead management integration.
     
     Features:
     - User-based access control (admin sees all, users see their own)
+    - CRM filters: source, lead status, pipeline stage, approached
     - Multiple filter options (time, score, domain search)
     - Bulk actions with confirmation dialogs
     - CSV export functionality
+    - CRM metrics dashboard strip
     - Grouped display by time period
     """
     logger = logging.getLogger("sales_engine")
@@ -4400,7 +4747,103 @@ def show_audit_history():
     # Initialize session state for this module
     init_audit_history_session_state()
     
-    st.title("📊 Audit History")
+    # =========================================================================
+    # CRM-ENHANCED BRANDING CSS
+    # =========================================================================
+    st.markdown("""
+    <style>
+    /* CRM Status Badges */
+    .badge-source {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-right: 4px;
+    }
+    .badge-single { background: #e3f2fd; color: #1565c0; }
+    .badge-bulk { background: #fff3e0; color: #ef6c00; }
+    .badge-manual { background: #f3e5f5; color: #7b1fa2; }
+    
+    .badge-lead-status {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-right: 4px;
+    }
+    .badge-hot { background: #ffebee; color: #c62828; }
+    .badge-warm { background: #fff8e1; color: #f57c00; }
+    .badge-cold { background: #eceff1; color: #546e7a; }
+    
+    .badge-pipeline {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .badge-new { background: #e8f5e9; color: #2e7d32; }
+    .badge-contacted { background: #e3f2fd; color: #1565c0; }
+    .badge-follow-up { background: #fff3e0; color: #ef6c00; }
+    .badge-closed { background: #f5f5f5; color: #616161; }
+    
+    .approached-yes { color: #2e7d32; }
+    .approached-no { color: #9e9e9e; }
+    
+    /* CRM Metrics Strip */
+    .crm-metrics-strip {
+        background: linear-gradient(135deg, #0c3740 0%, #1a5a6e 100%);
+        padding: 1rem 1.5rem;
+        border-radius: 12px;
+        margin-bottom: 1.5rem;
+        color: white;
+    }
+    .crm-metric-card {
+        background: rgba(255,255,255,0.1);
+        border-radius: 8px;
+        padding: 0.75rem;
+        text-align: center;
+    }
+    .crm-metric-value {
+        font-size: 1.5rem;
+        font-weight: bold;
+        font-family: 'Poppins', sans-serif;
+    }
+    .crm-metric-label {
+        font-size: 0.8rem;
+        opacity: 0.9;
+        font-family: 'Lato', sans-serif;
+    }
+    
+    /* Lead Details Card */
+    .lead-details-card {
+        background: #f8faf9;
+        border: 1px solid #e0e0e0;
+        border-radius: 12px;
+        padding: 1.25rem;
+        margin-top: 1rem;
+    }
+    .lead-details-card h4 {
+        color: #0c3740;
+        font-family: 'Poppins', sans-serif;
+        margin-bottom: 1rem;
+    }
+    
+    /* Sticky bar and existing styles */
+    .sticky-bar {position: -webkit-sticky; position: sticky; top: 0; z-index: 100; background: #fff; padding: 1rem 0 0.5rem 0; border-bottom: 1px solid #eee; margin-bottom: 1rem;}
+    .active-filter {background: #e0f7fa; color: #0066cc; border-radius: 6px; padding: 2px 8px; margin-left: 6px; font-size: 0.95em;}
+    .clear-btn {background: #ffebee; color: #c62828; border-radius: 6px; padding: 2px 8px; margin-left: 6px; font-size: 0.9em; cursor: pointer;}
+    .confirm-delete {background: #ffcdd2; border: 2px solid #c62828; padding: 1rem; border-radius: 8px; margin: 1rem 0;}
+    @media (max-width: 900px) {
+        .element-container .stColumn {width: 100% !important; display: block !important;}
+        .sticky-bar {padding: 0.5rem 0;}
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.title("📊 Audit History & Lead CRM")
     
     # Get current user info for access control
     current_user = st.session_state.get("current_user")
@@ -4410,28 +4853,45 @@ def show_audit_history():
     if is_admin:
         st.markdown("🔓 **Admin View** - Viewing all audits across all users")
     else:
-        st.markdown(f"🔒 Viewing your previous audits")
+        st.markdown(f"🔒 Viewing your audits and leads")
     
-    # Sticky filter/search bar using HTML/CSS
-    st.markdown(
-        '''<style>
-        .sticky-bar {position: -webkit-sticky; position: sticky; top: 0; z-index: 100; background: #fff; padding: 1rem 0 0.5rem 0; border-bottom: 1px solid #eee; margin-bottom: 1rem;}
-        .active-filter {background: #e0f7fa; color: #0066cc; border-radius: 6px; padding: 2px 8px; margin-left: 6px; font-size: 0.95em;}
-        .clear-btn {background: #ffebee; color: #c62828; border-radius: 6px; padding: 2px 8px; margin-left: 6px; font-size: 0.9em; cursor: pointer;}
-        .confirm-delete {background: #ffcdd2; border: 2px solid #c62828; padding: 1rem; border-radius: 8px; margin: 1rem 0;}
-        @media (max-width: 900px) {
-            .element-container .stColumn {width: 100% !important; display: block !important;}
-            .sticky-bar {padding: 0.5rem 0;}
-        }
-        @media (max-width: 600px) {
-            .element-container .stColumn {width: 100% !important; display: block !important;}
-            .sticky-bar {padding: 0.2rem 0; font-size: 0.95em;}
-        }
-        </style>''', unsafe_allow_html=True)
+    # =========================================================================
+    # CRM METRICS STRIP (Dashboard summary)
+    # =========================================================================
+    crm_metrics = get_crm_metrics()
+    
+    st.markdown("### 📈 Lead Pipeline Overview")
+    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+    with col_m1:
+        st.metric("📊 Total Leads", crm_metrics.get("total", 0))
+    with col_m2:
+        st.metric("📧 Not Approached", crm_metrics.get("not_approached", 0), 
+                  help="Leads that haven't been contacted yet")
+    with col_m3:
+        st.metric("✅ Approached", crm_metrics.get("approached", 0))
+    with col_m4:
+        st.metric("🔥 Hot Leads", crm_metrics.get("hot", 0), 
+                  delta="Priority" if crm_metrics.get("hot", 0) > 0 else None)
+    with col_m5:
+        st.metric("📅 Follow-up Due", crm_metrics.get("follow_up_due", 0),
+                  delta="Action needed" if crm_metrics.get("follow_up_due", 0) > 0 else None)
+    
+    st.markdown("---")
+    
+    # =========================================================================
+    # CRM QUICK VIEW TABS
+    # =========================================================================
+    crm_view = st.radio(
+        "Quick View",
+        ["All Leads", "Not Approached", "Approached", "🔥 Hot Leads", "📅 Needs Follow-up"],
+        horizontal=True,
+        key="crm_quick_view",
+        help="Quick filter for common CRM views"
+    )
     
     st.markdown('<div class="sticky-bar">', unsafe_allow_html=True)
     
-    # Clear Filters button - MUST be rendered BEFORE filter widgets to avoid StreamlitAPIException
+    # Clear Filters button
     col_clear, col_spacer = st.columns([1, 7])
     with col_clear:
         if st.button("✖️ Clear All Filters", key="clear_all_filters_btn", help="Reset all filters to default"):
@@ -4443,8 +4903,10 @@ def show_audit_history():
     date_from = None
     date_to = None
     
-    # Date filtering row with calendar
-    col_date1, col_date2, col_date3, col_date4 = st.columns([2, 2, 2, 2])
+    # =========================================================================
+    # ROW 1: TIME & SOURCE FILTERS
+    # =========================================================================
+    col_date1, col_date2, col_date3, col_source = st.columns([2, 2, 2, 2])
     with col_date1:
         time_filter = st.selectbox(
             "📅 Time Period",
@@ -4463,15 +4925,49 @@ def show_audit_history():
             date_to = st.date_input("To Date", value=datetime.now(), key="hist_date_to")
         else:
             st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
-    with col_date4:
+    with col_source:
+        source_filter = st.selectbox(
+            "🔗 Source",
+            ["All", "Single Audit", "Bulk Audit", "Manual"],
+            key="source_filter",
+            help="Filter by how the audit was created"
+        )
+    
+    # =========================================================================
+    # ROW 2: CRM FILTERS (Lead Status, Pipeline, Approached)
+    # =========================================================================
+    col_lead_status, col_pipeline, col_approached, col_show_all = st.columns([2, 2, 2, 2])
+    with col_lead_status:
+        lead_status_filter = st.selectbox(
+            "🎯 Lead Status",
+            ["All", "🔥 Hot", "☀️ Warm", "❄️ Cold"],
+            key="lead_status_filter",
+            help="Filter by lead temperature"
+        )
+    with col_pipeline:
+        pipeline_filter = st.selectbox(
+            "📊 Pipeline Stage",
+            ["All", "New", "Contacted", "Follow-up", "Closed"],
+            key="pipeline_filter",
+            help="Filter by sales pipeline stage"
+        )
+    with col_approached:
+        approached_filter = st.selectbox(
+            "📧 Approached",
+            ["All", "✅ Yes", "❌ No"],
+            key="approached_filter",
+            help="Filter by whether lead has been contacted"
+        )
+    with col_show_all:
         show_all_scans = st.checkbox("🔄 Show All Scans", value=False, key="show_all_scans", 
                                       help="Unchecked: shows only most recent scan per domain. Checked: all historical scans.")
     
-    # Search and score filters row
+    # =========================================================================
+    # ROW 3: SEARCH & SCORE FILTERS
+    # =========================================================================
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         search_raw = st.text_input("🔍 Search domain", key="hist_search", help="Filter audits by domain name")
-        # Sanitize search input
         search = sanitize_domain_search(search_raw) if search_raw else None
     with col2:
         min_score_raw = st.number_input("Min Score", 0, 100, 0, help="Show audits with score above this value")
@@ -4542,6 +5038,70 @@ def show_audit_history():
     
     if not audits:
         st.info("No audits match your time filter. Try selecting a different time period.")
+        return
+    
+    # =========================================================================
+    # APPLY CRM FILTERS (Source, Lead Status, Pipeline, Approached)
+    # =========================================================================
+    # Load leads for CRM filtering
+    db = get_db()
+    leads_by_domain = {}
+    if db:
+        try:
+            all_leads = db.query(Lead).all()
+            leads_by_domain = {lead.domain: lead for lead in all_leads}
+        except Exception:
+            pass
+        finally:
+            try:
+                db.close()
+            except:
+                pass
+    
+    # Apply CRM Quick View filter
+    if crm_view == "Not Approached":
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and not leads_by_domain[a.domain].approached]
+    elif crm_view == "Approached":
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and leads_by_domain[a.domain].approached]
+    elif crm_view == "🔥 Hot Leads":
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and leads_by_domain[a.domain].lead_status == "hot"]
+    elif crm_view == "📅 Needs Follow-up":
+        today = datetime.utcnow().replace(hour=23, minute=59, second=59)
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and 
+                  leads_by_domain[a.domain].follow_up_date and 
+                  leads_by_domain[a.domain].follow_up_date <= today and
+                  leads_by_domain[a.domain].pipeline_stage == "follow-up"]
+    
+    # Apply source filter
+    if source_filter == "Single Audit":
+        audits = [a for a in audits if getattr(a, 'source', 'single') == 'single']
+    elif source_filter == "Bulk Audit":
+        audits = [a for a in audits if getattr(a, 'source', None) == 'bulk']
+    elif source_filter == "Manual":
+        audits = [a for a in audits if getattr(a, 'source', None) == 'manual']
+    
+    # Apply lead status filter
+    if lead_status_filter == "🔥 Hot":
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and leads_by_domain[a.domain].lead_status == "hot"]
+    elif lead_status_filter == "☀️ Warm":
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and leads_by_domain[a.domain].lead_status == "warm"]
+    elif lead_status_filter == "❄️ Cold":
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and leads_by_domain[a.domain].lead_status == "cold"]
+    
+    # Apply pipeline filter
+    pipeline_map = {"New": "new", "Contacted": "contacted", "Follow-up": "follow-up", "Closed": "closed"}
+    if pipeline_filter in pipeline_map:
+        stage = pipeline_map[pipeline_filter]
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and leads_by_domain[a.domain].pipeline_stage == stage]
+    
+    # Apply approached filter
+    if approached_filter == "✅ Yes":
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and leads_by_domain[a.domain].approached]
+    elif approached_filter == "❌ No":
+        audits = [a for a in audits if leads_by_domain.get(a.domain) and not leads_by_domain[a.domain].approached]
+    
+    if not audits:
+        st.info("No audits match your CRM filters. Try adjusting the filters above.")
         return
     
     # Deduplicate by domain if not showing all scans
@@ -4740,11 +5300,14 @@ def render_audit_item(audit, bulk_selected: set):
 
 
 def render_audit_detail(audit):
-    """Render full audit details inside an expander."""
+    """Render full audit details inside an expander with CRM lead management panel."""
     logger = logging.getLogger("sales_engine")
     
     # Convert audit to data dict using helper
     data = convert_audit_to_data_dict(audit)
+    
+    # Get lead for this audit's domain
+    lead = get_lead_for_audit(audit.id)
     
     # Metrics row
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -4759,6 +5322,159 @@ def render_audit_detail(audit):
         st.metric("Age", data.get('domain_age', 'Unknown'))
     with c5:
         st.metric("Audit ID", audit.id)
+    
+    # =========================================================================
+    # CRM LEAD MANAGEMENT PANEL
+    # =========================================================================
+    if lead:
+        st.markdown("---")
+        st.markdown("""
+        <div style='background: linear-gradient(135deg, #0c3740 0%, #1a5a6e 100%); 
+                    color: white; padding: 0.5rem 1rem; border-radius: 8px 8px 0 0;
+                    font-family: Poppins, sans-serif; font-weight: 600;'>
+            🎯 Lead CRM Details
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Lead status badges row
+        source_badge = {
+            "single": ("Single", "badge-single"),
+            "bulk": ("Bulk", "badge-bulk"),
+            "manual": ("Manual", "badge-manual")
+        }.get(lead.source or "single", ("Single", "badge-single"))
+        
+        status_badge = {
+            "hot": ("🔥 Hot", "badge-hot"),
+            "warm": ("☀️ Warm", "badge-warm"),
+            "cold": ("❄️ Cold", "badge-cold")
+        }.get(lead.lead_status or "warm", ("☀️ Warm", "badge-warm"))
+        
+        pipeline_badge = {
+            "new": ("New", "badge-new"),
+            "contacted": ("Contacted", "badge-contacted"),
+            "follow-up": ("Follow-up", "badge-follow-up"),
+            "closed": ("Closed", "badge-closed")
+        }.get(lead.pipeline_stage or "new", ("New", "badge-new"))
+        
+        approached_icon = "✅" if lead.approached else "❌"
+        approached_class = "approached-yes" if lead.approached else "approached-no"
+        
+        st.markdown(f"""
+        <div style='background: #f8faf9; border: 1px solid #e0e0e0; border-top: none; 
+                    padding: 0.75rem 1rem; border-radius: 0 0 8px 8px; margin-bottom: 1rem;'>
+            <span class='badge-source {source_badge[1]}'>{source_badge[0]}</span>
+            <span class='badge-lead-status {status_badge[1]}'>{status_badge[0]}</span>
+            <span class='badge-pipeline {pipeline_badge[1]}'>{pipeline_badge[0]}</span>
+            <span class='{approached_class}' style='margin-left: 8px;'>Approached: {approached_icon}</span>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Lead info row (non-editable info)
+        col_lead1, col_lead2, col_lead3 = st.columns(3)
+        with col_lead1:
+            st.markdown(f"**📧 Email:** {lead.email or 'Not found'}")
+            st.markdown(f"**📞 Phone:** {lead.phone or 'Not found'}")
+        with col_lead2:
+            st.markdown(f"**🏢 Company:** {lead.company_name or lead.domain}")
+            st.markdown(f"**📊 Opportunity:** {lead.opportunity_rating or 'N/A'}/100")
+        with col_lead3:
+            approached_date = lead.approached_date.strftime('%Y-%m-%d') if lead.approached_date else 'Never'
+            st.markdown(f"**📅 Approached:** {approached_date}")
+            followup_date = lead.follow_up_date.strftime('%Y-%m-%d') if lead.follow_up_date else 'Not set'
+            st.markdown(f"**📆 Follow-up:** {followup_date}")
+        
+        # Editable CRM fields in expander
+        with st.expander("✏️ Edit Lead CRM Fields", expanded=False):
+            col_e1, col_e2 = st.columns(2)
+            
+            with col_e1:
+                # Approached toggle
+                new_approached = st.checkbox(
+                    "✅ Mark as Approached",
+                    value=lead.approached,
+                    key=f"lead_approached_{audit.id}",
+                    help="Check this when you've contacted the lead"
+                )
+                
+                # Lead status
+                status_options = ["hot", "warm", "cold"]
+                current_status_idx = status_options.index(lead.lead_status) if lead.lead_status in status_options else 1
+                new_lead_status = st.selectbox(
+                    "🎯 Lead Status",
+                    status_options,
+                    index=current_status_idx,
+                    format_func=lambda x: {"hot": "🔥 Hot", "warm": "☀️ Warm", "cold": "❄️ Cold"}.get(x, x),
+                    key=f"lead_status_{audit.id}"
+                )
+                
+                # Interested
+                interested_options = ["yes", "maybe", "no"]
+                current_interested_idx = interested_options.index(lead.interested) if lead.interested in interested_options else 1
+                new_interested = st.selectbox(
+                    "💡 Interested",
+                    interested_options,
+                    index=current_interested_idx,
+                    format_func=lambda x: {"yes": "✅ Yes", "maybe": "🤔 Maybe", "no": "❌ No"}.get(x, x),
+                    key=f"lead_interested_{audit.id}"
+                )
+            
+            with col_e2:
+                # Pipeline stage
+                pipeline_options = ["new", "contacted", "follow-up", "closed"]
+                current_pipeline_idx = pipeline_options.index(lead.pipeline_stage) if lead.pipeline_stage in pipeline_options else 0
+                new_pipeline_stage = st.selectbox(
+                    "📊 Pipeline Stage",
+                    pipeline_options,
+                    index=current_pipeline_idx,
+                    format_func=lambda x: {"new": "🆕 New", "contacted": "📞 Contacted", "follow-up": "📅 Follow-up", "closed": "✅ Closed"}.get(x, x),
+                    key=f"lead_pipeline_{audit.id}"
+                )
+                
+                # Follow-up date
+                default_followup = lead.follow_up_date.date() if lead.follow_up_date else datetime.now().date() + timedelta(days=7)
+                new_follow_up_date = st.date_input(
+                    "📅 Follow-up Date",
+                    value=default_followup,
+                    key=f"lead_followup_{audit.id}"
+                )
+            
+            # Notes field
+            new_notes = st.text_area(
+                "📝 Notes",
+                value=lead.notes or "",
+                height=100,
+                key=f"lead_notes_{audit.id}",
+                placeholder="Add notes about this lead..."
+            )
+            
+            # Save button
+            if st.button("💾 Save CRM Changes", key=f"save_lead_{audit.id}", type="primary", use_container_width=True):
+                update_fields = {
+                    "approached": new_approached,
+                    "lead_status": new_lead_status,
+                    "interested": new_interested,
+                    "pipeline_stage": new_pipeline_stage,
+                    "notes": new_notes
+                }
+                
+                # Set approached date if newly approached
+                if new_approached and not lead.approached:
+                    update_fields["approached_date"] = datetime.utcnow()
+                
+                # Set follow-up date
+                if new_follow_up_date:
+                    update_fields["follow_up_date"] = datetime.combine(new_follow_up_date, datetime.min.time())
+                
+                if update_lead_crm_fields(lead.id, **update_fields):
+                    st.success("✅ Lead updated successfully!")
+                    logger.info(f"Updated CRM fields for lead {lead.id} ({lead.domain})")
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to update lead")
+    else:
+        # No lead found - show create lead option
+        st.markdown("---")
+        st.info("ℹ️ No lead record exists for this domain yet. The lead will be created when you run a new audit or import manually.")
     
     # Tech stack
     if data.get('tech_stack'):
@@ -4808,7 +5524,7 @@ def render_audit_detail(audit):
     
     # Action buttons
     st.markdown("---")
-    col_btn1, col_btn2, col_btn3 = st.columns(3)
+    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
     
     with col_btn1:
         # Download PDF - only generate when clicked
@@ -4843,6 +5559,22 @@ def render_audit_detail(audit):
             st.rerun()
     
     with col_btn3:
+        # Send Email button
+        if lead and lead.email:
+            if st.button("📧 Send Email", key=f"send_email_{audit.id}", use_container_width=True, type="primary"):
+                # Set up session state for email sending
+                st.session_state.email_target_lead_id = lead.id
+                st.session_state.email_target_audit_id = audit.id
+                st.session_state.email_target_domain = lead.domain
+                st.session_state.email_target_address = lead.email
+                st.session_state.current_section = 'Email Outreach'
+                st.toast(f"📧 Opening email for {lead.domain}")
+                st.rerun()
+        else:
+            st.button("📧 Send Email", key=f"send_email_{audit.id}_disabled", use_container_width=True, disabled=True, 
+                      help="No email address found for this lead")
+    
+    with col_btn4:
         # Delete audit with confirmation
         confirm_key = f"_confirm_delete_{audit.id}"
         if st.session_state.get(confirm_key):
@@ -4911,75 +5643,354 @@ def show_competitor_analysis():
             st.dataframe(pd.DataFrame(comp_data), use_container_width=True)
 
 def show_email_outreach():
-    """Email outreach page."""
+    """Email outreach page with CRM integration.
+    
+    Features:
+    - Lead selection from CRM database
+    - Pre-fill from audit detail navigation
+    - Actual email sending with SMTP
+    - Automatic approached status update after send
+    - Email templates with variable substitution
+    """
+    logger = logging.getLogger("sales_engine")
+    
+    # Code Nest branding CSS
+    st.markdown("""
+    <style>
+    .email-compose-card {
+        background: #f8faf9;
+        border: 1px solid #e0e0e0;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+    }
+    .email-success {
+        background: linear-gradient(135deg, #2b945f 0%, #3cb371 100%);
+        color: white;
+        padding: 1rem 1.5rem;
+        border-radius: 8px;
+        text-align: center;
+    }
+    .email-header {
+        background: linear-gradient(135deg, #0c3740 0%, #1a5a6e 100%);
+        color: white;
+        padding: 0.75rem 1rem;
+        border-radius: 8px 8px 0 0;
+        font-family: 'Poppins', sans-serif;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
     st.title("📧 Email Outreach")
-    st.markdown("Manage email campaigns to leads")
+    st.markdown("Send personalized emails to leads with automatic CRM tracking")
     st.markdown("---")
     
     if not DB_AVAILABLE:
         st.error("Database required")
-    else:
-        email_sub1, email_sub2 = st.tabs(["Send Email", "Email Templates"])
+        return
+    
+    email_sub1, email_sub2, email_sub3 = st.tabs(["📨 Send Email", "📋 Email Templates", "📊 Outreach Stats"])
+    
+    with email_sub1:
+        leads = get_leads_cached()
         
-        with email_sub1:
-            leads = get_leads_cached()
+        # Check for pre-filled target from audit detail
+        target_lead_id = st.session_state.pop('email_target_lead_id', None)
+        target_domain = st.session_state.pop('email_target_domain', None)
+        target_email = st.session_state.pop('email_target_address', None)
+        target_audit_id = st.session_state.pop('email_target_audit_id', None)
+        
+        if leads:
+            # Build lead options dictionary
+            lead_opts = {}
+            default_idx = 0
+            for idx, l in enumerate(leads):
+                label = f"{l.domain} (Score: {l.health_score or 'N/A'}, Opp: {l.opportunity_rating or 'N/A'})"
+                lead_opts[label] = l
+                # Set default to target lead if coming from audit detail
+                if target_lead_id and l.id == target_lead_id:
+                    default_idx = idx
             
-            if leads:
-                lead_opts = {f"{l.domain} (Score: {l.health_score}, Opp: {l.opportunity_rating})": l for l in leads}
-                selected_name = st.selectbox("Select a lead", list(lead_opts.keys()), key="lead_select")
-                selected_lead = lead_opts[selected_name] if selected_name else None
+            # CRM quick stats
+            col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+            with col_stat1:
+                st.metric("📊 Total Leads", len(leads))
+            with col_stat2:
+                not_approached = sum(1 for l in leads if not l.approached)
+                st.metric("📧 Not Approached", not_approached)
+            with col_stat3:
+                with_email = sum(1 for l in leads if l.email)
+                st.metric("✉️ With Email", with_email)
+            with col_stat4:
+                hot_leads = sum(1 for l in leads if l.lead_status == "hot")
+                st.metric("🔥 Hot Leads", hot_leads)
+            
+            st.markdown("---")
+            
+            # Lead selection
+            selected_name = st.selectbox(
+                "🎯 Select a lead to email", 
+                list(lead_opts.keys()), 
+                index=default_idx if default_idx < len(lead_opts) else 0,
+                key="lead_select"
+            )
+            selected_lead = lead_opts[selected_name] if selected_name else None
+            
+            if selected_lead:
+                # Lead info card with CRM fields
+                st.markdown("<div class='email-header'>📋 Lead Information</div>", unsafe_allow_html=True)
                 
-                if selected_lead:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown(f"**Domain:** {selected_lead.domain}")
-                        st.markdown(f"**Score:** {selected_lead.health_score}")
-                        st.markdown(f"**Opportunity:** {selected_lead.opportunity_rating}/100")
-                    with col2:
-                        st.markdown(f"**Email:** {selected_lead.email or 'N/A'}")
-                        new_status = st.selectbox("Status", ["new", "contacted", "responded", "converted", "lost"], index=["new", "contacted", "responded", "converted", "lost"].index(selected_lead.status))
-                        if new_status != selected_lead.status and st.button("Update Status"):
-                            update_lead_status(selected_lead.id, new_status)
-                            st.rerun()
-                    
-                    st.divider()
-                    st.markdown("#### Compose Email")
-                    
-                    recipient = st.text_input("Recipient", value=selected_lead.email or "")
-                    subject = st.text_input("Subject", value=f"Website Review - {selected_lead.domain}")
-                    body = st.text_area("Body", height=250)
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("Save Draft"):
-                            st.info("Draft saved")
-                    with col2:
-                        if st.button("Send Email", type="primary"):
-                            st.success("Email sent!")
-            else:
-                st.info("No leads found")
-        
-        with email_sub2:
-            st.markdown("#### Manage Email Templates")
-            
-            template_name = st.text_input("Template name")
-            template_subject = st.text_input("Subject")
-            template_body = st.text_area("Body template", height=200, help="Use {{domain}}, {{score}}, {{company}} as variables")
-            
-            if st.button("Save Template"):
-                if save_email_template(template_name, template_subject, template_body):
-                    st.success("Template saved!")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.markdown(f"**🌐 Domain:** {selected_lead.domain}")
+                    st.markdown(f"**📊 Score:** {selected_lead.health_score or 'N/A'}")
+                    st.markdown(f"**🎯 Opportunity:** {selected_lead.opportunity_rating or 'N/A'}/100")
+                with col2:
+                    st.markdown(f"**📧 Email:** {selected_lead.email or 'Not found'}")
+                    st.markdown(f"**📞 Phone:** {selected_lead.phone or 'Not found'}")
+                    st.markdown(f"**🏢 Company:** {selected_lead.company_name or 'Unknown'}")
+                with col3:
+                    # CRM status badges
+                    approached_icon = "✅ Yes" if selected_lead.approached else "❌ No"
+                    st.markdown(f"**📮 Approached:** {approached_icon}")
+                    st.markdown(f"**🎯 Status:** {selected_lead.lead_status or 'warm'}")
+                    st.markdown(f"**📊 Pipeline:** {selected_lead.pipeline_stage or 'new'}")
+                
+                # Inline status update
+                st.markdown("---")
+                col_status1, col_status2 = st.columns([3, 1])
+                with col_status1:
+                    new_status = st.selectbox(
+                        "Update lead status after send", 
+                        ["new", "contacted", "responded", "converted", "lost"], 
+                        index=["new", "contacted", "responded", "converted", "lost"].index(selected_lead.status) if selected_lead.status in ["new", "contacted", "responded", "converted", "lost"] else 0,
+                        key="email_lead_status"
+                    )
+                with col_status2:
+                    st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
+                    if new_status != selected_lead.status and st.button("Update Status"):
+                        update_lead_status(selected_lead.id, new_status)
+                        st.success("✅ Status updated!")
+                        st.rerun()
+                
+                st.markdown("---")
+                st.markdown("#### ✍️ Compose Email")
+                
+                # Email fields
+                recipient = st.text_input("📧 Recipient", value=selected_lead.email or target_email or "")
+                
+                # Get latest audit for this domain for subject/body template
+                db = get_db()
+                latest_audit = None
+                audit_data = None
+                if db:
+                    try:
+                        latest_audit = db.query(Audit).filter(Audit.domain == selected_lead.domain).order_by(Audit.created_at.desc()).first()
+                        if latest_audit:
+                            audit_data = convert_audit_to_data_dict(latest_audit)
+                    except Exception as e:
+                        logger.warning(f"Error loading audit for email: {e}")
+                    finally:
+                        db.close()
+                
+                # Default subject with personalization
+                default_subject = f"Quick Website Review for {selected_lead.company_name or selected_lead.domain}"
+                subject = st.text_input("📝 Subject", value=default_subject)
+                
+                # Build body with AI draft if available
+                default_body = ""
+                if audit_data and audit_data.get('ai', {}).get('email'):
+                    default_body = audit_data['ai']['email']
                 else:
-                    st.error("Failed to save")
-            
-            st.divider()
-            st.markdown("#### Existing Templates")
-            
-            templates = load_email_templates()
+                    default_body = f"""Hi,
+
+I recently analyzed your website at {selected_lead.domain} and noticed a few opportunities to improve your online presence.
+
+Your website scored {selected_lead.health_score or 'N/A'}/100 on our health check. I'd love to share some insights that could help improve your site's performance and conversions.
+
+Would you be interested in a quick call to discuss?
+
+Best regards,
+The Code Nest Team
+"""
+                
+                body = st.text_area("📄 Body", value=default_body, height=250)
+                
+                # Attachment options
+                col_attach1, col_attach2 = st.columns(2)
+                with col_attach1:
+                    attach_pdf = st.checkbox("📎 Attach PDF Report", value=True if latest_audit else False,
+                                            disabled=not latest_audit, 
+                                            help="Attach the audit PDF report to the email")
+                with col_attach2:
+                    mark_approached = st.checkbox("✅ Mark as Approached on Send", value=True,
+                                                  help="Automatically update CRM when email is sent")
+                
+                # Action buttons
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+                    if st.button("💾 Save Draft", use_container_width=True):
+                        # Save to session for later
+                        st.session_state.email_draft = {
+                            'lead_id': selected_lead.id,
+                            'recipient': recipient,
+                            'subject': subject,
+                            'body': body
+                        }
+                        st.success("💾 Draft saved!")
+                
+                with col_btn2:
+                    if st.button("📤 Send Email", type="primary", use_container_width=True):
+                        if not recipient:
+                            st.error("❌ Recipient email is required")
+                        elif not subject:
+                            st.error("❌ Subject is required")
+                        elif not body:
+                            st.error("❌ Email body is required")
+                        else:
+                            with st.spinner("Sending email..."):
+                                try:
+                                    # Get PDF if requested
+                                    pdf_bytes = None
+                                    pdf_filename = None
+                                    if attach_pdf and latest_audit:
+                                        pdf_bytes = get_audit_pdf(latest_audit.id)
+                                        if not pdf_bytes and audit_data:
+                                            pdf_bytes = generate_pdf(audit_data)
+                                        pdf_filename = f"website_audit_{selected_lead.domain}.pdf"
+                                    
+                                    # Send the email
+                                    success, message = send_branded_email_with_pdf(
+                                        to_email=recipient,
+                                        subject=subject,
+                                        body=body,
+                                        pdf_bytes=pdf_bytes,
+                                        filename=pdf_filename or "audit_report.pdf"
+                                    )
+                                    
+                                    if success:
+                                        st.markdown("""
+                                        <div class='email-success'>
+                                            ✅ <strong>Email Sent Successfully!</strong><br>
+                                            Your email has been delivered.
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                        
+                                        # Update CRM if requested
+                                        if mark_approached:
+                                            mark_lead_as_approached(selected_lead.id, update_pipeline=True)
+                                            st.info("✅ Lead marked as approached in CRM")
+                                        
+                                        # Log outreach
+                                        logger.info(f"Email sent to {recipient} for lead {selected_lead.domain}")
+                                        
+                                        # Clear draft
+                                        st.session_state.pop('email_draft', None)
+                                    else:
+                                        st.error(f"❌ Failed to send email: {message}")
+                                        logger.error(f"Email send failed: {message}")
+                                        
+                                except Exception as e:
+                                    st.error(f"❌ Error sending email: {str(e)}")
+                                    logger.error(f"Email send error: {str(e)}")
+        else:
+            st.info("📭 No leads found. Run some audits first to generate leads!")
+    
+    with email_sub2:
+        st.markdown("### 📋 Manage Email Templates")
+        st.markdown("Create reusable templates with variable substitution")
+        
+        template_name = st.text_input("Template name", placeholder="e.g., Initial Outreach")
+        template_subject = st.text_input("Subject", placeholder="e.g., Quick Website Review for {{company}}")
+        template_body = st.text_area(
+            "Body template", 
+            height=200, 
+            placeholder="Hi {{name}},\n\nI noticed your website {{domain}} scored {{score}}/100...",
+            help="Available variables: {{domain}}, {{score}}, {{company}}, {{name}}, {{issues}}"
+        )
+        
+        st.markdown("""
+        **Available variables:**
+        - `{{domain}}` - Website domain
+        - `{{score}}` - Health score
+        - `{{company}}` - Company name
+        - `{{name}}` - Contact name
+        - `{{issues}}` - Number of issues found
+        """)
+        
+        if st.button("💾 Save Template", type="primary"):
+            if template_name and template_subject and template_body:
+                if save_email_template(template_name, template_subject, template_body):
+                    st.success("✅ Template saved!")
+                else:
+                    st.error("❌ Failed to save template")
+            else:
+                st.warning("⚠️ Please fill in all fields")
+        
+        st.divider()
+        st.markdown("#### 📚 Existing Templates")
+        
+        templates = load_email_templates()
+        if templates:
             for name, template in templates.items():
-                with st.expander(name):
-                    st.write(f"**Subject:** {template['subject']}")
-                    st.write(f"**Body:** {template['body']}")
+                with st.expander(f"📄 {name}"):
+                    st.markdown(f"**Subject:** {template.get('subject', 'N/A')}")
+                    st.markdown(f"**Body:**")
+                    st.code(template.get('body', ''), language=None)
+                    if st.button(f"🗑️ Delete", key=f"del_template_{name}"):
+                        templates.pop(name, None)
+                        save_email_templates(templates)
+                        st.rerun()
+        else:
+            st.info("No templates saved yet")
+    
+    with email_sub3:
+        st.markdown("### 📊 Outreach Statistics")
+        
+        leads = get_leads_cached()
+        if leads:
+            # Calculate stats
+            total = len(leads)
+            approached = sum(1 for l in leads if l.approached)
+            not_approached = total - approached
+            hot = sum(1 for l in leads if l.lead_status == "hot")
+            warm = sum(1 for l in leads if l.lead_status == "warm")
+            cold = sum(1 for l in leads if l.lead_status == "cold")
+            
+            # Pipeline breakdown
+            new_stage = sum(1 for l in leads if l.pipeline_stage == "new")
+            contacted = sum(1 for l in leads if l.pipeline_stage == "contacted")
+            followup = sum(1 for l in leads if l.pipeline_stage == "follow-up")
+            closed = sum(1 for l in leads if l.pipeline_stage == "closed")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("📊 Total Leads", total)
+                st.metric("✅ Approached", approached)
+                st.metric("❌ Not Approached", not_approached)
+            with col2:
+                st.metric("🔥 Hot", hot)
+                st.metric("☀️ Warm", warm)
+                st.metric("❄️ Cold", cold)
+            with col3:
+                st.metric("🆕 New", new_stage)
+                st.metric("📞 Contacted", contacted)
+                st.metric("📅 Follow-up", followup)
+                st.metric("✅ Closed", closed)
+            
+            # Conversion funnel visualization
+            st.markdown("---")
+            st.markdown("#### 📈 Pipeline Funnel")
+            
+            funnel_data = {
+                "Stage": ["New", "Contacted", "Follow-up", "Closed"],
+                "Count": [new_stage, contacted, followup, closed]
+            }
+            import pandas as pd
+            df_funnel = pd.DataFrame(funnel_data)
+            st.bar_chart(df_funnel.set_index("Stage"))
+        else:
+            st.info("No leads to show statistics for")
 
 def show_lead_management():
     """Advanced lead management with CSV import, AI enrichment, and service scoring."""
@@ -7566,13 +8577,17 @@ def delete_single_audit(audit_id: int) -> tuple:
 # AUDIT HISTORY - DATABASE FUNCTIONS (FIXED)
 # ============================================================================
 
-def save_audit_to_db(data, comparison_group=None, username=None):
-    """Save audit to database with user tracking.
+def save_audit_to_db(data, comparison_group=None, username=None, source="single"):
+    """Save audit to database with user tracking and full CRM lead creation.
+    
+    This function saves the audit and creates/updates the associated Lead record
+    with proper CRM fields for lead management workflow.
     
     Args:
-        data: Audit data dictionary
+        data: Audit data dictionary from run_audit()
         comparison_group: Optional group name for competitor analysis
         username: Username of the creator (auto-detected if not provided)
+        source: Source of the audit - "single", "bulk", or "manual"
     
     Returns:
         audit_id on success, None on failure
@@ -7607,7 +8622,7 @@ def save_audit_to_db(data, comparison_group=None, username=None):
         # Safely get AI data
         ai_data = data.get('ai', {}) or {}
         
-        # Create audit record with user tracking
+        # Create audit record with user tracking and source
         audit = Audit(
             url=url,
             domain=domain,
@@ -7622,7 +8637,8 @@ def save_audit_to_db(data, comparison_group=None, username=None):
             ai_solutions=ai_data.get('solutions'),
             ai_email=ai_data.get('email'),
             comparison_group=comparison_group,
-            username=username,  # Track which user created this audit
+            username=username,
+            source=source,  # Track origin: single, bulk, manual
             created_at=datetime.utcnow()
         )
         
@@ -7633,31 +8649,73 @@ def save_audit_to_db(data, comparison_group=None, username=None):
         # Store audit_id in data for PDF generation
         data['audit_id'] = audit.id
         
-        logger.info(f"Audit saved: ID={audit.id}, domain={domain}, user={username}")
+        logger.info(f"Audit saved: ID={audit.id}, domain={domain}, user={username}, source={source}")
         
-        # Create/update lead (safely)
+        # =====================================================================
+        # CRM LEAD CREATION/UPDATE - Full integration
+        # =====================================================================
         try:
             existing_lead = db.query(Lead).filter(Lead.domain == domain).first()
             opp_score = calculate_opportunity_score(data)
             
+            # Try to extract phone from raw HTML if available
+            extracted_phone = None
+            if data.get('raw_html'):
+                extracted_phone = extract_phone_from_html(data.get('raw_html'))
+            
+            # Get first email from the audit
+            first_email = data.get('emails', [None])[0] if data.get('emails') else None
+            
             if not existing_lead:
+                # CREATE NEW LEAD with CRM fields
                 lead = Lead(
                     domain=domain,
-                    email=data.get('emails', [None])[0] if data.get('emails') else None,
+                    email=first_email,
+                    phone=extracted_phone,
                     health_score=data.get('score', 0),
                     opportunity_rating=opp_score,
-                    created_at=datetime.utcnow()
+                    # CRM fields
+                    approached=False,
+                    lead_status="warm",  # Default new leads to warm
+                    interested="maybe",
+                    pipeline_stage="new",
+                    source=source,  # Track if from single/bulk
+                    assigned_user=username,  # Assign to creator
+                    last_audit_id=audit.id,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
                 )
                 db.add(lead)
+                logger.info(f"Lead created: domain={domain}, source={source}, assigned={username}")
             else:
+                # UPDATE EXISTING LEAD
                 existing_lead.health_score = data.get('score', 0)
                 existing_lead.opportunity_rating = opp_score
+                existing_lead.last_audit_id = audit.id
                 existing_lead.updated_at = datetime.utcnow()
+                
+                # Update email if we found one and didn't have it
+                if first_email and not existing_lead.email:
+                    existing_lead.email = first_email
+                
+                # Update phone if we found one and didn't have it
+                if extracted_phone and not existing_lead.phone:
+                    existing_lead.phone = extracted_phone
+                
+                # Don't overwrite source if already set (preserve original source)
+                # Don't overwrite approached status or pipeline_stage
+                
+                logger.debug(f"Lead updated: domain={domain}, new_audit={audit.id}")
             
             db.commit()
+            
         except Exception as lead_error:
             logger.warning(f"Failed to create/update lead for {domain}: {str(lead_error)}")
             # Don't fail the whole operation if lead update fails
+            try:
+                db.rollback()
+            except:
+                pass
         
         # Invalidate cache so new audit appears immediately
         invalidate_audit_cache()
@@ -7813,6 +8871,17 @@ def load_email_templates():
         return {}
     except Exception:
         return {}
+
+
+def save_email_templates(templates: dict):
+    """Save the entire templates dictionary."""
+    templates_file = Path(__file__).parent / "email_templates.json"
+    try:
+        templates_file.write_text(json.dumps(templates, indent=2))
+        return True
+    except Exception:
+        return False
+
 
 class PDFReport(FPDF):
     """

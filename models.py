@@ -24,7 +24,7 @@ class Audit(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     url = Column(String(500), nullable=False)
-    domain = Column(String(255), nullable=False)
+    domain = Column(String(255), nullable=False, index=True)
     health_score = Column(Integer, default=100)
     psi_score = Column(Integer, nullable=True)
     domain_age = Column(String(100), nullable=True)
@@ -35,7 +35,13 @@ class Audit(Base):
     ai_impact = Column(Text, nullable=True)
     ai_solutions = Column(Text, nullable=True)
     ai_email = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    # User tracking - associates audit with user who created it
+    username = Column(String(150), nullable=True, index=True)
+    
+    # Source tracking - single, bulk, or manual
+    source = Column(String(50), default="single")
     
     # For competitor analysis grouping
     comparison_group = Column(String(100), nullable=True)
@@ -50,10 +56,10 @@ class Lead(Base):
     __tablename__ = "leads"
     
     id = Column(Integer, primary_key=True, index=True)
-    domain = Column(String(255), nullable=False)
+    domain = Column(String(255), nullable=False, index=True)
     email = Column(String(255), nullable=True)
     company_name = Column(String(255), nullable=True)
-    phone = Column(String(20), nullable=True)
+    phone = Column(String(50), nullable=True)  # Extended for international formats
     address = Column(Text, nullable=True)
     place_id = Column(String(500), nullable=True)  # Google Places ID
     city = Column(String(100), nullable=True)
@@ -68,11 +74,34 @@ class Lead(Base):
     estimated_revenue = Column(String(50), nullable=True)
     services_needed = Column(JSON, default=list)  # Array of service scores
     service_priorities = Column(JSON, default=dict)  # {"website_dev": 85, "seo": 90, ...}
-    status = Column(String(50), default="new")  # new, contacted, responded, converted, lost
+    status = Column(String(50), default="new")  # Legacy: new, contacted, responded, converted, lost
     notes = Column(Text, nullable=True)
     ai_enrichment = Column(JSON, nullable=True)  # Stores AI analysis
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # =========================================================================
+    # CRM FIELDS - Added for proper lead management workflow
+    # =========================================================================
+    
+    # Outreach tracking
+    approached = Column(Boolean, default=False, nullable=False)  # Has lead been contacted?
+    approached_date = Column(DateTime, nullable=True)  # When first approached
+    follow_up_date = Column(DateTime, nullable=True)  # Scheduled follow-up
+    
+    # Lead qualification
+    lead_status = Column(String(20), default="warm")  # hot, warm, cold
+    interested = Column(String(20), default="maybe")  # yes, no, maybe
+    
+    # Pipeline management
+    pipeline_stage = Column(String(50), default="new")  # new, contacted, follow-up, closed
+    assigned_user = Column(String(150), nullable=True)  # Username of assigned salesperson
+    
+    # Source tracking
+    source = Column(String(50), default="single")  # single, bulk, manual
+    
+    # Link to most recent audit
+    last_audit_id = Column(Integer, nullable=True)  # Reference to most recent audit
 
 class EmailOutreach(Base):
     __tablename__ = "email_outreach"
@@ -123,8 +152,50 @@ def init_db():
         # Migrate existing tables to add missing columns
         migrate_leads_table()
         migrate_users_table()
+        migrate_audits_table()
         return True
     return False
+
+
+def migrate_audits_table():
+    """Add username and source columns to audits table if they don't exist."""
+    if not engine:
+        return
+    
+    inspector = __import__('sqlalchemy').inspect(engine)
+    if 'audits' not in inspector.get_table_names():
+        return
+    
+    audits_columns = [c['name'] for c in inspector.get_columns('audits')]
+    
+    with engine.connect() as conn:
+        # Add username column for user tracking
+        if 'username' not in audits_columns:
+            try:
+                conn.execute(__import__('sqlalchemy').text('ALTER TABLE audits ADD COLUMN username VARCHAR(150)'))
+                conn.commit()
+            except Exception:
+                pass
+        
+        # Add source column for tracking origin (single/bulk/manual)
+        if 'source' not in audits_columns:
+            try:
+                conn.execute(__import__('sqlalchemy').text('ALTER TABLE audits ADD COLUMN source VARCHAR(50) DEFAULT "single"'))
+                conn.commit()
+            except Exception:
+                pass
+        
+        # Create indexes for faster queries
+        for idx_name, idx_col in [
+            ('ix_audits_username', 'username'),
+            ('ix_audits_domain', 'domain'),
+            ('ix_audits_created_at', 'created_at')
+        ]:
+            try:
+                conn.execute(__import__('sqlalchemy').text(f'CREATE INDEX IF NOT EXISTS {idx_name} ON audits ({idx_col})'))
+                conn.commit()
+            except Exception:
+                pass
 
 def migrate_users_table():
     """Add api_keys and api_keys_updated_at columns to users table if they don't exist."""
@@ -161,9 +232,10 @@ def migrate_leads_table():
     inspector = __import__('sqlalchemy').inspect(engine)
     leads_columns = [c['name'] for c in inspector.get_columns('leads')] if 'leads' in inspector.get_table_names() else []
     
-    # List of columns that should exist
+    # List of columns that should exist (including new CRM fields)
     required_columns = {
-        'phone': 'ALTER TABLE leads ADD COLUMN phone VARCHAR(20)',
+        # Original fields
+        'phone': 'ALTER TABLE leads ADD COLUMN phone VARCHAR(50)',
         'address': 'ALTER TABLE leads ADD COLUMN address TEXT',
         'place_id': 'ALTER TABLE leads ADD COLUMN place_id VARCHAR(500)',
         'city': 'ALTER TABLE leads ADD COLUMN city VARCHAR(100)',
@@ -181,6 +253,17 @@ def migrate_leads_table():
         'ai_enrichment': 'ALTER TABLE leads ADD COLUMN ai_enrichment JSON',
         'opportunity_rating': 'ALTER TABLE leads ADD COLUMN opportunity_rating INTEGER DEFAULT 0',
         'updated_at': 'ALTER TABLE leads ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP',
+        
+        # NEW CRM FIELDS
+        'approached': 'ALTER TABLE leads ADD COLUMN approached BOOLEAN DEFAULT 0',
+        'approached_date': 'ALTER TABLE leads ADD COLUMN approached_date DATETIME',
+        'follow_up_date': 'ALTER TABLE leads ADD COLUMN follow_up_date DATETIME',
+        'lead_status': 'ALTER TABLE leads ADD COLUMN lead_status VARCHAR(20) DEFAULT "warm"',
+        'interested': 'ALTER TABLE leads ADD COLUMN interested VARCHAR(20) DEFAULT "maybe"',
+        'pipeline_stage': 'ALTER TABLE leads ADD COLUMN pipeline_stage VARCHAR(50) DEFAULT "new"',
+        'assigned_user': 'ALTER TABLE leads ADD COLUMN assigned_user VARCHAR(150)',
+        'source': 'ALTER TABLE leads ADD COLUMN source VARCHAR(50) DEFAULT "single"',
+        'last_audit_id': 'ALTER TABLE leads ADD COLUMN last_audit_id INTEGER',
     }
     
     # Add missing columns
@@ -193,6 +276,13 @@ def migrate_leads_table():
                 except Exception as e:
                     # Column might already exist or be incompatible, continue
                     pass
+        
+        # Create index on domain for faster lookups
+        try:
+            conn.execute(__import__('sqlalchemy').text('CREATE INDEX IF NOT EXISTS ix_leads_domain ON leads (domain)'))
+            conn.commit()
+        except Exception:
+            pass
 
 def get_db():
     """Get database session."""
