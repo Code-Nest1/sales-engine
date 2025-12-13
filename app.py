@@ -2254,16 +2254,31 @@ def init_app_session():
         st.session_state.session_token = None
     
     # -------------------------------------------------------------------------
-    # API KEYS (CRITICAL - never overwrite if set, even on logout)
+    # API KEYS (CRITICAL - never overwrite if already set with a value)
+    # Only initialize if not present. Don't overwrite with empty env vars.
+    # The actual loading from DB happens in reload_user_api_keys() after login.
     # -------------------------------------------------------------------------
     if 'OPENAI_API_KEY' not in st.session_state:
-        st.session_state.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+        env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        st.session_state.OPENAI_API_KEY = env_key if env_key else ""
     
     if 'GOOGLE_API_KEY' not in st.session_state:
-        st.session_state.GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
+        env_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        st.session_state.GOOGLE_API_KEY = env_key if env_key else ""
     
     if 'SLACK_WEBHOOK' not in st.session_state:
-        st.session_state.SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "").strip()
+        env_key = os.environ.get("SLACK_WEBHOOK", "").strip()
+        st.session_state.SLACK_WEBHOOK = env_key if env_key else ""
+    
+    # SMTP settings (stored in session for runtime use)
+    if '_smtp_host' not in st.session_state:
+        st.session_state['_smtp_host'] = ""
+    if '_smtp_port' not in st.session_state:
+        st.session_state['_smtp_port'] = 587
+    if '_smtp_user' not in st.session_state:
+        st.session_state['_smtp_user'] = ""
+    if '_smtp_pass' not in st.session_state:
+        st.session_state['_smtp_pass'] = ""
     
     # -------------------------------------------------------------------------
     # 2FA STATE
@@ -2518,10 +2533,11 @@ def _clear_auth_state_only():
     
     logger.debug(f"Auth state cleared for user: {current_user}")
     
-    # DO NOT clear these keys:
-    # - OPENAI_API_KEY, GOOGLE_API_KEY, SLACK_WEBHOOK
-    # - current_audit_data, audit_bulk_selected
-    # - bulk_scan_active, bulk_scan_session_id
+    # CRITICAL: DO NOT clear these keys - they must persist across logout/login:
+    # - OPENAI_API_KEY, GOOGLE_API_KEY, SLACK_WEBHOOK (API keys)
+    # - _smtp_host, _smtp_port, _smtp_user, _smtp_pass (SMTP settings)
+    # - current_audit_data, audit_bulk_selected (audit state)
+    # - bulk_scan_active, bulk_scan_session_id (bulk scan state)
     # - current_section (navigation)
 
 
@@ -2531,10 +2547,11 @@ def logout_user():
     
     This must:
     - Delete only auth-related keys
-    - Keep all other session keys (including API keys & audit data)
+    - Keep all other session keys (including API keys, SMTP settings & audit data)
     - Delete session from file storage
     - Clear navigation state for the user
     - Not delete cached audit results on disk
+    - NOT clear API keys or SMTP settings
     """
     logger = logging.getLogger("sales_engine")
     
@@ -2548,6 +2565,7 @@ def logout_user():
         destroy_session(session_token)
     
     # Clear persistence layer state (navigation, current audit selection)
+    # NOTE: This PRESERVES API keys and SMTP settings
     # This preserves disk cache but clears session-specific state
     on_logout_cleanup()
     
@@ -2991,7 +3009,7 @@ def decrypt_key(encrypted_key: str) -> str:
 def get_user_api_keys(username: str) -> dict:
     """Get API keys for a user from database. Returns dict with keys and error status."""
     logger = logging.getLogger("sales_engine")
-    default_keys = {"openai": "", "google": "", "slack": "", "_db_error": False}
+    default_keys = {"openai": "", "google": "", "slack": "", "smtp_host": "", "smtp_port": 587, "smtp_user": "", "smtp_pass": "", "_db_error": False}
     
     if not username:
         logger.warning("get_user_api_keys called with empty username")
@@ -3001,42 +3019,69 @@ def get_user_api_keys(username: str) -> dict:
         db = get_db()
         if not db:
             logger.error(f"Database unavailable when loading API keys for {username}")
-            return {"openai": "", "google": "", "slack": "", "_db_error": True}
+            return {"openai": "", "google": "", "slack": "", "smtp_host": "", "smtp_port": 587, "smtp_user": "", "smtp_pass": "", "_db_error": True}
         
         user = db.query(User).filter(User.username == username).first()
         if not user:
-            logger.warning(f"User not found in database when loading API keys: {username}")
-            db.close()
-            return default_keys
+            # User doesn't exist in DB yet - try to create from JSON
+            users_json = load_users()
+            if username in users_json:
+                user_data = users_json[username]
+                ensure_user_in_database(username, user_data.get("password_hash", ""), is_admin=(user_data.get("role") == "admin"))
+                # Re-query after creation
+                user = db.query(User).filter(User.username == username).first()
+            
+            if not user:
+                logger.warning(f"User not found in database when loading API keys: {username}")
+                db.close()
+                return default_keys
         
         api_keys = user.api_keys or {}
-        # Decrypt keys when retrieving - always return all three keys
-        decrypted = {"openai": "", "google": "", "slack": "", "_db_error": False}
+        # Decrypt keys when retrieving - always return all keys
+        decrypted = {"openai": "", "google": "", "slack": "", "smtp_host": "", "smtp_port": 587, "smtp_user": "", "smtp_pass": "", "_db_error": False}
         for key_name, encrypted_value in api_keys.items():
             if key_name.startswith("_"):
                 continue  # Skip internal flags
             try:
                 if encrypted_value:
-                    decrypted[key_name] = decrypt_key(encrypted_value)
+                    # SMTP port is not encrypted
+                    if key_name == "smtp_port":
+                        decrypted[key_name] = int(encrypted_value) if encrypted_value else 587
+                    elif key_name in ["smtp_host", "smtp_user"]:
+                        # These don't need encryption
+                        decrypted[key_name] = encrypted_value
+                    else:
+                        decrypted[key_name] = decrypt_key(encrypted_value)
             except Exception as decrypt_err:
                 logger.error(f"Failed to decrypt {key_name} for {username}: {str(decrypt_err)}")
-                decrypted[key_name] = ""
+                if key_name == "smtp_port":
+                    decrypted[key_name] = 587
+                else:
+                    decrypted[key_name] = ""
         
         db.close()
-        logger.debug(f"Loaded API keys for {username}: openai={'yes' if decrypted.get('openai') else 'no'}, google={'yes' if decrypted.get('google') else 'no'}, slack={'yes' if decrypted.get('slack') else 'no'}")
+        logger.debug(f"Loaded API keys for {username}: openai={'yes' if decrypted.get('openai') else 'no'}, google={'yes' if decrypted.get('google') else 'no'}, slack={'yes' if decrypted.get('slack') else 'no'}, smtp={'yes' if decrypted.get('smtp_host') else 'no'}")
         return decrypted
     except Exception as e:
         logger.error(f"Error loading API keys for {username}: {str(e)}", exc_info=True)
-        return {"openai": "", "google": "", "slack": "", "_db_error": True}
+        return {"openai": "", "google": "", "slack": "", "smtp_host": "", "smtp_port": 587, "smtp_user": "", "smtp_pass": "", "_db_error": True}
 
 def save_user_api_key(username: str, key_name: str, key_value: str) -> tuple:
-    """Save API key for a user to database (encrypted). Returns (success, error_message)."""
+    """Save API key for a user to database (encrypted). Returns (success, error_message).
+    
+    Handles both API keys (encrypted) and SMTP settings (some unencrypted).
+    """
     logger = logging.getLogger("sales_engine")
     db = None
     
     if not username or not key_name:
         logger.error("save_user_api_key called with empty username or key_name")
         return False, "Invalid username or key name"
+    
+    # SAFETY: Never save empty values for critical keys - this prevents accidental overwriting
+    if key_name in ["openai", "google", "slack", "smtp_pass"] and not key_value:
+        logger.warning(f"Refusing to save empty value for {key_name} - this would clear existing key")
+        return True, None  # Return success but don't save (preserve existing)
     
     try:
         db = get_db()
@@ -3046,21 +3091,32 @@ def save_user_api_key(username: str, key_name: str, key_value: str) -> tuple:
         
         user = db.query(User).filter(User.username == username).first()
         if not user:
-            logger.error(f"User not found in database when saving API key: {username}")
-            db.close()
-            return False, "User not found in database"
+            # Try to create user from JSON if they exist there
+            users_json = load_users()
+            if username in users_json:
+                user_data = users_json[username]
+                ensure_user_in_database(username, user_data.get("password_hash", ""), is_admin=(user_data.get("role") == "admin"))
+                user = db.query(User).filter(User.username == username).first()
+            
+            if not user:
+                logger.error(f"User not found in database when saving API key: {username}")
+                db.close()
+                return False, "User not found in database"
         
         # Initialize api_keys dict if needed
         if not user.api_keys:
             user.api_keys = {}
         
-        # Encrypt key before saving (handle empty value for deletion)
-        if key_value:
-            user.api_keys[key_name] = encrypt_key(key_value)
+        # Handle different key types
+        if key_name == "smtp_port":
+            # SMTP port is stored as-is (integer as string)
+            user.api_keys[key_name] = str(key_value)
+        elif key_name in ["smtp_host", "smtp_user"]:
+            # SMTP host and user are stored unencrypted
+            user.api_keys[key_name] = key_value
         else:
-            # Empty value means delete the key
-            if key_name in user.api_keys:
-                del user.api_keys[key_name]
+            # Encrypt API keys and passwords
+            user.api_keys[key_name] = encrypt_key(key_value)
         
         user.api_keys_updated_at = datetime.utcnow()
         
@@ -3208,7 +3264,7 @@ def verify_2fa_token(secret: str, token: str) -> bool:
         return False
 
 def reload_user_api_keys() -> dict:
-    """Reload API keys from database for current user. Returns status dict."""
+    """Reload API keys and SMTP settings from database for current user. Returns status dict."""
     logger = logging.getLogger("sales_engine")
     current_user = st.session_state.get("current_user")
     
@@ -3224,6 +3280,8 @@ def reload_user_api_keys() -> dict:
     if db_error:
         st.session_state["_api_keys_db_error"] = True
         logger.error(f"Database error while loading API keys for {current_user}")
+        # DON'T overwrite existing session keys on DB error
+        return {"success": False, "error": "Database error"}
     else:
         st.session_state["_api_keys_db_error"] = False
     
@@ -3232,26 +3290,39 @@ def reload_user_api_keys() -> dict:
     env_google = os.environ.get("GOOGLE_API_KEY", "").strip()
     env_slack = os.environ.get("SLACK_WEBHOOK", "").strip()
     
-    # Priority: non-empty env var > user's saved key > empty string
+    # Priority: non-empty env var > user's saved key > EXISTING session value > empty string
     # This ensures env vars only override if they actually have a value
+    # And we NEVER overwrite a valid key with an empty one
     db_openai = user_keys.get("openai", "")
     db_google = user_keys.get("google", "")
     db_slack = user_keys.get("slack", "")
     
-    st.session_state.OPENAI_API_KEY = env_openai if env_openai else db_openai
-    st.session_state.GOOGLE_API_KEY = env_google if env_google else db_google
-    st.session_state.SLACK_WEBHOOK = env_slack if env_slack else db_slack
+    # Get existing session values as fallback
+    existing_openai = st.session_state.get("OPENAI_API_KEY", "")
+    existing_google = st.session_state.get("GOOGLE_API_KEY", "")
+    existing_slack = st.session_state.get("SLACK_WEBHOOK", "")
+    
+    # Apply priority: env > db > existing > empty
+    st.session_state.OPENAI_API_KEY = env_openai or db_openai or existing_openai
+    st.session_state.GOOGLE_API_KEY = env_google or db_google or existing_google
+    st.session_state.SLACK_WEBHOOK = env_slack or db_slack or existing_slack
+    
+    # Load SMTP settings to session state
+    st.session_state["_smtp_host"] = user_keys.get("smtp_host", "")
+    st.session_state["_smtp_port"] = user_keys.get("smtp_port", 587)
+    st.session_state["_smtp_user"] = user_keys.get("smtp_user", "")
+    st.session_state["_smtp_pass"] = user_keys.get("smtp_pass", "")
     
     # Track which source each key came from (for debugging)
     st.session_state["_api_key_sources"] = {
-        "openai": "env" if env_openai else ("db" if db_openai else "none"),
-        "google": "env" if env_google else ("db" if db_google else "none"),
-        "slack": "env" if env_slack else ("db" if db_slack else "none")
+        "openai": "env" if env_openai else ("db" if db_openai else ("session" if existing_openai else "none")),
+        "google": "env" if env_google else ("db" if db_google else ("session" if existing_google else "none")),
+        "slack": "env" if env_slack else ("db" if db_slack else ("session" if existing_slack else "none"))
     }
     
     logger.info(f"API keys loaded for {current_user}: openai={st.session_state['_api_key_sources']['openai']}, google={st.session_state['_api_key_sources']['google']}, slack={st.session_state['_api_key_sources']['slack']}")
     
-    return {"success": not db_error, "error": "Database error" if db_error else None}
+    return {"success": True, "error": None}
 
 def show_auth_page():
     """Enhanced login/signup UI with 2FA support."""
@@ -3458,13 +3529,10 @@ if not session_valid:
     show_auth_page()
     st.stop()
 
-# Step 4: Reload API keys for authenticated user (if not already loaded this run)
-if st.session_state.get("current_user") and not st.session_state.get("_api_keys_loaded_this_run"):
+# Step 4: Reload API keys for authenticated user
+# Always reload on each app run to ensure keys are current from DB
+if st.session_state.get("current_user"):
     reload_user_api_keys()
-    st.session_state["_api_keys_loaded_this_run"] = True
-
-# Reset the per-run flag at start of each run (for next rerun)
-st.session_state["_api_keys_loaded_this_run"] = False
 
 # Get current API keys from session (for backward compatibility)
 OPENAI_API_KEY = st.session_state.get('OPENAI_API_KEY', '')

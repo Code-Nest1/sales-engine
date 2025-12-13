@@ -163,11 +163,15 @@ def reset_persistence_state() -> bool:
     Reset all persistence state (useful for logout or hard reset).
     
     This clears:
-    - All session state containers
+    - Audit cache containers
     - Current audit selection
     - Navigation state
+    - AI cache containers
+    - PDF context containers
     
-    Does NOT clear:
+    Does NOT clear (CRITICAL):
+    - API keys (OPENAI_API_KEY, GOOGLE_API_KEY, SLACK_WEBHOOK)
+    - SMTP settings (_smtp_host, _smtp_port, _smtp_user, _smtp_pass)
     - Disk caches (audit_cache.json, ai_cache.json, etc.)
     - Database records
     
@@ -175,7 +179,7 @@ def reset_persistence_state() -> bool:
         True if reset was successful
     """
     try:
-        # Clear session containers
+        # Clear session containers - but NOT API keys or SMTP settings
         st.session_state._audit_cache = {}
         st.session_state._current_audit_id = None
         st.session_state._ai_cache = {}
@@ -194,7 +198,11 @@ def reset_persistence_state() -> bool:
         except Exception:
             pass
         
-        logger.info("Persistence state reset")
+        # IMPORTANT: Do NOT clear these keys:
+        # - OPENAI_API_KEY, GOOGLE_API_KEY, SLACK_WEBHOOK
+        # - _smtp_host, _smtp_port, _smtp_user, _smtp_pass
+        
+        logger.info("Persistence state reset (API keys preserved)")
         return True
         
     except Exception as e:
