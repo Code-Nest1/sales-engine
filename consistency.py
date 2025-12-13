@@ -541,3 +541,207 @@ bulk_to_dict = normalize_bulk_result
 _lead_to_dict = normalize_lead
 _audit_to_dict = normalize_audit
 _bulk_to_dict = normalize_bulk_result
+
+
+# ============================================================================
+# CRASH-PROOF FIELD RECOVERY (Phase 5 Step 3)
+# ============================================================================
+
+def ensure_audit_defaults(audit: Any) -> Dict[str, Any]:
+    """
+    Ensure all critical audit fields exist with safe defaults.
+    
+    Use this before rendering to guarantee no KeyError or missing field crashes.
+    This goes beyond normalize_audit by ensuring UI-critical fields are always present.
+    
+    Args:
+        audit: Audit dict (should already be normalized, but handles any input)
+    
+    Returns:
+        Dict with all required fields guaranteed
+    """
+    # First normalize if not already a dict
+    if not isinstance(audit, dict):
+        audit = normalize_audit(audit)
+    
+    # Start with defaults
+    result = dict(AUDIT_DEFAULTS)
+    result.update(audit)
+    
+    # Ensure critical numeric fields
+    if result.get("health_score") is None:
+        result["health_score"] = 0
+    result["score"] = result["health_score"]  # Alias
+    
+    if result.get("psi_score") is None:
+        result["psi_score"] = 0
+    result["psi"] = result["psi_score"]  # Alias
+    
+    # Ensure critical list fields
+    if not isinstance(result.get("issues"), list):
+        result["issues"] = []
+    result["issue_count"] = len(result["issues"])
+    
+    if not isinstance(result.get("tech_stack"), list):
+        result["tech_stack"] = []
+    result["tech"] = result["tech_stack"]  # Alias
+    
+    if not isinstance(result.get("emails_found"), list):
+        result["emails_found"] = []
+    
+    # Ensure string fields
+    if not result.get("domain"):
+        result["domain"] = "Unknown"
+    
+    if not result.get("domain_age"):
+        result["domain_age"] = "Unknown"
+    
+    if not result.get("created_at"):
+        result["created_at"] = ""
+    result["timestamp"] = result["created_at"]  # Alias
+    
+    # Ensure AI fields are a proper dict structure
+    result["ai"] = {
+        "summary": _safe_str(result.get("ai_summary")),
+        "impact": _safe_str(result.get("ai_impact")),
+        "solutions": _safe_str(result.get("ai_solutions")),
+        "email": _safe_str(result.get("ai_email")),
+        "email_subject": _safe_str(result.get("ai_email_subject")),
+    }
+    
+    return result
+
+
+def ensure_lead_defaults(lead: Any) -> Dict[str, Any]:
+    """
+    Ensure all critical CRM lead fields exist with safe defaults.
+    
+    Use this before rendering to guarantee no KeyError or missing field crashes.
+    
+    Args:
+        lead: Lead dict (should already be normalized, but handles any input)
+    
+    Returns:
+        Dict with all required CRM fields guaranteed
+    """
+    # First normalize if not already a dict
+    if not isinstance(lead, dict):
+        lead = normalize_lead(lead)
+    
+    # Start with defaults
+    result = dict(LEAD_DEFAULTS)
+    result.update(lead)
+    
+    # Ensure critical boolean fields
+    result["approached"] = _safe_bool(result.get("approached"), False)
+    
+    # Ensure date fields are None or valid
+    if result.get("approached_date") == "":
+        result["approached_date"] = None
+    if result.get("follow_up_date") == "":
+        result["follow_up_date"] = None
+    
+    # Ensure status fields have valid enum values
+    if result.get("lead_status") not in ("hot", "warm", "cold"):
+        result["lead_status"] = "cold"
+    
+    if result.get("pipeline_stage") not in ("new", "contacted", "follow-up", "qualified", "proposal", "closed"):
+        result["pipeline_stage"] = "new"
+    
+    if result.get("interested") not in ("yes", "no", "maybe"):
+        result["interested"] = "no"
+    
+    # Ensure string fields
+    if not result.get("notes"):
+        result["notes"] = ""
+    if not result.get("assigned_user"):
+        result["assigned_user"] = ""
+    if not result.get("phone"):
+        result["phone"] = ""
+    if not result.get("domain"):
+        result["domain"] = ""
+    
+    # Ensure numeric fields
+    if result.get("last_audit_id") is None:
+        result["last_audit_id"] = None
+    if result.get("health_score") is None:
+        result["health_score"] = None  # Keep None for "not scanned"
+    
+    # Ensure list/dict fields
+    if not isinstance(result.get("services_needed"), list):
+        result["services_needed"] = []
+    if not isinstance(result.get("service_priorities"), dict):
+        result["service_priorities"] = {}
+    
+    return result
+
+
+def ensure_bulk_defaults(bulk: Any) -> Dict[str, Any]:
+    """
+    Ensure all critical bulk scan fields exist with safe defaults.
+    
+    Use this before rendering to guarantee no KeyError or missing field crashes.
+    
+    Args:
+        bulk: BulkScan dict (should already be normalized, but handles any input)
+    
+    Returns:
+        Dict with all required bulk scan fields guaranteed
+    """
+    # First normalize if not already a dict
+    if not isinstance(bulk, dict):
+        bulk = normalize_bulk_result(bulk)
+    
+    # Start with defaults
+    result = dict(BULK_SCAN_DEFAULTS)
+    result.update(bulk)
+    
+    # Ensure critical numeric fields
+    if result.get("processed_urls") is None:
+        result["processed_urls"] = 0
+    if result.get("total_urls") is None:
+        result["total_urls"] = 0
+    if result.get("paused_at_index") is None:
+        result["paused_at_index"] = 0
+    
+    # Ensure dict fields
+    if not isinstance(result.get("results"), dict):
+        result["results"] = {}
+    
+    # Ensure list fields
+    if not isinstance(result.get("urls"), list):
+        result["urls"] = []
+    
+    # Ensure status is valid
+    if result.get("status") not in ("running", "paused", "completed", "error"):
+        result["status"] = "running"
+    
+    # Ensure session_id
+    if not result.get("session_id"):
+        result["session_id"] = ""
+    
+    return result
+
+
+def safe_render_audit(audit: Any) -> Dict[str, Any]:
+    """
+    Full safety wrapper: normalize + ensure defaults.
+    Use this in UI rendering functions.
+    """
+    return ensure_audit_defaults(normalize_audit(audit))
+
+
+def safe_render_lead(lead: Any) -> Dict[str, Any]:
+    """
+    Full safety wrapper: normalize + ensure defaults.
+    Use this in UI rendering functions.
+    """
+    return ensure_lead_defaults(normalize_lead(lead))
+
+
+def safe_render_bulk(bulk: Any) -> Dict[str, Any]:
+    """
+    Full safety wrapper: normalize + ensure defaults.
+    Use this in UI rendering functions.
+    """
+    return ensure_bulk_defaults(normalize_bulk_result(bulk))

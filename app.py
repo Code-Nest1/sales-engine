@@ -42,6 +42,8 @@ from consistency import (
     normalize_audit, normalize_lead, normalize_bulk_result,
     normalize_audit_list, normalize_lead_list, normalize_bulk_list,
     ensure_audit_fields, ensure_lead_fields,
+    ensure_audit_defaults, ensure_lead_defaults, ensure_bulk_defaults,
+    safe_render_audit, safe_render_lead, safe_render_bulk,
     get_safe_export_columns, safe_timestamp_slice,
     lead_to_dict, audit_to_dict, bulk_to_dict,
     _lead_to_dict, _audit_to_dict, _bulk_to_dict
@@ -91,6 +93,54 @@ from persistence import (
     sync_query_params,
     restore_navigation_on_refresh,
 )
+
+# ============================================================================
+# CRASH-PROOF UI HELPERS (Phase 5 Step 3)
+# ============================================================================
+
+def safe_ui_section(section_name: str):
+    """
+    Decorator for crash-proof UI sections.
+    Wraps a function with try/except and displays user-friendly error.
+    
+    Usage:
+        @safe_ui_section("Audit History")
+        def show_audit_history():
+            ...
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                logger = logging.getLogger("sales_engine")
+                logger.error(f"Error in {section_name}: {str(e)}", exc_info=True)
+                st.error(f"⚠️ Something went wrong in {section_name}. Please try again or refresh the page.")
+                st.expander("🔍 Technical Details").code(str(e))
+                return None
+        return wrapper
+    return decorator
+
+
+def safe_execute(operation_name: str, operation, *args, **kwargs):
+    """
+    Execute an operation safely with automatic error handling.
+    
+    Args:
+        operation_name: Name for logging
+        operation: Callable to execute
+        *args, **kwargs: Arguments to pass to operation
+        
+    Returns:
+        Result of operation, or None on error
+    """
+    logger = logging.getLogger("sales_engine")
+    try:
+        return operation(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"Error in {operation_name}: {str(e)}", exc_info=True)
+        return None
+
 
 # ============================================================================
 # ENHANCED APP CONFIGURATION
@@ -1516,12 +1566,13 @@ def send_audit_report_email(recipient_email, audit_data):
                             <div class="section-title">🤖 AI Analysis Summary</div>
         """
         
-        if audit_data.get('ai'):
+        ai_section = audit_data.get('ai') if isinstance(audit_data.get('ai'), dict) else {}
+        if ai_section:
             html_body += f"""
                             <p><strong>Summary:</strong></p>
-                            <p>{audit_data['ai'].get('summary', 'No summary available')}</p>
+                            <p>{ai_section.get('summary', 'No summary available')}</p>
                             <p><strong>Recommendations:</strong></p>
-                            <p>{audit_data['ai'].get('solutions', 'No recommendations available')}</p>
+                            <p>{ai_section.get('solutions', 'No recommendations available')}</p>
             """
         
         html_body += f"""
@@ -2256,6 +2307,28 @@ def init_app_session():
     if '_session_initialized' not in st.session_state:
         st.session_state._session_initialized = True
         logger.debug("Session state initialized for first time")
+    
+    # -------------------------------------------------------------------------
+    # CRASH-PROOF REQUIRED KEYS (Phase 5 Step 3)
+    # Ensures all critical keys exist with safe defaults
+    # -------------------------------------------------------------------------
+    required_keys = {
+        "nav_state": None,
+        "audit_persistence": {},
+        "audit_tags": {},
+        "crm_selected_lead_id": None,
+        "email_drafts": {},
+        "pdf_context": {},
+        "ai_cache": {},
+        "_current_audit_id": None,
+        "last_bulk_session_id": None,
+        "filter_preferences": {},
+        "export_settings": {},
+    }
+    
+    for key, default_value in required_keys.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
 
 
 def save_login_state(username: str, role: str, email: str = None) -> str:
@@ -4118,6 +4191,13 @@ def show_single_audit():
         st.info("👆 Enter a website URL above and click **Analyze** to start an audit.")
         return
     
+    # Phase 5 Step 3: Ensure all audit fields exist with safe defaults
+    audit_data = ensure_audit_defaults(audit_data)
+    
+    # Ensure issues list is valid
+    if not isinstance(audit_data.get("issues"), list):
+        audit_data["issues"] = []
+    
     # Metrics
     st.markdown("---")
     st.markdown("### 📊 Audit Results")
@@ -4157,19 +4237,24 @@ def show_single_audit():
                 logger.error(f"Error displaying issue {i}: {str(e)}")
                 st.warning(f"Could not display issue #{i}")
     
-    # AI analysis
-    if audit_data.get('ai'):
+    # AI analysis - Phase 5 Step 3: Ensure AI data is always a dict
+    ai_data = audit_data.get('ai')
+    if not isinstance(ai_data, dict):
+        ai_data = {"summary": "", "impact": "", "solutions": "", "email": ""}
+        audit_data['ai'] = ai_data
+    
+    if ai_data:
         st.markdown("---")
         
         # Show cache indicator
-        if audit_data['ai'].get('from_cache'):
+        if ai_data.get('from_cache'):
             st.markdown("### 🤖 AI Analysis _(cached)_")
             st.caption("💾 Using cached AI result to save API costs. Click 'Regenerate' for fresh analysis.")
         else:
             st.markdown("### 🤖 AI Analysis")
         
         # Check if we have structured insights
-        insights = audit_data['ai'].get('insights')
+        insights = ai_data.get('insights')
         
         if insights:
             # Display structured AI insights
@@ -4206,13 +4291,13 @@ def show_single_audit():
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("**Summary**")
-                st.info(audit_data['ai'].get('summary', 'No summary available'))
+                st.info(ai_data.get('summary', 'No summary available'))
                 st.markdown("**Impact**")
-                st.warning(audit_data['ai'].get('impact', 'No impact assessment available'))
+                st.warning(ai_data.get('impact', 'No impact assessment available'))
             
             with col2:
                 st.markdown("**Solutions**")
-                st.success(audit_data['ai'].get('solutions', 'No solutions available'))
+                st.success(ai_data.get('solutions', 'No solutions available'))
         
         # =========================================================================
         # EMAIL OUTREACH SECTION (always shown when AI is available)
@@ -4237,10 +4322,10 @@ def show_single_audit():
         default_email = emails_found[0] if emails_found else ""
         
         # Email subject - use AI generated or default (ensure lowercase)
-        default_subject = audit_data['ai'].get('email_subject', f"quick note about {domain}").lower()
+        default_subject = ai_data.get('email_subject', f"quick note about {domain}").lower()
         
         # Email body - use AI generated cold email
-        default_body = audit_data['ai'].get('email', '')
+        default_body = ai_data.get('email', '')
         
         col1, col2 = st.columns([2, 1])
         
@@ -4767,6 +4852,26 @@ def run_bulk_audit_safe(url: str, openai_key: str, google_key: str) -> tuple:
     """
     logger = logging.getLogger("sales_engine")
     
+    # Phase 5 Step 3: Skip invalid or overly long URLs
+    if not url or not isinstance(url, str):
+        logger.warning(f"Bulk audit skipping invalid URL type: {type(url)}")
+        return None, False, "Invalid URL"
+    
+    url = url.strip()
+    
+    if len(url) > 255:
+        logger.warning(f"Bulk audit skipping URL > 255 chars: {url[:50]}...")
+        return None, False, "URL too long (max 255 chars)"
+    
+    if len(url) < 4:
+        logger.warning(f"Bulk audit skipping URL too short: {url}")
+        return None, False, "URL too short"
+    
+    # Basic domain validation
+    if not any(url.startswith(p) for p in ['http://', 'https://', 'www.']) and '.' not in url:
+        logger.warning(f"Bulk audit skipping invalid domain format: {url}")
+        return None, False, "Invalid domain format"
+    
     try:
         # Run the audit
         audit_data = run_audit(url, openai_key, google_key)
@@ -4774,6 +4879,12 @@ def run_bulk_audit_safe(url: str, openai_key: str, google_key: str) -> tuple:
         if not audit_data:
             logger.warning(f"Bulk audit returned no data for: {url}")
             return None, False, "Audit returned no data"
+        
+        # Check for error in audit_data
+        if isinstance(audit_data, dict) and "error" in audit_data:
+            error_msg = audit_data.get("error", "Unknown error")
+            logger.warning(f"Bulk audit returned error for {url}: {error_msg}")
+            return None, False, error_msg
         
         # Save to database with source="bulk"
         audit_id = save_audit_to_db(audit_data, source="bulk")
@@ -6585,25 +6696,27 @@ def render_audit_detail(audit, audit_dict=None):
             except Exception as e:
                 logger.warning(f"Could not display issue #{i}: {str(e)}")
     
-    # AI analysis
-    if data.get('ai') and data['ai'].get('summary') and data['ai']['summary'] != 'No summary available':
+    # AI analysis - safely access ai section
+    ai_section = data.get('ai') if isinstance(data.get('ai'), dict) else {}
+    if ai_section.get('summary') and ai_section['summary'] != 'No summary available':
         st.markdown("---")
         st.markdown("**🤖 AI Analysis**")
         
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**Summary**")
-            st.info(data['ai'].get('summary', 'No summary available'))
+            st.info(ai_section.get('summary', 'No summary available'))
             st.markdown("**Impact**")
-            st.warning(data['ai'].get('impact', 'No impact assessment available'))
+            st.warning(ai_section.get('impact', 'No impact assessment available'))
         
         with col2:
             st.markdown("**Solutions**")
-            st.success(data['ai'].get('solutions', 'No solutions available'))
+            st.success(ai_section.get('solutions', 'No solutions available'))
         
-        if data['ai'].get('email') and data['ai']['email'] != 'No email draft available':
+        email_draft = ai_section.get('email', '')
+        if email_draft and email_draft != 'No email draft available':
             st.markdown("**📧 Cold Email Draft**")
-            email_text = clean_text(data['ai']['email']) if 'clean_text' in dir() else data['ai']['email']
+            email_text = clean_text(email_draft) if 'clean_text' in dir() else email_draft
             st.text_area("", value=email_text, height=150, key=f"email_draft_{audit_dict['id']}")
     
     # Action buttons
@@ -6892,8 +7005,9 @@ def show_email_outreach():
                 
                 # Build body with AI draft if available
                 default_body = ""
-                if audit_data and audit_data.get('ai', {}).get('email'):
-                    default_body = audit_data['ai']['email']
+                ai_section = audit_data.get('ai') if (audit_data and isinstance(audit_data.get('ai'), dict)) else {}
+                if ai_section.get('email'):
+                    default_body = ai_section['email']
                 else:
                     default_body = f"""Hi,
 
@@ -7592,8 +7706,12 @@ def render_crm_kanban_board():
 
 def render_kanban_lead_card(lead, current_stage: str):
     """Render a single lead card in the Kanban board."""
-    # Ensure lead is a dict (handles ORM objects)
-    lead = lead_to_dict(lead)
+    # Ensure lead is a dict with all defaults (crash-proof)
+    lead = safe_render_lead(lead)
+    
+    # Skip if no valid lead
+    if not lead.get("domain") and not lead.get("id"):
+        return
     
     domain = (lead.get("domain") or "Unknown")[:25]
     company = (lead.get("company_name") or "")[:20] or domain
@@ -7675,12 +7793,14 @@ def render_crm_table_view():
     
     leads = result["data"].get("leads", [])
     
-    # Convert all leads to dicts (handles ORM objects if any)
-    leads = [lead_to_dict(l) for l in leads]
+    # Convert all leads to dicts with crash-proof defaults
+    leads = [safe_render_lead(l) for l in leads]
     
-    # Apply search filter
+    # Apply search filter - skip leads with no domain
     if search_term:
-        leads = [l for l in leads if search_term.lower() in (l.get("domain") or "").lower()]
+        leads = [l for l in leads if l.get("domain") and search_term.lower() in l["domain"].lower()]
+    else:
+        leads = [l for l in leads if l.get("domain")]  # Filter out invalid leads
     
     if not leads:
         st.info("No leads found matching your filters")
@@ -7874,13 +7994,22 @@ def render_crm_lead_detail_panel(lead_id: int):
     
     Called when a lead is selected in the Kanban or Table view.
     """
+    if not lead_id:
+        st.warning("No lead selected")
+        return
+    
     result = db_get_lead_by_id(lead_id)
     
     if not result["success"]:
         st.error(f"Could not load lead: {result.get('error', 'Unknown')}")
         return
     
-    lead = lead_to_dict(result["data"].get("lead", {}))  # Ensure dict
+    # Use crash-proof lead rendering
+    lead = safe_render_lead(result["data"].get("lead", {}))
+    
+    if not lead.get("domain"):
+        st.warning("Lead data is incomplete")
+        return
     
     st.markdown("### 📋 Lead Details")
     
@@ -10934,7 +11063,8 @@ def generate_pdf(data):
     # =========================================================================
     # AI INSIGHTS PAGE
     # =========================================================================
-    if data.get('ai') and data['ai'].get('insights'):
+    ai_section = data.get('ai') if isinstance(data.get('ai'), dict) else {}
+    if ai_section.get('insights'):
         pdf.add_page()
         
         # AI Insights header - centered with branding
@@ -10949,7 +11079,7 @@ def generate_pdf(data):
         pdf.line(70, y, 140, y)
         pdf.ln(10)
         
-        insights = data['ai']['insights']
+        insights = ai_section.get('insights', {})
         
         # Snapshot Summary
         if insights.get('snapshot_summary'):
@@ -11537,140 +11667,156 @@ def show_email_settings():
 
 def show_export_reports():
     """Export audits as PDF or Excel reports."""
-    st.markdown("## 📄 Export Reports")
+    logger = logging.getLogger("sales_engine")
     
-    export_type = st.radio("Export Format", ["PDF (Single)", "Excel (Batch)", "CSV (Data)"], horizontal=True)
-    
-    if export_type == "PDF (Single)":
-        st.markdown("### Export Single Audit as PDF")
+    try:
+        st.markdown("## 📄 Export Reports")
         
-        # Get list of audits and convert to dicts
-        audits_raw = get_audit_history_cached(limit=100)
-        if not audits_raw:
-            st.warning("No audits available to export")
-            return
+        export_type = st.radio("Export Format", ["PDF (Single)", "Excel (Batch)", "CSV (Data)"], horizontal=True)
         
-        # Convert all audits to dicts (handles ORM objects)
-        audits = [audit_to_dict(a) for a in audits_raw]
+        if export_type == "PDF (Single)":
+            st.markdown("### Export Single Audit as PDF")
+            
+            # Get list of audits and convert to dicts
+            audits_raw = get_audit_history_cached(limit=100)
+            if not audits_raw:
+                st.warning("No audits available to export")
+                return
+            
+            # Convert all audits to dicts with safety wrapper
+            audits = [safe_render_audit(a) for a in audits_raw]
+            
+            # Build audit options with safe timestamp handling
+            audit_options = {}
+            for a in audits:
+                domain = a.get('domain') or 'Unknown'
+                timestamp = safe_timestamp_slice(a.get('timestamp') or a.get('created_at'), 10)
+                label = f"{domain} ({timestamp})"
+                audit_options[label] = a
+            
+            if not audit_options:
+                st.warning("No valid audits to display")
+                return
+            
+            selected = st.selectbox("Select Audit", list(audit_options.keys()))
+            
+            if selected and st.button("Generate PDF Report", use_container_width=True, type="primary"):
+                with st.spinner("Generating PDF..."):
+                    audit_data = audit_options[selected]
+                    pdf_bytes = generate_pdf_report(audit_data)
+                    
+                    if pdf_bytes:
+                        st.success("✅ PDF generated successfully")
+                        st.download_button(
+                            label="⬇️ Download PDF Report",
+                            data=pdf_bytes,
+                            file_name=f"audit_{(audit_data.get('domain') or 'report').replace('/', '_')}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True
+                        )
+                    else:
+                        st.error("Error generating PDF")
         
-        # Build audit options with safe timestamp handling
-        audit_options = {}
-        for a in audits:
-            domain = a.get('domain') or 'Unknown'
-            timestamp = a.get('timestamp') or a.get('created_at') or ''
-            ts_label = timestamp[:10] if isinstance(timestamp, str) and len(timestamp) >= 10 else 'N/A'
-            label = f"{domain} ({ts_label})"
-            audit_options[label] = a
+        elif export_type == "Excel (Batch)":
+            st.markdown("### Export Multiple Audits as Excel")
+            
+            audits_raw = get_audit_history_cached(limit=500)
+            if not audits_raw:
+                st.warning("No audits available to export")
+                return
+            
+            # Convert all audits to dicts with safety wrapper
+            audits = [safe_render_audit(a) for a in audits_raw]
+            
+            # Filter options
+            col1, col2 = st.columns(2)
+            with col1:
+                min_score = st.slider("Minimum Score", 0, 100, 0)
+            with col2:
+                max_score = st.slider("Maximum Score", 0, 100, 100)
+            
+            # Safe score filtering
+            filtered_audits = []
+            for a in audits:
+                score = a.get("score") or a.get("health_score") or 0
+                try:
+                    score_int = int(score) if score is not None else 0
+                except (ValueError, TypeError):
+                    score_int = 0
+                if min_score <= score_int <= max_score:
+                    filtered_audits.append(a)
+            
+            if not filtered_audits:
+                st.warning("No audits match your filter criteria")
+                return
+            
+            st.info(f"Exporting {len(filtered_audits)} audits...")
+            
+            if st.button("Generate Excel Report", use_container_width=True, type="primary"):
+                with st.spinner("Generating Excel..."):
+                    excel_bytes = generate_excel_report(filtered_audits)
+                    
+                    if excel_bytes:
+                        st.success("✅ Excel file generated successfully")
+                        st.download_button(
+                            label="⬇️ Download Excel Report",
+                            data=excel_bytes,
+                            file_name=f"audits_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                    else:
+                        st.error("Error generating Excel")
         
-        selected = st.selectbox("Select Audit", list(audit_options.keys()))
-        
-        if selected and st.button("Generate PDF Report", use_container_width=True, type="primary"):
-            with st.spinner("Generating PDF..."):
-                audit_data = audit_options[selected]
-                pdf_bytes = generate_pdf_report(audit_data)
-                
-                if pdf_bytes:
-                    st.success("✅ PDF generated successfully")
-                    st.download_button(
-                        label="⬇️ Download PDF Report",
-                        data=pdf_bytes,
-                        file_name=f"audit_{(audit_data.get('domain') or 'report').replace('/', '_')}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-                else:
-                    st.error("Error generating PDF")
-    
-    elif export_type == "Excel (Batch)":
-        st.markdown("### Export Multiple Audits as Excel")
-        
-        audits_raw = get_audit_history_cached(limit=500)
-        if not audits_raw:
-            st.warning("No audits available to export")
-            return
-        
-        # Convert all audits to dicts (handles ORM objects)
-        audits = [audit_to_dict(a) for a in audits_raw]
-        
-        # Filter options
-        col1, col2 = st.columns(2)
-        with col1:
-            min_score = st.slider("Minimum Score", 0, 100, 0)
-        with col2:
-            max_score = st.slider("Maximum Score", 0, 100, 100)
-        
-        # Safe score filtering
-        filtered_audits = []
-        for a in audits:
-            score = a.get("score") or a.get("health_score") or 0
-            try:
-                score_int = int(score) if score is not None else 0
-            except (ValueError, TypeError):
-                score_int = 0
-            if min_score <= score_int <= max_score:
-                filtered_audits.append(a)
-        
-        st.info(f"Exporting {len(filtered_audits)} audits...")
-        
-        if st.button("Generate Excel Report", use_container_width=True, type="primary"):
-            with st.spinner("Generating Excel..."):
-                excel_bytes = generate_excel_report(filtered_audits)
-                
-                if excel_bytes:
-                    st.success("✅ Excel file generated successfully")
-                    st.download_button(
-                        label="⬇️ Download Excel Report",
-                        data=excel_bytes,
-                        file_name=f"audits_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                else:
-                    st.error("Error generating Excel")
-    
-    elif export_type == "CSV (Data)":
-        st.markdown("### Export as CSV for Analysis")
-        
-        audits_raw = get_audit_history_cached(limit=1000)
-        if not audits_raw:
-            st.warning("No audits available to export")
-            return
-        
-        # Convert all audits to dicts (handles ORM objects)
-        audits = [audit_to_dict(a) for a in audits_raw]
-        
-        df = pd.DataFrame(audits)
-        
-        # Column selection with safe defaults
-        existing_cols = df.columns.tolist()
-        preferred_defaults = ["domain", "score", "health_score", "status", "timestamp", "created_at"]
-        default_cols = [c for c in preferred_defaults if c in existing_cols]
-        
-        # If no preferred columns exist, use first few columns
-        if not default_cols and existing_cols:
-            default_cols = existing_cols[:min(4, len(existing_cols))]
-        
-        columns = st.multiselect(
-            "Select columns to export",
-            existing_cols,
-            default=default_cols
-        )
-        
-        if columns and st.button("Generate CSV", use_container_width=True, type="primary"):
-            csv_data = df[columns].to_csv(index=False)
-            st.success("✅ CSV ready for download")
-            st.download_button(
-                label="⬇️ Download CSV",
-                data=csv_data,
-                file_name=f"audits_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-                use_container_width=True
+        elif export_type == "CSV (Data)":
+            st.markdown("### Export as CSV for Analysis")
+            
+            audits_raw = get_audit_history_cached(limit=1000)
+            if not audits_raw:
+                st.warning("No audits available to export")
+                return
+            
+            # Convert all audits to dicts with safety wrapper
+            audits = [safe_render_audit(a) for a in audits_raw]
+            
+            df = pd.DataFrame(audits)
+            
+            # Handle empty dataframe
+            if df.empty:
+                st.warning("No data available for export")
+                return
+            
+            # Column selection with safe defaults using helper
+            existing_cols = df.columns.tolist()
+            default_cols = get_safe_export_columns(existing_cols, ["domain", "score", "health_score", "status", "timestamp", "created_at"])
+            
+            columns = st.multiselect(
+                "Select columns to export",
+                existing_cols,
+                default=default_cols
             )
-        
-        # Preview
-        if columns:
-            st.markdown("### Preview")
-            st.dataframe(df[columns].head(10), use_container_width=True)
+            
+            if columns and st.button("Generate CSV", use_container_width=True, type="primary"):
+                csv_data = df[columns].to_csv(index=False)
+                st.success("✅ CSV ready for download")
+                st.download_button(
+                    label="⬇️ Download CSV",
+                    data=csv_data,
+                    file_name=f"audits_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            
+            # Preview
+            if columns:
+                st.markdown("### Preview")
+                st.dataframe(df[columns].head(10), use_container_width=True)
+    
+    except Exception as e:
+        logger.error(f"Error in Export Reports: {str(e)}", exc_info=True)
+        st.error("⚠️ Something went wrong generating the export. Please try again.")
+        with st.expander("🔍 Technical Details"):
+            st.code(str(e))
 
 
 # ============================================================================
