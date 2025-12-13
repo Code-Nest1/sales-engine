@@ -2,7 +2,7 @@
   "users": {
     "rabnawaz": {
       "name": "Admin",
-      "password_hash": "ed4aee3038185386758f74b97ddbb8c323713093349bd36bca763e731d62b939",
+      "password_hash": "$2b$12$xcybfGU9HW1Pk11lmxPv4uOQWH5ByNz.bOpB7jNR6vyXY3m5skx9C",
       "role": "admin",
       "admin_request": false,
       "admin_request_reason": ""
