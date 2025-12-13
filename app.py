@@ -37,6 +37,16 @@ except ImportError:
 load_dotenv()
 from models import init_db, get_db, Audit, Lead, EmailOutreach, DATABASE_URL, User, BulkScan
 
+# Import consistency layer for normalization
+from consistency import (
+    normalize_audit, normalize_lead, normalize_bulk_result,
+    normalize_audit_list, normalize_lead_list, normalize_bulk_list,
+    ensure_audit_fields, ensure_lead_fields,
+    get_safe_export_columns, safe_timestamp_slice,
+    lead_to_dict, audit_to_dict, bulk_to_dict,
+    _lead_to_dict, _audit_to_dict, _bulk_to_dict
+)
+
 # ============================================================================
 # PERSISTENCE LAYER IMPORTS
 # ============================================================================
@@ -640,144 +650,12 @@ def db_get_follow_up_due(days_ahead: int = 7) -> dict:
         return api_error(str(e), code=500)
 
 
-def lead_to_dict(lead) -> dict:
-    """
-    Convert Lead model or dict to a safe dictionary.
-    
-    Handles both ORM Lead objects and existing dicts.
-    Returns dict with all fields safely defaulted.
-    """
-    # If already a dict, ensure all expected keys exist with safe defaults
-    if isinstance(lead, dict):
-        return {
-            "id": lead.get("id"),
-            "domain": lead.get("domain") or "",
-            "email": lead.get("email") or "",
-            "company_name": lead.get("company_name") or "",
-            "phone": lead.get("phone") or "",
-            "address": lead.get("address") or "",
-            "city": lead.get("city") or "",
-            "state": lead.get("state") or "",
-            "zipcode": lead.get("zipcode") or "",
-            "health_score": lead.get("health_score"),
-            "opportunity_rating": lead.get("opportunity_rating") or 0,
-            "industry": lead.get("industry") or "",
-            "company_size": lead.get("company_size") or "",
-            "status": lead.get("status") or "new",
-            "notes": lead.get("notes") or "",
-            "approached": lead.get("approached", False),
-            "approached_date": lead.get("approached_date"),
-            "follow_up_date": lead.get("follow_up_date"),
-            "lead_status": lead.get("lead_status") or "warm",
-            "interested": lead.get("interested") or "maybe",
-            "pipeline_stage": lead.get("pipeline_stage") or "new",
-            "assigned_user": lead.get("assigned_user") or "",
-            "source": lead.get("source") or "single",
-            "last_audit_id": lead.get("last_audit_id"),
-            "created_at": lead.get("created_at"),
-            "updated_at": lead.get("updated_at")
-        }
-    
-    # ORM Lead object
-    return {
-        "id": lead.id,
-        "domain": lead.domain or "",
-        "email": lead.email or "",
-        "company_name": lead.company_name or "",
-        "phone": lead.phone or "",
-        "address": lead.address or "",
-        "city": lead.city or "",
-        "state": lead.state or "",
-        "zipcode": lead.zipcode or "",
-        "health_score": lead.health_score,
-        "opportunity_rating": lead.opportunity_rating or 0,
-        "industry": lead.industry or "",
-        "company_size": lead.company_size or "",
-        "status": lead.status or "new",
-        "notes": lead.notes or "",
-        "approached": lead.approached if lead.approached is not None else False,
-        "approached_date": lead.approached_date.isoformat() if lead.approached_date else None,
-        "follow_up_date": lead.follow_up_date.isoformat() if lead.follow_up_date else None,
-        "lead_status": lead.lead_status or "warm",
-        "interested": lead.interested or "maybe",
-        "pipeline_stage": lead.pipeline_stage or "new",
-        "assigned_user": lead.assigned_user or "",
-        "source": lead.source or "single",
-        "last_audit_id": lead.last_audit_id,
-        "created_at": lead.created_at.isoformat() if lead.created_at else None,
-        "updated_at": lead.updated_at.isoformat() if lead.updated_at else None
-    }
-
-
-# Alias for backward compatibility
-_lead_to_dict = lead_to_dict
-
-
-def audit_to_dict(audit) -> dict:
-    """
-    Convert Audit model or dict to a safe dictionary.
-    
-    Handles both ORM Audit objects and existing dicts.
-    Returns dict with all fields safely defaulted.
-    """
-    # If already a dict, ensure all expected keys exist with safe defaults
-    if isinstance(audit, dict):
-        # Handle timestamp field for backward compatibility
-        timestamp = audit.get("timestamp") or audit.get("created_at")
-        if timestamp and hasattr(timestamp, 'isoformat'):
-            timestamp = timestamp.isoformat()
-        
-        return {
-            "id": audit.get("id"),
-            "url": audit.get("url") or "",
-            "domain": audit.get("domain") or "",
-            "health_score": audit.get("health_score") or audit.get("score") or 0,
-            "score": audit.get("score") or audit.get("health_score") or 0,
-            "psi_score": audit.get("psi_score") or audit.get("psi"),
-            "psi": audit.get("psi") or audit.get("psi_score"),
-            "domain_age": audit.get("domain_age") or "",
-            "tech_stack": audit.get("tech_stack") or [],
-            "issues": audit.get("issues") or [],
-            "emails_found": audit.get("emails_found") or [],
-            "ai_summary": audit.get("ai_summary") or "",
-            "ai_impact": audit.get("ai_impact") or "",
-            "ai_solutions": audit.get("ai_solutions") or "",
-            "ai_email": audit.get("ai_email") or "",
-            "username": audit.get("username") or "",
-            "source": audit.get("source") or "single",
-            "status": audit.get("status") or "",
-            "created_at": timestamp,
-            "timestamp": timestamp  # Backward compatibility alias
-        }
-    
-    # ORM Audit object
-    timestamp = audit.created_at.isoformat() if audit.created_at else None
-    return {
-        "id": audit.id,
-        "url": audit.url or "",
-        "domain": audit.domain or "",
-        "health_score": audit.health_score or 0,
-        "score": audit.health_score or 0,  # Alias for compatibility
-        "psi_score": audit.psi_score,
-        "psi": audit.psi_score,  # Alias for compatibility
-        "domain_age": audit.domain_age or "",
-        "tech_stack": audit.tech_stack or [],
-        "issues": audit.issues or [],
-        "emails_found": audit.emails_found or [],
-        "ai_summary": audit.ai_summary or "",
-        "ai_impact": audit.ai_impact or "",
-        "ai_solutions": audit.ai_solutions or "",
-        "ai_email": audit.ai_email or "",
-        "username": audit.username or "",
-        "source": audit.source or "single",
-        "status": "",  # Legacy field
-        "created_at": timestamp,
-        "timestamp": timestamp  # Backward compatibility alias
-    }
-
-
-# Alias for backward compatibility
-_audit_to_dict = audit_to_dict
+# ============================================================================
+# CONSISTENCY LAYER - Functions imported from consistency.py
+# ============================================================================
+# lead_to_dict, audit_to_dict, bulk_to_dict - imported from consistency.py
+# normalize_audit, normalize_lead, normalize_bulk_result - imported from consistency.py
+# See consistency.py for full implementation
 
 
 # ============================================================================
@@ -10049,27 +9927,39 @@ def sort_audit_rows(hist_data: list, sort_col: str, reverse: bool = True) -> lis
     return sorted(hist_data, key=sort_key, reverse=reverse)
 
 def convert_audit_to_data_dict(audit) -> dict:
-    """Convert an Audit model instance to a data dictionary for display/PDF generation."""
+    """Convert an Audit model instance to a data dictionary for display/PDF generation.
+    
+    Uses the consistency layer to normalize the audit first, then adds display-specific fields.
+    """
+    # Use consistency layer for base conversion
+    base = audit_to_dict(audit)
+    
+    # Add display-specific 'ai' nested dict structure
+    ai_dict = None
+    if base.get('ai_summary'):
+        ai_dict = {
+            'summary': base.get('ai_summary') or 'No summary available',
+            'impact': base.get('ai_impact') or 'No impact assessment available',
+            'solutions': base.get('ai_solutions') or 'No solutions available',
+            'email': base.get('ai_email') or 'No email draft available'
+        }
+    
     return {
-        'url': audit.url or "",
-        'domain': audit.domain or "",
-        'score': audit.health_score,
-        'health_score': audit.health_score,
-        'psi': audit.psi_score,
-        'psi_score': audit.psi_score,
-        'domain_age': audit.domain_age or "Unknown",
-        'tech_stack': audit.tech_stack if audit.tech_stack else [],
-        'issues': audit.issues if audit.issues else [],
-        'ai': {
-            'summary': audit.ai_summary or 'No summary available',
-            'impact': audit.ai_impact or 'No impact assessment available',
-            'solutions': audit.ai_solutions or 'No solutions available',
-            'email': audit.ai_email or 'No email draft available'
-        } if audit.ai_summary else None,
-        'emails': audit.emails_found if audit.emails_found else [],
-        'created_at': audit.created_at.strftime("%Y-%m-%d %H:%M:%S") if audit.created_at else "N/A",
-        'audit_id': audit.id,
-        'username': audit.username or "Unknown"
+        'url': base.get('url') or "",
+        'domain': base.get('domain') or "",
+        'score': base.get('health_score') or 0,
+        'health_score': base.get('health_score') or 0,
+        'psi': base.get('psi_score'),
+        'psi_score': base.get('psi_score'),
+        'domain_age': base.get('domain_age') or "Unknown",
+        'tech_stack': base.get('tech_stack') or [],
+        'issues': base.get('issues') or [],
+        'ai': ai_dict,
+        'emails': base.get('emails_found') or [],
+        'created_at': base.get('created_at') or "N/A",
+        'timestamp': base.get('timestamp') or base.get('created_at') or "N/A",
+        'audit_id': base.get('id'),
+        'username': base.get('username') or "Unknown"
     }
 
 def invalidate_audit_cache():
