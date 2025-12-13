@@ -3070,6 +3070,7 @@ def save_user_api_key(username: str, key_name: str, key_value: str) -> tuple:
     """Save API key for a user to database (encrypted). Returns (success, error_message).
     
     Handles both API keys (encrypted) and SMTP settings (some unencrypted).
+    CRITICAL: Uses flag_modified() to ensure SQLAlchemy detects JSON column changes.
     """
     logger = logging.getLogger("sales_engine")
     db = None
@@ -3079,9 +3080,11 @@ def save_user_api_key(username: str, key_name: str, key_value: str) -> tuple:
         return False, "Invalid username or key name"
     
     # SAFETY: Never save empty values for critical keys - this prevents accidental overwriting
-    if key_name in ["openai", "google", "slack", "smtp_pass"] and not key_value:
-        logger.warning(f"Refusing to save empty value for {key_name} - this would clear existing key")
-        return True, None  # Return success but don't save (preserve existing)
+    # For critical keys, empty value = skip save (preserve existing)
+    if key_name in ["openai", "google", "slack", "smtp_pass"]:
+        if not key_value or not str(key_value).strip():
+            logger.warning(f"Refusing to save empty value for {key_name} - preserving existing key")
+            return True, None  # Return success but don't save
     
     try:
         db = get_db()
@@ -3096,6 +3099,7 @@ def save_user_api_key(username: str, key_name: str, key_value: str) -> tuple:
             if username in users_json:
                 user_data = users_json[username]
                 ensure_user_in_database(username, user_data.get("password_hash", ""), is_admin=(user_data.get("role") == "admin"))
+                # Re-query after creation
                 user = db.query(User).filter(User.username == username).first()
             
             if not user:
@@ -3103,29 +3107,29 @@ def save_user_api_key(username: str, key_name: str, key_value: str) -> tuple:
                 db.close()
                 return False, "User not found in database"
         
-        # Initialize api_keys dict if needed
-        if not user.api_keys:
+        # CRITICAL: Initialize api_keys dict if it's None (not just falsy)
+        if user.api_keys is None:
             user.api_keys = {}
         
         # Handle different key types
         if key_name == "smtp_port":
             # SMTP port is stored as-is (integer as string)
-            user.api_keys[key_name] = str(key_value)
+            user.api_keys[key_name] = str(key_value) if key_value else "587"
         elif key_name in ["smtp_host", "smtp_user"]:
             # SMTP host and user are stored unencrypted
-            user.api_keys[key_name] = key_value
+            user.api_keys[key_name] = str(key_value) if key_value else ""
         else:
             # Encrypt API keys and passwords
-            user.api_keys[key_name] = encrypt_key(key_value)
+            user.api_keys[key_name] = encrypt_key(str(key_value))
         
         user.api_keys_updated_at = datetime.utcnow()
         
-        # Force SQLAlchemy to detect the change in JSON column
+        # CRITICAL: Force SQLAlchemy to detect the change in JSON column
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(user, "api_keys")
         
         db.commit()
-        logger.info(f"Successfully saved API key {key_name} for {username}")
+        logger.info(f"Successfully saved API key {key_name} for {username} to database")
         db.close()
         return True, None
     except Exception as e:
@@ -3210,11 +3214,13 @@ def ensure_user_in_database(username: str, password_hash: str, is_admin: bool = 
             db.close()
             return True
         
-        # Create new user in database
+        # Create new user in database with empty but initialized JSON columns
         new_user = User(
             username=username,
             password_hash=password_hash,
-            is_admin=is_admin
+            is_admin=is_admin,
+            api_keys={},
+            smtp_settings={}
         )
         db.add(new_user)
         db.commit()
@@ -3226,6 +3232,64 @@ def ensure_user_in_database(username: str, password_hash: str, is_admin: bool = 
         if db:
             db.close()
         return False
+
+
+def ensure_users_in_database_on_startup():
+    """
+    Sync ALL users from users.json to database on startup.
+    
+    This ensures users exist in the database BEFORE any authentication or key loading.
+    Called once during app initialization, after DB is ready.
+    """
+    logger = logging.getLogger("sales_engine")
+    logger.info("Syncing JSON users to database on startup...")
+    
+    try:
+        # Load users from JSON file
+        users_json = load_users()
+        if not users_json:
+            logger.warning("No users found in JSON file during startup sync")
+            return 0
+        
+        db = get_db()
+        if not db:
+            logger.error("Database unavailable during startup user sync")
+            return 0
+        
+        synced_count = 0
+        for username, user_data in users_json.items():
+            try:
+                existing = db.query(User).filter(User.username == username).first()
+                if not existing:
+                    # User exists in JSON but not in DB - create them
+                    is_admin = user_data.get("role") == "admin"
+                    new_user = User(
+                        username=username,
+                        password_hash=user_data.get("password_hash", ""),
+                        is_admin=is_admin,
+                        api_keys={},
+                        smtp_settings={}
+                    )
+                    db.add(new_user)
+                    synced_count += 1
+                    logger.info(f"Synced user to database: {username} (admin={is_admin})")
+            except Exception as user_err:
+                logger.error(f"Error syncing user {username}: {str(user_err)}")
+                continue
+        
+        if synced_count > 0:
+            db.commit()
+            logger.info(f"Startup sync complete: {synced_count} users synced to database")
+        else:
+            logger.info("Startup sync: all users already exist in database")
+        
+        db.close()
+        return synced_count
+        
+    except Exception as e:
+        logger.error(f"Error during startup user sync: {str(e)}", exc_info=True)
+        return 0
+
 
 def load_2fa_secrets():
     """Load 2FA secrets."""
@@ -3307,11 +3371,23 @@ def reload_user_api_keys() -> dict:
     st.session_state.GOOGLE_API_KEY = env_google or db_google or existing_google
     st.session_state.SLACK_WEBHOOK = env_slack or db_slack or existing_slack
     
-    # Load SMTP settings to session state
-    st.session_state["_smtp_host"] = user_keys.get("smtp_host", "")
-    st.session_state["_smtp_port"] = user_keys.get("smtp_port", 587)
-    st.session_state["_smtp_user"] = user_keys.get("smtp_user", "")
-    st.session_state["_smtp_pass"] = user_keys.get("smtp_pass", "")
+    # Load SMTP settings to session state (priority: db > existing > default)
+    # SMTP settings don't typically come from env vars
+    db_smtp_host = user_keys.get("smtp_host", "")
+    db_smtp_port = user_keys.get("smtp_port", 587)
+    db_smtp_user = user_keys.get("smtp_user", "")
+    db_smtp_pass = user_keys.get("smtp_pass", "")
+    
+    existing_smtp_host = st.session_state.get("_smtp_host", "")
+    existing_smtp_port = st.session_state.get("_smtp_port", 587)
+    existing_smtp_user = st.session_state.get("_smtp_user", "")
+    existing_smtp_pass = st.session_state.get("_smtp_pass", "")
+    
+    # Apply priority: db > existing > default (never overwrite with empty)
+    st.session_state["_smtp_host"] = db_smtp_host or existing_smtp_host
+    st.session_state["_smtp_port"] = db_smtp_port if db_smtp_port else existing_smtp_port
+    st.session_state["_smtp_user"] = db_smtp_user or existing_smtp_user
+    st.session_state["_smtp_pass"] = db_smtp_pass or existing_smtp_pass
     
     # Track which source each key came from (for debugging)
     st.session_state["_api_key_sources"] = {
@@ -3519,6 +3595,13 @@ init_app_session()
 # Step 1.5: Initialize persistence layer (audit data, AI cache, navigation state)
 # This restores audit data from disk cache if available, syncs URL params, etc.
 persistence_status = init_app_session_persistence()
+
+# Step 1.6: Sync ALL users from JSON to database on startup (if not already done this session)
+# This ensures users exist in the database BEFORE any key loading
+if not st.session_state.get("_users_synced_to_db"):
+    if DB_AVAILABLE:
+        ensure_users_in_database_on_startup()
+    st.session_state["_users_synced_to_db"] = True
 
 # Step 2: Try to restore/validate login state
 # This checks session_state, then query params, validates tokens, and restores user info

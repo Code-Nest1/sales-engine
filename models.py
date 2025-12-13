@@ -143,6 +143,8 @@ class User(Base):
     # API Keys stored in encrypted format
     api_keys = Column(JSON, default=dict)  # {"openai": "encrypted_key", "google": "...", "slack": "..."}
     api_keys_updated_at = Column(DateTime, nullable=True)
+    # SMTP settings stored per-user (some encrypted, some not)
+    smtp_settings = Column(JSON, default=dict)  # {"host": "", "port": 587, "user": "", "pass": "encrypted"}
     created_at = Column(DateTime, default=datetime.utcnow)
 
 def init_db():
@@ -198,7 +200,7 @@ def migrate_audits_table():
                 pass
 
 def migrate_users_table():
-    """Add api_keys and api_keys_updated_at columns to users table if they don't exist."""
+    """Add api_keys, api_keys_updated_at, and smtp_settings columns to users table if they don't exist."""
     if not engine:
         return
     
@@ -220,6 +222,14 @@ def migrate_users_table():
         if 'api_keys_updated_at' not in users_columns:
             try:
                 conn.execute(__import__('sqlalchemy').text('ALTER TABLE users ADD COLUMN api_keys_updated_at DATETIME'))
+                conn.commit()
+            except Exception:
+                pass
+        
+        # Add smtp_settings column for per-user SMTP configuration
+        if 'smtp_settings' not in users_columns:
+            try:
+                conn.execute(__import__('sqlalchemy').text('ALTER TABLE users ADD COLUMN smtp_settings JSON DEFAULT "{}"'))
                 conn.commit()
             except Exception:
                 pass
