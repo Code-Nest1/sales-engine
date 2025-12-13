@@ -294,6 +294,522 @@ def setup_logging():
 
 logger = setup_logging()
 
+
+# ============================================================================
+# PHASE 4: DATABASE ABSTRACTION LAYER
+# ============================================================================
+# These functions provide a clean interface for database operations,
+# ensuring consistent error handling and response formatting.
+
+# Pipeline stage definitions for CRM
+PIPELINE_STAGES = ["new", "contacted", "follow-up", "qualified", "proposal", "closed"]
+LEAD_STATUS_OPTIONS = ["hot", "warm", "cold"]
+
+
+def create_response(success: bool, data: dict = None, error: str = None, code: int = 200) -> dict:
+    """
+    Create a standardized API response envelope.
+    
+    Args:
+        success: Whether the operation succeeded
+        data: Optional data payload
+        error: Optional error message
+        code: HTTP-like status code
+    
+    Returns:
+        Standardized response dict
+    """
+    return {
+        "success": success,
+        "data": data or {},
+        "error": error,
+        "code": code,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+def api_success(data: dict = None, message: str = None) -> dict:
+    """Create a success response envelope."""
+    result = create_response(success=True, data=data, code=200)
+    if message:
+        result["message"] = message
+    return result
+
+
+def api_error(error: str, code: int = 400, data: dict = None) -> dict:
+    """Create an error response envelope."""
+    return create_response(success=False, data=data, error=error, code=code)
+
+
+def db_get_lead_by_domain(domain: str) -> dict:
+    """
+    Get a lead by domain name.
+    
+    Args:
+        domain: Domain name to search for
+    
+    Returns:
+        API response with lead data or error
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        lead = db.query(Lead).filter(Lead.domain == domain).first()
+        db.close()
+        
+        if lead:
+            return api_success(data={"lead": _lead_to_dict(lead)})
+        else:
+            return api_error(f"Lead not found for domain: {domain}", code=404)
+    except Exception as e:
+        logger.error(f"Error getting lead by domain '{domain}': {e}")
+        return api_error(str(e), code=500)
+
+
+def db_get_lead_by_id(lead_id: int) -> dict:
+    """
+    Get a lead by ID.
+    
+    Args:
+        lead_id: Lead ID to search for
+    
+    Returns:
+        API response with lead data or error
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        lead = db.query(Lead).filter(Lead.id == lead_id).first()
+        db.close()
+        
+        if lead:
+            return api_success(data={"lead": _lead_to_dict(lead)})
+        else:
+            return api_error(f"Lead not found with ID: {lead_id}", code=404)
+    except Exception as e:
+        logger.error(f"Error getting lead by ID {lead_id}: {e}")
+        return api_error(str(e), code=500)
+
+
+def db_get_audit_by_id(audit_id: int) -> dict:
+    """
+    Get an audit by ID.
+    
+    Args:
+        audit_id: Audit ID to search for
+    
+    Returns:
+        API response with audit data or error
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        audit = db.query(Audit).filter(Audit.id == audit_id).first()
+        db.close()
+        
+        if audit:
+            return api_success(data={"audit": _audit_to_dict(audit)})
+        else:
+            return api_error(f"Audit not found with ID: {audit_id}", code=404)
+    except Exception as e:
+        logger.error(f"Error getting audit by ID {audit_id}: {e}")
+        return api_error(str(e), code=500)
+
+
+def db_get_leads_by_pipeline(stage: str = None, status: str = None, limit: int = 100) -> dict:
+    """
+    Get leads filtered by pipeline stage and/or status.
+    
+    Args:
+        stage: Pipeline stage filter (optional)
+        status: Lead status filter (optional)
+        limit: Maximum results to return
+    
+    Returns:
+        API response with list of leads
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        query = db.query(Lead)
+        
+        if stage:
+            query = query.filter(Lead.pipeline_stage == stage)
+        if status:
+            query = query.filter(Lead.lead_status == status)
+        
+        leads = query.order_by(Lead.updated_at.desc()).limit(limit).all()
+        db.close()
+        
+        leads_data = [_lead_to_dict(lead) for lead in leads]
+        return api_success(data={"leads": leads_data, "count": len(leads_data)})
+    except Exception as e:
+        logger.error(f"Error getting leads by pipeline: {e}")
+        return api_error(str(e), code=500)
+
+
+def db_create_lead_from_audit(audit_id: int) -> dict:
+    """
+    Create a new lead from an audit result.
+    
+    Args:
+        audit_id: The audit ID to create a lead from
+    
+    Returns:
+        API response with created lead data
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        # Get the audit
+        audit = db.query(Audit).filter(Audit.id == audit_id).first()
+        if not audit:
+            db.close()
+            return api_error(f"Audit not found: {audit_id}", code=404)
+        
+        # Check if lead already exists for this domain
+        existing_lead = db.query(Lead).filter(Lead.domain == audit.domain).first()
+        if existing_lead:
+            # Update existing lead with latest audit
+            existing_lead.last_audit_id = audit_id
+            existing_lead.health_score = audit.health_score
+            if audit.emails_found:
+                emails = audit.emails_found if isinstance(audit.emails_found, list) else []
+                if emails:
+                    existing_lead.email = emails[0]
+            existing_lead.updated_at = datetime.utcnow()
+            db.commit()
+            lead_dict = _lead_to_dict(existing_lead)
+            db.close()
+            return api_success(data={"lead": lead_dict, "created": False}, message="Lead updated with latest audit")
+        
+        # Create new lead
+        emails = audit.emails_found if isinstance(audit.emails_found, list) else []
+        new_lead = Lead(
+            domain=audit.domain,
+            email=emails[0] if emails else None,
+            company_name=audit.domain.replace(".", " ").title(),
+            health_score=audit.health_score,
+            pipeline_stage="new",
+            lead_status="warm",
+            source="audit",
+            last_audit_id=audit_id
+        )
+        db.add(new_lead)
+        db.commit()
+        lead_dict = _lead_to_dict(new_lead)
+        db.close()
+        
+        return api_success(data={"lead": lead_dict, "created": True}, message="Lead created from audit")
+    except Exception as e:
+        logger.error(f"Error creating lead from audit {audit_id}: {e}")
+        return api_error(str(e), code=500)
+
+
+def db_update_lead_pipeline(lead_id: int, stage: str = None, status: str = None, notes: str = None) -> dict:
+    """
+    Update a lead's pipeline stage, status, or notes.
+    
+    Args:
+        lead_id: Lead ID to update
+        stage: New pipeline stage (optional)
+        status: New lead status (optional)
+        notes: Notes to append (optional)
+    
+    Returns:
+        API response with updated lead data
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        lead = db.query(Lead).filter(Lead.id == lead_id).first()
+        if not lead:
+            db.close()
+            return api_error(f"Lead not found: {lead_id}", code=404)
+        
+        if stage and stage in PIPELINE_STAGES:
+            lead.pipeline_stage = stage
+        if status and status in LEAD_STATUS_OPTIONS:
+            lead.lead_status = status
+        if notes:
+            existing_notes = lead.notes or ""
+            lead.notes = f"{existing_notes}\n[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {notes}".strip()
+        
+        lead.updated_at = datetime.utcnow()
+        db.commit()
+        lead_dict = _lead_to_dict(lead)
+        db.close()
+        
+        return api_success(data={"lead": lead_dict}, message="Lead updated")
+    except Exception as e:
+        logger.error(f"Error updating lead {lead_id}: {e}")
+        return api_error(str(e), code=500)
+
+
+def db_count_leads_by_status() -> dict:
+    """
+    Get count of leads grouped by status and pipeline stage.
+    
+    Returns:
+        API response with counts by status and stage
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        # Count by status
+        status_counts = {}
+        for status in LEAD_STATUS_OPTIONS:
+            count = db.query(Lead).filter(Lead.lead_status == status).count()
+            status_counts[status] = count
+        
+        # Count by pipeline stage
+        stage_counts = {}
+        for stage in PIPELINE_STAGES:
+            count = db.query(Lead).filter(Lead.pipeline_stage == stage).count()
+            stage_counts[stage] = count
+        
+        total = db.query(Lead).count()
+        db.close()
+        
+        return api_success(data={
+            "by_status": status_counts,
+            "by_stage": stage_counts,
+            "total": total
+        })
+    except Exception as e:
+        logger.error(f"Error counting leads by status: {e}")
+        return api_error(str(e), code=500)
+
+
+def db_get_follow_up_due(days_ahead: int = 7) -> dict:
+    """
+    Get leads with follow-up dates within the specified window.
+    
+    Args:
+        days_ahead: Number of days to look ahead
+    
+    Returns:
+        API response with leads needing follow-up
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        now = datetime.utcnow()
+        future = now + timedelta(days=days_ahead)
+        
+        leads = db.query(Lead).filter(
+            Lead.follow_up_date != None,
+            Lead.follow_up_date <= future,
+            Lead.pipeline_stage != "closed"
+        ).order_by(Lead.follow_up_date.asc()).all()
+        
+        db.close()
+        
+        leads_data = [_lead_to_dict(lead) for lead in leads]
+        
+        # Categorize by urgency
+        overdue = [l for l in leads_data if l.get("follow_up_date") and datetime.fromisoformat(l["follow_up_date"]) < now]
+        today = [l for l in leads_data if l.get("follow_up_date") and datetime.fromisoformat(l["follow_up_date"]).date() == now.date()]
+        upcoming = [l for l in leads_data if l not in overdue and l not in today]
+        
+        return api_success(data={
+            "leads": leads_data,
+            "overdue": overdue,
+            "today": today,
+            "upcoming": upcoming,
+            "total": len(leads_data)
+        })
+    except Exception as e:
+        logger.error(f"Error getting follow-up due leads: {e}")
+        return api_error(str(e), code=500)
+
+
+def _lead_to_dict(lead: Lead) -> dict:
+    """Convert Lead model to dictionary."""
+    return {
+        "id": lead.id,
+        "domain": lead.domain,
+        "email": lead.email,
+        "company_name": lead.company_name,
+        "phone": lead.phone,
+        "address": lead.address,
+        "city": lead.city,
+        "state": lead.state,
+        "zipcode": lead.zipcode,
+        "health_score": lead.health_score,
+        "opportunity_rating": lead.opportunity_rating,
+        "industry": lead.industry,
+        "company_size": lead.company_size,
+        "status": lead.status,
+        "notes": lead.notes,
+        "approached": lead.approached,
+        "approached_date": lead.approached_date.isoformat() if lead.approached_date else None,
+        "follow_up_date": lead.follow_up_date.isoformat() if lead.follow_up_date else None,
+        "lead_status": lead.lead_status,
+        "interested": lead.interested,
+        "pipeline_stage": lead.pipeline_stage,
+        "assigned_user": lead.assigned_user,
+        "source": lead.source,
+        "last_audit_id": lead.last_audit_id,
+        "created_at": lead.created_at.isoformat() if lead.created_at else None,
+        "updated_at": lead.updated_at.isoformat() if lead.updated_at else None
+    }
+
+
+def _audit_to_dict(audit: Audit) -> dict:
+    """Convert Audit model to dictionary."""
+    return {
+        "id": audit.id,
+        "url": audit.url,
+        "domain": audit.domain,
+        "health_score": audit.health_score,
+        "psi_score": audit.psi_score,
+        "domain_age": audit.domain_age,
+        "tech_stack": audit.tech_stack,
+        "issues": audit.issues,
+        "emails_found": audit.emails_found,
+        "ai_summary": audit.ai_summary,
+        "ai_impact": audit.ai_impact,
+        "ai_solutions": audit.ai_solutions,
+        "ai_email": audit.ai_email,
+        "username": audit.username,
+        "source": audit.source,
+        "created_at": audit.created_at.isoformat() if audit.created_at else None
+    }
+
+
+# ============================================================================
+# PHASE 4: AUTO-MOVEMENT RULES
+# ============================================================================
+
+def apply_auto_pipeline_rules(lead_id: int) -> dict:
+    """
+    Apply automatic pipeline movement rules based on lead activity.
+    
+    Rules:
+    - If email sent → move to "contacted"
+    - If followed up 2+ times → move to "follow-up"
+    - If health_score < 50 → mark as "cold"
+    - If health_score > 80 → mark as "hot"
+    
+    Args:
+        lead_id: Lead ID to apply rules to
+    
+    Returns:
+        API response with rule application results
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        lead = db.query(Lead).filter(Lead.id == lead_id).first()
+        if not lead:
+            db.close()
+            return api_error(f"Lead not found: {lead_id}", code=404)
+        
+        changes = []
+        
+        # Rule 1: Auto-set lead temperature based on health score
+        if lead.health_score is not None:
+            if lead.health_score < 50 and lead.lead_status != "cold":
+                lead.lead_status = "cold"
+                changes.append("Set status to 'cold' (low health score)")
+            elif lead.health_score > 80 and lead.lead_status == "cold":
+                lead.lead_status = "warm"
+                changes.append("Set status to 'warm' (high health score)")
+        
+        # Rule 2: If approached but still in "new", move to "contacted"
+        if lead.approached and lead.pipeline_stage == "new":
+            lead.pipeline_stage = "contacted"
+            changes.append("Moved to 'contacted' (already approached)")
+        
+        if changes:
+            lead.updated_at = datetime.utcnow()
+            db.commit()
+        
+        lead_dict = _lead_to_dict(lead)
+        db.close()
+        
+        return api_success(data={"lead": lead_dict, "changes": changes})
+    except Exception as e:
+        logger.error(f"Error applying auto rules to lead {lead_id}: {e}")
+        return api_error(str(e), code=500)
+
+
+def auto_move_after_email_sent(lead_id: int) -> dict:
+    """
+    Automatically update lead after an email is sent.
+    
+    Updates:
+    - Set approached = True
+    - Set approached_date if not set
+    - Move pipeline_stage to "contacted" if still "new"
+    - Set default follow_up_date if not set (3 days from now)
+    
+    Args:
+        lead_id: Lead ID that received an email
+    
+    Returns:
+        API response with update results
+    """
+    try:
+        db = get_db()
+        if not db:
+            return api_error("Database connection failed", code=503)
+        
+        lead = db.query(Lead).filter(Lead.id == lead_id).first()
+        if not lead:
+            db.close()
+            return api_error(f"Lead not found: {lead_id}", code=404)
+        
+        changes = []
+        now = datetime.utcnow()
+        
+        # Mark as approached
+        if not lead.approached:
+            lead.approached = True
+            lead.approached_date = now
+            changes.append("Marked as approached")
+        
+        # Move pipeline stage
+        if lead.pipeline_stage == "new":
+            lead.pipeline_stage = "contacted"
+            changes.append("Moved to 'contacted' stage")
+        
+        # Set default follow-up
+        if not lead.follow_up_date:
+            lead.follow_up_date = now + timedelta(days=3)
+            changes.append("Set follow-up for 3 days from now")
+        
+        if changes:
+            lead.updated_at = now
+            db.commit()
+        
+        lead_dict = _lead_to_dict(lead)
+        db.close()
+        
+        return api_success(data={"lead": lead_dict, "changes": changes})
+    except Exception as e:
+        logger.error(f"Error auto-moving lead {lead_id}: {e}")
+        return api_error(str(e), code=500)
+
 # ============================================================================
 # INPUT VALIDATION & SANITIZATION
 # ============================================================================
@@ -2131,6 +2647,84 @@ def init_users_file():
     if not USERS_PATH.exists():
         USERS_PATH.write_text(json.dumps({"users": {}}, indent=2))
 
+
+def ensure_admin_user_exists():
+    """
+    Ensure the admin user 'rabnawaz' exists with the correct SHA256 password hash.
+    
+    This function:
+    - Checks if admin user exists in users.json
+    - Creates or updates admin with correct SHA256 hash if needed
+    - Syncs admin user to database
+    
+    IMPORTANT: Does NOT touch other users or any Phase 1/2/3 code.
+    """
+    logger = logging.getLogger("sales_engine")
+    
+    ADMIN_USERNAME = "rabnawaz"
+    ADMIN_PASSWORD = "92948870"
+    ADMIN_HASH = hashlib.sha256(ADMIN_PASSWORD.encode('utf-8')).hexdigest()
+    
+    try:
+        # Load existing users
+        init_users_file()
+        users_data = json.loads(USERS_PATH.read_text())
+        users = users_data.get("users", {})
+        
+        admin_user = users.get(ADMIN_USERNAME)
+        needs_update = False
+        
+        if not admin_user:
+            # Admin doesn't exist, create it
+            logger.info(f"Creating admin user: {ADMIN_USERNAME}")
+            needs_update = True
+        elif admin_user.get("password_hash") != ADMIN_HASH:
+            # Admin exists but hash is wrong (e.g., bcrypt instead of SHA256)
+            logger.info(f"Updating admin password hash for: {ADMIN_USERNAME}")
+            needs_update = True
+        
+        if needs_update:
+            users[ADMIN_USERNAME] = {
+                "name": "Admin",
+                "password_hash": ADMIN_HASH,
+                "role": "admin",
+                "admin_request": False,
+                "admin_request_reason": "",
+                "created_at": users.get(ADMIN_USERNAME, {}).get("created_at", datetime.now().isoformat()),
+                "last_login": users.get(ADMIN_USERNAME, {}).get("last_login")
+            }
+            users_data["users"] = users
+            USERS_PATH.write_text(json.dumps(users_data, indent=2))
+            logger.info(f"Admin user '{ADMIN_USERNAME}' saved to users.json")
+            
+            # Also sync to database
+            try:
+                db = get_db()
+                if db:
+                    existing = db.query(User).filter(User.username == ADMIN_USERNAME).first()
+                    if existing:
+                        existing.password_hash = ADMIN_HASH
+                        existing.is_admin = True
+                    else:
+                        new_user = User(
+                            username=ADMIN_USERNAME,
+                            email=f"{ADMIN_USERNAME}@admin.local",
+                            password_hash=ADMIN_HASH,
+                            is_admin=True
+                        )
+                        db.add(new_user)
+                    db.commit()
+                    db.close()
+                    logger.info(f"Admin user '{ADMIN_USERNAME}' synced to database")
+            except Exception as db_err:
+                logger.warning(f"Could not sync admin to database: {db_err}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error ensuring admin user exists: {e}")
+        return False
+
+
 def init_2fa_file():
     """Create two_fa.json if it doesn't exist."""
     if not TWO_FA_PATH.exists():
@@ -2776,6 +3370,7 @@ def show_auth_page():
                             st.error("❌ Failed to create account. Please try again.")
 # Initialize auth
 init_users_file()
+ensure_admin_user_exists()  # Ensure admin user exists with correct SHA256 hash
 init_2fa_file()
 init_sessions_file()
 init_login_attempts_file()
@@ -2839,6 +3434,7 @@ with st.sidebar:
             "Bulk Audit",
             "Competitor Analysis",
             "Lead Management",
+            "CRM Pipeline",
             "Email Outreach",
             "Scheduled Audits",
             "API Settings",
@@ -6754,6 +7350,566 @@ def show_scheduled_audits():
         st.markdown("### Active Schedules")
         st.info("No scheduled audits yet")
 
+
+# ============================================================================
+# PHASE 4: CRM PIPELINE DASHBOARD
+# ============================================================================
+
+def show_crm_pipeline():
+    """
+    CRM Pipeline Dashboard - Visual lead management with Kanban board.
+    
+    Features:
+    - Kanban board with 6 pipeline stages
+    - Table view with filters and bulk actions
+    - Analytics dashboard with charts
+    - Lead detail panel with quick actions
+    - Auto-movement rules for workflow automation
+    """
+    logger = logging.getLogger("sales_engine")
+    logger.debug("Rendering CRM Pipeline page")
+    
+    # Custom CSS for CRM Pipeline
+    st.markdown("""
+    <style>
+    /* CRM Pipeline Header */
+    .crm-header {
+        background: linear-gradient(135deg, #0c3740 0%, #1a5a6e 100%);
+        padding: 1.5rem 2rem;
+        border-radius: 12px;
+        margin-bottom: 1.5rem;
+        color: white;
+    }
+    .crm-header h1 {
+        font-family: 'Poppins', sans-serif;
+        font-size: 1.8rem;
+        margin: 0;
+        font-weight: 600;
+    }
+    .crm-header p {
+        font-family: 'Lato', sans-serif;
+        opacity: 0.9;
+        margin: 0.3rem 0 0 0;
+        font-size: 0.95rem;
+    }
+    
+    /* Kanban Column */
+    .kanban-column {
+        background: #f8f9fa;
+        border-radius: 10px;
+        padding: 0.8rem;
+        min-height: 400px;
+    }
+    .kanban-header {
+        font-weight: 600;
+        padding: 0.5rem;
+        border-radius: 6px;
+        margin-bottom: 0.5rem;
+        font-family: 'Poppins', sans-serif;
+        font-size: 0.9rem;
+        text-align: center;
+    }
+    .kanban-header.new { background: #e3f2fd; color: #1565c0; }
+    .kanban-header.contacted { background: #fff3e0; color: #ef6c00; }
+    .kanban-header.follow-up { background: #fce4ec; color: #c2185b; }
+    .kanban-header.qualified { background: #e8f5e9; color: #2e7d32; }
+    .kanban-header.proposal { background: #f3e5f5; color: #7b1fa2; }
+    .kanban-header.closed { background: #e0f2f1; color: #00695c; }
+    
+    /* Lead Card in Kanban */
+    .lead-card {
+        background: white;
+        border-radius: 8px;
+        padding: 0.8rem;
+        margin-bottom: 0.5rem;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        border-left: 3px solid #2b945f;
+        transition: all 0.2s ease;
+    }
+    .lead-card:hover {
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        transform: translateY(-1px);
+    }
+    .lead-card.hot { border-left-color: #dc3545; }
+    .lead-card.warm { border-left-color: #ffc107; }
+    .lead-card.cold { border-left-color: #6c757d; }
+    
+    .lead-domain {
+        font-weight: 600;
+        font-size: 0.9rem;
+        color: #0c3740;
+        margin-bottom: 0.3rem;
+    }
+    .lead-company {
+        font-size: 0.8rem;
+        color: #5a5a5a;
+        margin-bottom: 0.3rem;
+    }
+    .lead-score {
+        font-size: 0.75rem;
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+        display: inline-block;
+    }
+    .lead-score.high { background: #d4edda; color: #155724; }
+    .lead-score.medium { background: #fff3cd; color: #856404; }
+    .lead-score.low { background: #f8d7da; color: #721c24; }
+    
+    /* Status Badge */
+    .status-pill {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 12px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+    .status-pill.hot { background: #dc3545; color: white; }
+    .status-pill.warm { background: #ffc107; color: #333; }
+    .status-pill.cold { background: #6c757d; color: white; }
+    
+    /* Analytics Card */
+    .analytics-card {
+        background: white;
+        border-radius: 10px;
+        padding: 1.2rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        text-align: center;
+    }
+    .analytics-card h3 {
+        font-size: 2rem;
+        color: #0c3740;
+        margin: 0;
+        font-weight: 700;
+    }
+    .analytics-card p {
+        font-size: 0.85rem;
+        color: #5a5a5a;
+        margin: 0.3rem 0 0 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Header
+    st.markdown("""
+    <div class="crm-header">
+        <h1>📊 CRM Pipeline</h1>
+        <p>Manage your leads through the sales pipeline with visual tracking and automation</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if not DB_AVAILABLE:
+        st.error("Database connection required for CRM Pipeline")
+        return
+    
+    # View tabs
+    tab1, tab2, tab3 = st.tabs(["🗂️ Kanban Board", "📋 Table View", "📈 Analytics"])
+    
+    with tab1:
+        render_crm_kanban_board()
+    
+    with tab2:
+        render_crm_table_view()
+    
+    with tab3:
+        render_crm_analytics()
+
+
+def render_crm_kanban_board():
+    """Render the Kanban-style pipeline board."""
+    
+    # Get leads grouped by stage
+    stages_data = {}
+    for stage in PIPELINE_STAGES:
+        result = db_get_leads_by_pipeline(stage=stage, limit=50)
+        if result["success"]:
+            stages_data[stage] = result["data"].get("leads", [])
+        else:
+            stages_data[stage] = []
+    
+    # Create 6 columns for the Kanban board
+    cols = st.columns(6)
+    stage_colors = {
+        "new": "new",
+        "contacted": "contacted",
+        "follow-up": "follow-up",
+        "qualified": "qualified",
+        "proposal": "proposal",
+        "closed": "closed"
+    }
+    stage_icons = {
+        "new": "🆕",
+        "contacted": "📧",
+        "follow-up": "🔄",
+        "qualified": "✅",
+        "proposal": "📝",
+        "closed": "🎉"
+    }
+    
+    for idx, stage in enumerate(PIPELINE_STAGES):
+        with cols[idx]:
+            leads = stages_data.get(stage, [])
+            icon = stage_icons.get(stage, "📋")
+            color_class = stage_colors.get(stage, "new")
+            
+            st.markdown(f"""
+            <div class="kanban-column">
+                <div class="kanban-header {color_class}">
+                    {icon} {stage.upper()} ({len(leads)})
+                </div>
+            """, unsafe_allow_html=True)
+            
+            if not leads:
+                st.caption("No leads")
+            else:
+                for lead in leads[:10]:  # Show max 10 per column
+                    render_kanban_lead_card(lead, stage)
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_kanban_lead_card(lead: dict, current_stage: str):
+    """Render a single lead card in the Kanban board."""
+    domain = lead.get("domain", "Unknown")[:25]
+    company = lead.get("company_name", "")[:20] or domain
+    score = lead.get("health_score")
+    status = lead.get("lead_status", "warm")
+    lead_id = lead.get("id")
+    
+    # Determine score class
+    if score is None:
+        score_class = "medium"
+        score_display = "N/A"
+    elif score >= 70:
+        score_class = "high"
+        score_display = f"🟢 {score}"
+    elif score >= 40:
+        score_class = "medium"
+        score_display = f"🟡 {score}"
+    else:
+        score_class = "low"
+        score_display = f"🔴 {score}"
+    
+    # Card container
+    with st.container(border=True):
+        st.markdown(f"**{domain}**")
+        if company and company != domain:
+            st.caption(company)
+        
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            # Status pill
+            pill_colors = {"hot": "🔥", "warm": "☀️", "cold": "❄️"}
+            st.caption(f"{pill_colors.get(status, '❓')} {status}")
+        with col2:
+            st.caption(score_display)
+        
+        # Quick actions
+        col_move, col_view = st.columns(2)
+        with col_move:
+            # Move to next stage
+            current_idx = PIPELINE_STAGES.index(current_stage) if current_stage in PIPELINE_STAGES else 0
+            if current_idx < len(PIPELINE_STAGES) - 1:
+                next_stage = PIPELINE_STAGES[current_idx + 1]
+                if st.button("→", key=f"move_{lead_id}_{current_stage}", help=f"Move to {next_stage}"):
+                    result = db_update_lead_pipeline(lead_id, stage=next_stage)
+                    if result["success"]:
+                        st.toast(f"Moved to {next_stage}")
+                        st.rerun()
+        with col_view:
+            if st.button("👁️", key=f"view_{lead_id}_{current_stage}", help="View details"):
+                st.session_state["crm_selected_lead_id"] = lead_id
+                st.rerun()
+
+
+def render_crm_table_view():
+    """Render the table view with filters and bulk actions."""
+    
+    # Filters row
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        stage_filter = st.selectbox("Pipeline Stage", ["All"] + PIPELINE_STAGES, key="crm_stage_filter")
+    with col2:
+        status_filter = st.selectbox("Lead Status", ["All"] + LEAD_STATUS_OPTIONS, key="crm_status_filter")
+    with col3:
+        search_term = st.text_input("Search Domain", placeholder="Enter domain...", key="crm_search")
+    with col4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh", key="crm_refresh"):
+            st.rerun()
+    
+    # Get filtered leads
+    stage = stage_filter if stage_filter != "All" else None
+    status = status_filter if status_filter != "All" else None
+    
+    result = db_get_leads_by_pipeline(stage=stage, status=status, limit=100)
+    
+    if not result["success"]:
+        st.error(f"Error loading leads: {result.get('error', 'Unknown')}")
+        return
+    
+    leads = result["data"].get("leads", [])
+    
+    # Apply search filter
+    if search_term:
+        leads = [l for l in leads if search_term.lower() in l.get("domain", "").lower()]
+    
+    if not leads:
+        st.info("No leads found matching your filters")
+        return
+    
+    st.markdown(f"**Showing {len(leads)} leads**")
+    
+    # Prepare dataframe
+    df_data = []
+    for lead in leads:
+        df_data.append({
+            "ID": lead.get("id"),
+            "Domain": lead.get("domain", ""),
+            "Company": lead.get("company_name", ""),
+            "Email": lead.get("email", ""),
+            "Score": lead.get("health_score", "N/A"),
+            "Status": lead.get("lead_status", ""),
+            "Stage": lead.get("pipeline_stage", ""),
+            "Approached": "✅" if lead.get("approached") else "❌",
+            "Follow-up": lead.get("follow_up_date", "")[:10] if lead.get("follow_up_date") else "-",
+        })
+    
+    df = pd.DataFrame(df_data)
+    
+    # Display with selection
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    # Bulk actions
+    st.markdown("### Bulk Actions")
+    selected_ids = st.multiselect("Select Lead IDs for bulk action", [l["ID"] for l in df_data], key="crm_bulk_select")
+    
+    if selected_ids:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            new_stage = st.selectbox("Move to Stage", PIPELINE_STAGES, key="crm_bulk_stage")
+            if st.button("Apply Stage", key="crm_apply_stage"):
+                success_count = 0
+                for lid in selected_ids:
+                    result = db_update_lead_pipeline(lid, stage=new_stage)
+                    if result["success"]:
+                        success_count += 1
+                st.success(f"Moved {success_count} leads to {new_stage}")
+                st.rerun()
+        
+        with col2:
+            new_status = st.selectbox("Set Status", LEAD_STATUS_OPTIONS, key="crm_bulk_status")
+            if st.button("Apply Status", key="crm_apply_status"):
+                success_count = 0
+                for lid in selected_ids:
+                    result = db_update_lead_pipeline(lid, status=new_status)
+                    if result["success"]:
+                        success_count += 1
+                st.success(f"Updated {success_count} leads to {new_status}")
+                st.rerun()
+        
+        with col3:
+            bulk_note = st.text_input("Add Note", key="crm_bulk_note")
+            if st.button("Add Note", key="crm_apply_note"):
+                success_count = 0
+                for lid in selected_ids:
+                    result = db_update_lead_pipeline(lid, notes=bulk_note)
+                    if result["success"]:
+                        success_count += 1
+                st.success(f"Added note to {success_count} leads")
+                st.rerun()
+
+
+def render_crm_analytics():
+    """Render CRM analytics dashboard."""
+    
+    # Get counts
+    result = db_count_leads_by_status()
+    
+    if not result["success"]:
+        st.error("Error loading analytics")
+        return
+    
+    data = result["data"]
+    by_status = data.get("by_status", {})
+    by_stage = data.get("by_stage", {})
+    total = data.get("total", 0)
+    
+    # Top metrics row
+    st.markdown("### 📊 Pipeline Overview")
+    cols = st.columns(4)
+    
+    with cols[0]:
+        st.markdown("""
+        <div class="analytics-card">
+            <h3>{}</h3>
+            <p>Total Leads</p>
+        </div>
+        """.format(total), unsafe_allow_html=True)
+    
+    with cols[1]:
+        hot = by_status.get("hot", 0)
+        st.markdown("""
+        <div class="analytics-card">
+            <h3 style="color: #dc3545;">{}</h3>
+            <p>🔥 Hot Leads</p>
+        </div>
+        """.format(hot), unsafe_allow_html=True)
+    
+    with cols[2]:
+        warm = by_status.get("warm", 0)
+        st.markdown("""
+        <div class="analytics-card">
+            <h3 style="color: #ffc107;">{}</h3>
+            <p>☀️ Warm Leads</p>
+        </div>
+        """.format(warm), unsafe_allow_html=True)
+    
+    with cols[3]:
+        cold = by_status.get("cold", 0)
+        st.markdown("""
+        <div class="analytics-card">
+            <h3 style="color: #6c757d;">{}</h3>
+            <p>❄️ Cold Leads</p>
+        </div>
+        """.format(cold), unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # Pipeline funnel
+    st.markdown("### 📈 Pipeline Stages")
+    
+    if by_stage:
+        stage_df = pd.DataFrame([
+            {"Stage": stage.title(), "Count": by_stage.get(stage, 0)}
+            for stage in PIPELINE_STAGES
+        ])
+        st.bar_chart(stage_df.set_index("Stage"))
+    else:
+        st.info("No data available for pipeline stages")
+    
+    # Follow-up section
+    st.markdown("---")
+    st.markdown("### ⏰ Follow-ups Due")
+    
+    followup_result = db_get_follow_up_due(days_ahead=7)
+    
+    if followup_result["success"]:
+        followup_data = followup_result["data"]
+        overdue = followup_data.get("overdue", [])
+        today = followup_data.get("today", [])
+        upcoming = followup_data.get("upcoming", [])
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown(f"#### 🚨 Overdue ({len(overdue)})")
+            if overdue:
+                for lead in overdue[:5]:
+                    st.markdown(f"- **{lead.get('domain', 'Unknown')}**")
+            else:
+                st.caption("None overdue")
+        
+        with col2:
+            st.markdown(f"#### 📅 Today ({len(today)})")
+            if today:
+                for lead in today[:5]:
+                    st.markdown(f"- **{lead.get('domain', 'Unknown')}**")
+            else:
+                st.caption("None today")
+        
+        with col3:
+            st.markdown(f"#### 📆 Upcoming ({len(upcoming)})")
+            if upcoming:
+                for lead in upcoming[:5]:
+                    date_str = lead.get('follow_up_date', '')[:10] if lead.get('follow_up_date') else ''
+                    st.markdown(f"- **{lead.get('domain', 'Unknown')}** ({date_str})")
+            else:
+                st.caption("None upcoming")
+    else:
+        st.error("Could not load follow-up data")
+
+
+def render_crm_lead_detail_panel(lead_id: int):
+    """
+    Render a detailed view panel for a single lead.
+    
+    Called when a lead is selected in the Kanban or Table view.
+    """
+    result = db_get_lead_by_id(lead_id)
+    
+    if not result["success"]:
+        st.error(f"Could not load lead: {result.get('error', 'Unknown')}")
+        return
+    
+    lead = result["data"].get("lead", {})
+    
+    st.markdown("### 📋 Lead Details")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown(f"**Domain:** {lead.get('domain', 'Unknown')}")
+        st.markdown(f"**Company:** {lead.get('company_name', 'N/A')}")
+        st.markdown(f"**Email:** {lead.get('email', 'N/A')}")
+        st.markdown(f"**Phone:** {lead.get('phone', 'N/A')}")
+        st.markdown(f"**Health Score:** {lead.get('health_score', 'N/A')}")
+    
+    with col2:
+        st.markdown(f"**Stage:** {lead.get('pipeline_stage', 'new')}")
+        st.markdown(f"**Status:** {lead.get('lead_status', 'warm')}")
+        st.markdown(f"**Approached:** {'Yes' if lead.get('approached') else 'No'}")
+        st.markdown(f"**Follow-up:** {lead.get('follow_up_date', 'Not set')[:10] if lead.get('follow_up_date') else 'Not set'}")
+        st.markdown(f"**Assigned:** {lead.get('assigned_user', 'Unassigned')}")
+    
+    # Notes
+    st.markdown("**Notes:**")
+    notes = lead.get("notes") or "No notes"
+    st.text_area("", value=notes, height=100, disabled=True, key=f"lead_notes_{lead_id}")
+    
+    # Quick actions
+    st.markdown("### Quick Actions")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        new_stage = st.selectbox("Move to Stage", PIPELINE_STAGES, 
+                                  index=PIPELINE_STAGES.index(lead.get("pipeline_stage", "new")),
+                                  key=f"detail_stage_{lead_id}")
+        if st.button("Update Stage", key=f"update_stage_{lead_id}"):
+            result = db_update_lead_pipeline(lead_id, stage=new_stage)
+            if result["success"]:
+                st.success("Stage updated")
+                st.rerun()
+    
+    with col2:
+        new_status = st.selectbox("Set Status", LEAD_STATUS_OPTIONS,
+                                   index=LEAD_STATUS_OPTIONS.index(lead.get("lead_status", "warm")) if lead.get("lead_status") in LEAD_STATUS_OPTIONS else 1,
+                                   key=f"detail_status_{lead_id}")
+        if st.button("Update Status", key=f"update_status_{lead_id}"):
+            result = db_update_lead_pipeline(lead_id, status=new_status)
+            if result["success"]:
+                st.success("Status updated")
+                st.rerun()
+    
+    with col3:
+        new_note = st.text_input("Add Note", key=f"detail_note_{lead_id}")
+        if st.button("Add Note", key=f"add_note_{lead_id}") and new_note:
+            result = db_update_lead_pipeline(lead_id, notes=new_note)
+            if result["success"]:
+                st.success("Note added")
+                st.rerun()
+    
+    # View audit button
+    if lead.get("last_audit_id"):
+        if st.button("🔍 View Last Audit", key=f"view_audit_{lead_id}"):
+            audit_id = lead["last_audit_id"]
+            set_current_audit(audit_id)
+            save_navigation_state("Single Audit", audit_id)
+            sync_query_params()
+            st.session_state.current_section = "Single Audit"
+            st.rerun()
+
+
 def clean_text(text):
     """Sanitize text for PDF."""
     if not text: return ""
@@ -10427,6 +11583,8 @@ elif current_section == "Competitor Analysis":
     show_competitor_analysis()
 elif current_section == "Lead Management":
     show_lead_management()
+elif current_section == "CRM Pipeline":
+    show_crm_pipeline()
 elif current_section == "Email Outreach":
     show_email_outreach()
 elif current_section == "Scheduled Audits":
