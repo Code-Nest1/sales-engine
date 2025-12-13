@@ -38,6 +38,51 @@ load_dotenv()
 from models import init_db, get_db, Audit, Lead, EmailOutreach, DATABASE_URL, User, BulkScan
 
 # ============================================================================
+# PERSISTENCE LAYER IMPORTS
+# ============================================================================
+from persistence import (
+    # Session/App Initialization
+    init_app_session_persistence,
+    reset_persistence_state,
+    get_persistence_status,
+    on_logout_cleanup,
+    
+    # Audit State Management
+    persist_audit_data,
+    load_audit_data,
+    get_current_audit,
+    set_current_audit,
+    clear_current_audit,
+    get_audit_from_db,
+    rebuild_audit_data_from_db,
+    
+    # AI Cache (new module replaces old functions)
+    get_ai_cache,
+    save_ai_cache,
+    ai_cache_exists,
+    clear_ai_cache,
+    get_regen_count as persistence_get_regen_count,
+    increment_regen_count as persistence_increment_regen_count,
+    reset_regen_count,
+    regen_limit_reached,
+    REGEN_LIMIT,
+    
+    # PDF Context
+    store_pdf_context,
+    load_pdf_context,
+    clear_pdf_context,
+    get_pdf_context_or_current,
+    
+    # Navigation State
+    save_navigation_state,
+    load_navigation_state,
+    clear_navigation_state,
+    get_deep_link_audit_id,
+    sync_query_params,
+    restore_navigation_on_refresh,
+)
+
+# ============================================================================
 # ENHANCED APP CONFIGURATION
 # ============================================================================
 
@@ -127,9 +172,6 @@ AI_CLIENT_TIMEOUT = 35.0  # Client-level timeout
 # Regeneration Limits
 MAX_REGENERATIONS_PER_URL = 2  # Max times user can regenerate AI content per URL
 
-# AI Cache Configuration
-AI_CACHE_FILE = Path(__file__).parent / "ai_cache.json"
-
 # Issue Categories (for structured issues)
 ISSUE_CATEGORIES = {
     "SEO": "Search Engine Optimization",
@@ -141,109 +183,73 @@ ISSUE_CATEGORIES = {
     "Content": "Content Quality"
 }
 
-def get_ai_cache_key(url: str, audit_hash: str = "") -> str:
-    """Generate a cache key for AI results."""
+# ============================================================================
+# AI CACHE WRAPPER FUNCTIONS (use persistence layer)
+# ============================================================================
+
+def _extract_domain(url: str) -> str:
+    """Extract clean domain from URL for cache keys."""
+    if not url:
+        return ""
     domain = urlparse(url).netloc.replace("www.", "").lower()
-    return f"{domain}:{audit_hash}" if audit_hash else domain
+    return domain if domain else url.lower().replace("www.", "")
 
-def load_ai_cache() -> dict:
-    """Load AI results cache from disk."""
-    try:
-        if AI_CACHE_FILE.exists():
-            return json.loads(AI_CACHE_FILE.read_text())
-    except Exception:
-        pass
-    return {}
-
-def save_ai_cache(cache: dict):
-    """Save AI results cache to disk."""
-    try:
-        # Keep only last 100 entries to prevent unbounded growth
-        if len(cache) > 100:
-            sorted_keys = sorted(cache.keys(), key=lambda k: cache[k].get('timestamp', ''), reverse=True)
-            cache = {k: cache[k] for k in sorted_keys[:100]}
-        AI_CACHE_FILE.write_text(json.dumps(cache, indent=2))
-    except Exception as e:
-        logger = logging.getLogger("sales_engine")
-        logger.warning(f"Failed to save AI cache: {e}")
 
 def get_cached_ai_result(url: str, audit_data: dict = None) -> dict | None:
-    """Get cached AI result for a URL from session state or disk."""
-    # Generate cache key
-    cache_key = get_ai_cache_key(url)
+    """
+    Get cached AI result for a URL using persistence layer.
     
-    # Check session state first (fastest)
-    if 'ai_cache' not in st.session_state:
-        st.session_state.ai_cache = {}
+    Uses triple-layer fallback: session → disk → None
+    """
+    domain = _extract_domain(url)
+    if not domain:
+        return None
     
-    if cache_key in st.session_state.ai_cache:
+    cached = get_ai_cache(domain)
+    if cached:
         logger = logging.getLogger("sales_engine")
-        logger.info(f"[AI CACHE HIT - Session] {cache_key}")
-        return st.session_state.ai_cache[cache_key]
-    
-    # Check disk cache
-    disk_cache = load_ai_cache()
-    if cache_key in disk_cache:
-        # Load into session state for faster future access
-        st.session_state.ai_cache[cache_key] = disk_cache[cache_key]
-        logger = logging.getLogger("sales_engine")
-        logger.info(f"[AI CACHE HIT - Disk] {cache_key}")
-        return disk_cache[cache_key]
-    
-    return None
+        logger.info(f"[AI CACHE HIT] {domain}")
+    return cached
+
 
 def cache_ai_result(url: str, ai_result: dict):
-    """Cache AI result in session state and disk."""
-    cache_key = get_ai_cache_key(url)
+    """
+    Cache AI result using persistence layer.
     
-    # Add timestamp
-    ai_result['cached_at'] = datetime.now().isoformat()
-    ai_result['timestamp'] = datetime.now().isoformat()
+    Stores to session + disk with automatic expiry.
+    """
+    domain = _extract_domain(url)
+    if not domain:
+        return
     
-    # Store in session state
-    if 'ai_cache' not in st.session_state:
-        st.session_state.ai_cache = {}
-    st.session_state.ai_cache[cache_key] = ai_result
-    
-    # Store on disk
-    disk_cache = load_ai_cache()
-    disk_cache[cache_key] = ai_result
-    save_ai_cache(disk_cache)
-    
+    save_ai_cache(domain, ai_result)
     logger = logging.getLogger("sales_engine")
-    logger.info(f"[AI CACHE STORE] {cache_key}")
+    logger.info(f"[AI CACHE STORE] {domain}")
+
 
 def get_regen_count(url: str) -> int:
-    """Get regeneration count for a URL."""
-    if 'ai_regen_counts' not in st.session_state:
-        st.session_state.ai_regen_counts = {}
-    cache_key = get_ai_cache_key(url)
-    return st.session_state.ai_regen_counts.get(cache_key, 0)
+    """Get regeneration count for a URL using persistence layer."""
+    domain = _extract_domain(url)
+    return persistence_get_regen_count(domain)
+
 
 def increment_regen_count(url: str) -> int:
-    """Increment and return regeneration count for a URL."""
-    if 'ai_regen_counts' not in st.session_state:
-        st.session_state.ai_regen_counts = {}
-    cache_key = get_ai_cache_key(url)
-    current = st.session_state.ai_regen_counts.get(cache_key, 0)
-    st.session_state.ai_regen_counts[cache_key] = current + 1
-    return current + 1
+    """Increment and return regeneration count for a URL using persistence layer."""
+    domain = _extract_domain(url)
+    return persistence_increment_regen_count(domain)
+
 
 def can_regenerate(url: str) -> bool:
     """Check if regeneration is allowed for this URL."""
-    return get_regen_count(url) < MAX_REGENERATIONS_PER_URL
+    domain = _extract_domain(url)
+    return not regen_limit_reached(domain, MAX_REGENERATIONS_PER_URL)
+
 
 def clear_ai_cache_for_url(url: str):
     """Clear cached AI result for a specific URL (for forced regeneration)."""
-    cache_key = get_ai_cache_key(url)
-    
-    if 'ai_cache' in st.session_state and cache_key in st.session_state.ai_cache:
-        del st.session_state.ai_cache[cache_key]
-    
-    disk_cache = load_ai_cache()
-    if cache_key in disk_cache:
-        del disk_cache[cache_key]
-        save_ai_cache(disk_cache)
+    domain = _extract_domain(url)
+    clear_ai_cache(domain)
+
 
 # Initialize database
 DB_AVAILABLE = False
@@ -1722,17 +1728,14 @@ def init_app_session():
         st.session_state['2fa_username'] = None
     
     # -------------------------------------------------------------------------
-    # NAVIGATION STATE
+    # NAVIGATION STATE (now managed by persistence layer)
     # -------------------------------------------------------------------------
     if 'current_section' not in st.session_state:
         st.session_state.current_section = 'Single Audit'
     
     # -------------------------------------------------------------------------
-    # AUDIT/CRM DATA STATE (preserve across login/logout)
+    # BULK AUDIT STATE (bulk scan is separate from single audit persistence)
     # -------------------------------------------------------------------------
-    if 'current_audit_data' not in st.session_state:
-        st.session_state.current_audit_data = None
-    
     if 'audit_bulk_selected' not in st.session_state:
         st.session_state.audit_bulk_selected = set()
     
@@ -1741,6 +1744,9 @@ def init_app_session():
     
     if 'bulk_scan_session_id' not in st.session_state:
         st.session_state.bulk_scan_session_id = None
+    
+    # NOTE: current_audit_data is now managed by persistence layer
+    # Use get_current_audit() and set_current_audit() instead
     
     # -------------------------------------------------------------------------
     # INTERNAL FLAGS (tracking state)
@@ -1958,7 +1964,8 @@ def logout_user():
     - Delete only auth-related keys
     - Keep all other session keys (including API keys & audit data)
     - Delete session from file storage
-    - Not delete cached audit results, CRM data, bulk scan states, etc.
+    - Clear navigation state for the user
+    - Not delete cached audit results on disk
     """
     logger = logging.getLogger("sales_engine")
     
@@ -1970,6 +1977,10 @@ def logout_user():
     # Destroy session in file storage
     if session_token:
         destroy_session(session_token)
+    
+    # Clear persistence layer state (navigation, current audit selection)
+    # This preserves disk cache but clears session-specific state
+    on_logout_cleanup()
     
     # Clear only auth state
     _clear_auth_state_only()
@@ -2786,6 +2797,10 @@ if not st.session_state.get("_api_keys_migrated"):
 # Step 1: Initialize all session state variables (never overwrites existing values)
 init_app_session()
 
+# Step 1.5: Initialize persistence layer (audit data, AI cache, navigation state)
+# This restores audit data from disk cache if available, syncs URL params, etc.
+persistence_status = init_app_session_persistence()
+
 # Step 2: Try to restore/validate login state
 # This checks session_state, then query params, validates tokens, and restores user info
 session_valid = load_login_state()
@@ -2863,8 +2878,9 @@ with st.sidebar:
         # This preserves API keys and audit data while clearing auth state
         logout_user()
         
-        # Clear query params to remove session token from URL
+        # Clear query params (removes session token and audit_id from URL)
         try:
+            clear_navigation_state()
             st.query_params.clear()
         except Exception:
             pass
@@ -3408,15 +3424,49 @@ def show_api_settings():
                     st.error(f"❌ Test failed: {message}")
 
 def show_single_audit():
-    """Single website audit page."""
+    """
+    Single website audit page with full persistence layer integration.
+    
+    Uses the new persistence framework for:
+    - Audit data survival across refresh/navigation
+    - AI cache to prevent recomputation
+    - PDF context for report generation
+    - Navigation state for deep linking
+    """
     st.title("🚀 Single Website Audit")
     st.markdown("Enter a website URL to analyze its technical health, SEO, performance & generate AI insights")
     st.markdown("---")
     
-    # Initialize session state for audit results
-    if 'current_audit_data' not in st.session_state:
-        st.session_state.current_audit_data = None
+    # =========================================================================
+    # STEP 1: Restore navigation and audit state on page load
+    # =========================================================================
+    restore_result = restore_navigation_on_refresh()
     
+    # Check for deep link audit ID from URL params
+    deep_link_audit_id = get_deep_link_audit_id()
+    if deep_link_audit_id:
+        set_current_audit(deep_link_audit_id)
+        logger.info(f"Loaded audit from deep link: {deep_link_audit_id}")
+    
+    # Save current navigation state
+    current_audit_id = st.session_state.get('_current_audit_id')
+    save_navigation_state("Single Audit", current_audit_id)
+    
+    # =========================================================================
+    # STEP 2: Load current audit data from persistence layer
+    # =========================================================================
+    audit_data = get_current_audit()
+    
+    # If no audit in persistence but we have an ID, try to rebuild from DB
+    if not audit_data and current_audit_id:
+        audit_data = rebuild_audit_data_from_db(current_audit_id)
+        if audit_data:
+            set_current_audit(current_audit_id)
+            logger.info(f"Rebuilt audit {current_audit_id} from database")
+    
+    # =========================================================================
+    # STEP 3: URL input and analysis
+    # =========================================================================
     col1, col2 = st.columns([3, 1])
     with col1:
         url = st.text_input("Website URL", placeholder="example.com")
@@ -3456,269 +3506,298 @@ def show_single_audit():
                     error_msg = data.get('error', 'Unknown error during audit')
                     st.error(f"❌ Scan Failed: {error_msg}")
                     logger.error(f"Audit failed for {url_sanitized}: {error_msg}")
-                    # Clear previous audit data on error
-                    st.session_state.current_audit_data = None
+                    clear_current_audit()
                 else:
                     logger.info(f"Audit completed successfully for {url_sanitized}")
                     
-                    # Store audit results in session state for persistence
-                    st.session_state.current_audit_data = data
-                    
-                    # Save to database safely
+                    # Save to database and get audit_id
+                    audit_id = None
                     try:
                         if DB_AVAILABLE:
-                            save_audit_to_db(data)
-                            logger.debug(f"Audit saved to database for {url_sanitized}")
+                            audit_id = save_audit_to_db(data)
+                            logger.debug(f"Audit saved to database for {url_sanitized}, id={audit_id}")
                     except Exception as e:
                         logger.warning(f"Failed to save audit to database: {str(e)}")
                         st.warning("⚠️ Audit completed but couldn't save to database")
+                    
+                    # =========================================================
+                    # PERSIST TO ALL LAYERS (session + disk + db)
+                    # =========================================================
+                    if audit_id:
+                        data['audit_id'] = audit_id
+                        persist_audit_data(audit_id, data)
+                        set_current_audit(audit_id)
+                        store_pdf_context(audit_id, data)
+                        save_navigation_state("Single Audit", audit_id)
+                        sync_query_params()
+                        logger.info(f"Audit {audit_id} persisted to all layers")
+                    
+                    # Update local variable for display
+                    audit_data = data
     
-    # Display results from session state (persists across reruns)
-    if st.session_state.current_audit_data:
-        data = st.session_state.current_audit_data
-        
-        # Metrics
+    # =========================================================================
+    # STEP 4: Display audit results (from persistence layer)
+    # =========================================================================
+    if not audit_data:
+        st.info("👆 Enter a website URL above and click **Analyze** to start an audit.")
+        return
+    
+    # Metrics
+    st.markdown("---")
+    st.markdown("### 📊 Audit Results")
+    
+    c1, c2, c3, c4, c5 = st.columns(5)
+    
+    with c1:
+        st.metric("Health Score", audit_data.get('score', 'N/A'), 
+                  delta=("Good" if audit_data.get('score', 0) >= 70 else "Needs Work"))
+    with c2:
+        st.metric("Google Speed", audit_data.get('psi', 'N/A'))
+    with c3:
+        st.metric("Accessibility", audit_data.get('accessibility_score', 'N/A'))
+    with c4:
+        st.metric("Issues Found", len(audit_data.get('issues', [])))
+    with c5:
+        st.metric("Age", audit_data.get('domain_age', 'Unknown'))
+    
+    # Tech stack
+    if audit_data.get('tech_stack'):
+        st.markdown(f"**📦 Tech Stack:** {', '.join(audit_data['tech_stack'])}")
+    
+    # Issues
+    if audit_data.get('issues'):
         st.markdown("---")
-        st.markdown("### 📊 Audit Results")
+        st.markdown("### ⚠️ Issues Detected")
         
-        c1, c2, c3, c4, c5 = st.columns(5)
+        for i, issue in enumerate(audit_data.get('issues', []), 1):
+            try:
+                with st.expander(f"{i}. {issue.get('title', 'Unknown Issue')}", expanded=(i <= 2)):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"**Impact:** {issue.get('impact', 'N/A')}")
+                    with col2:
+                        st.markdown(f"**Solution:** {issue.get('solution', 'N/A')}")
+            except Exception as e:
+                logger.error(f"Error displaying issue {i}: {str(e)}")
+                st.warning(f"Could not display issue #{i}")
+    
+    # AI analysis
+    if audit_data.get('ai'):
+        st.markdown("---")
         
-        with c1:
-            st.metric("Health Score", data.get('score', 'N/A'), delta=("Good" if data.get('score', 0) >= 70 else "Needs Work"))
-        with c2:
-            st.metric("Google Speed", data.get('psi', 'N/A'))
-        with c3:
-            st.metric("Accessibility", data.get('accessibility_score', 'N/A'))
-        with c4:
-            st.metric("Issues Found", len(data.get('issues', [])))
-        with c5:
-            st.metric("Age", data.get('domain_age', 'Unknown'))
+        # Show cache indicator
+        if audit_data['ai'].get('from_cache'):
+            st.markdown("### 🤖 AI Analysis _(cached)_")
+            st.caption("💾 Using cached AI result to save API costs. Click 'Regenerate' for fresh analysis.")
+        else:
+            st.markdown("### 🤖 AI Analysis")
         
-        # Tech stack
-        if data.get('tech_stack'):
-            st.markdown(f"**📦 Tech Stack:** {', '.join(data['tech_stack'])}")
+        # Check if we have structured insights
+        insights = audit_data['ai'].get('insights')
         
-        # Issues
-        if data.get('issues'):
-            st.markdown("---")
-            st.markdown("### ⚠️ Issues Detected")
-            
-            for i, issue in enumerate(data.get('issues', []), 1):
-                try:
-                    with st.expander(f"{i}. {issue.get('title', 'Unknown Issue')}", expanded=(i <= 2)):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown(f"**Impact:** {issue.get('impact', 'N/A')}")
-                        with col2:
-                            st.markdown(f"**Solution:** {issue.get('solution', 'N/A')}")
-                except Exception as e:
-                    logger.error(f"Error displaying issue {i}: {str(e)}")
-                    st.warning(f"Could not display issue #{i}")
-        
-        # AI analysis
-        if data.get('ai'):
-            st.markdown("---")
-            
-            # Show cache indicator
-            if data['ai'].get('from_cache'):
-                st.markdown("### 🤖 AI Analysis _(cached)_")
-                st.caption("💾 Using cached AI result to save API costs. Click 'Regenerate' for fresh analysis.")
-            else:
-                st.markdown("### 🤖 AI Analysis")
-            
-            # Check if we have structured insights
-            insights = data['ai'].get('insights')
-            
-            if insights:
-                # Display structured AI insights
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Snapshot Summary
-                    st.markdown("**📸 Snapshot Summary**")
-                    for bullet in insights.get('snapshot_summary', []):
-                        st.markdown(f"• {bullet}")
-                    
-                    # Top 3 Issues
-                    st.markdown("**🚨 Top 3 Issues Hurting You Most**")
-                    for item in insights.get('top_3_issues', []):
-                        st.markdown(f"**{item.get('issue', '')}**")
-                        st.caption(f"↳ {item.get('impact', '')}")
-                
-                with col2:
-                    # Quick Wins
-                    st.markdown("**⚡ Quick Wins (Next 30 Days)**")
-                    for idx, win in enumerate(insights.get('quick_wins', []), 1):
-                        st.markdown(f"{idx}. {win}")
-                    
-                    # Code Nest Services
-                    st.markdown("**🛠️ How Code Nest Can Help**")
-                    for item in insights.get('code_nest_services', []):
-                        st.markdown(f"• **{item.get('issue', '')}** → {item.get('service', '')}")
-                
-                # Suggested Next Step
-                if insights.get('next_step'):
-                    st.info(f"**📞 Next Step:** {insights['next_step']}")
-            else:
-                # Fallback to legacy display
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**Summary**")
-                    st.info(data['ai'].get('summary', 'No summary available'))
-                    st.markdown("**Impact**")
-                    st.warning(data['ai'].get('impact', 'No impact assessment available'))
-                
-                with col2:
-                    st.markdown("**Solutions**")
-                    st.success(data['ai'].get('solutions', 'No solutions available'))
-            
-            # =========================================================================
-            # EMAIL OUTREACH SECTION
-            # =========================================================================
-            st.markdown("---")
-            st.markdown("### 📧 Send Email Outreach")
-            
-            # Premium format info note
-            st.caption("✨ _This message was generated using Code Nest LLC's premium outreach format, covering Website Optimization, SEO, Social Media Management, PPC, and paid ad strategy._")
-            
-            # Check SMTP configuration
-            if not is_smtp_configured():
-                st.warning("⚠️ **SMTP not configured.** Go to **API Settings** to configure your Hostinger SMTP settings before sending emails.")
-            else:
-                st.success("✅ SMTP configured and ready")
-            
-            # Get domain for email personalization
-            domain = urlparse(data.get('url', '')).netloc.replace("www.", "")
-            
-            # Pre-fill email from audit data
-            emails_found = data.get('emails', [])
-            default_email = emails_found[0] if emails_found else ""
-            
-            # Email subject - use AI generated or default (ensure lowercase)
-            default_subject = data['ai'].get('email_subject', f"quick note about {domain}").lower()
-            
-            # Email body - use AI generated cold email
-            default_body = data['ai'].get('email', '')
-            
-            col1, col2 = st.columns([2, 1])
+        if insights:
+            # Display structured AI insights
+            col1, col2 = st.columns(2)
             
             with col1:
-                to_email = st.text_input(
-                    "📬 To Email",
-                    value=default_email,
-                    placeholder="contact@theirsite.com",
-                    help="Recipient email address - pre-filled if found during audit"
-                )
+                # Snapshot Summary
+                st.markdown("**📸 Snapshot Summary**")
+                for bullet in insights.get('snapshot_summary', []):
+                    st.markdown(f"• {bullet}")
+                
+                # Top 3 Issues
+                st.markdown("**🚨 Top 3 Issues Hurting You Most**")
+                for item in insights.get('top_3_issues', []):
+                    st.markdown(f"**{item.get('issue', '')}**")
+                    st.caption(f"↳ {item.get('impact', '')}")
             
             with col2:
-                email_subject = st.text_input(
-                    "📝 Subject",
-                    value=default_subject,
-                    placeholder="quick note about domain.com",
-                    help="Lowercase, 3-5 words, personalized to their domain"
-                )
+                # Quick Wins
+                st.markdown("**⚡ Quick Wins (Next 30 Days)**")
+                for idx, win in enumerate(insights.get('quick_wins', []), 1):
+                    st.markdown(f"{idx}. {win}")
+                
+                # Code Nest Services
+                st.markdown("**🛠️ How Code Nest Can Help**")
+                for item in insights.get('code_nest_services', []):
+                    st.markdown(f"• **{item.get('issue', '')}** → {item.get('service', '')}")
             
-            email_body = st.text_area(
-                "✉️ Email Body",
-                value=default_body,
-                height=280,
-                help="Premium agency-level cold email - edit as needed"
+            # Suggested Next Step
+            if insights.get('next_step'):
+                st.info(f"**📞 Next Step:** {insights['next_step']}")
+        else:
+            # Fallback to legacy display
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Summary**")
+                st.info(audit_data['ai'].get('summary', 'No summary available'))
+                st.markdown("**Impact**")
+                st.warning(audit_data['ai'].get('impact', 'No impact assessment available'))
+            
+            with col2:
+                st.markdown("**Solutions**")
+                st.success(audit_data['ai'].get('solutions', 'No solutions available'))
+        
+        # =========================================================================
+        # EMAIL OUTREACH SECTION (always shown when AI is available)
+        # =========================================================================
+        st.markdown("---")
+        st.markdown("### 📧 Send Email Outreach")
+        
+        # Premium format info note
+        st.caption("✨ _This message was generated using Code Nest LLC's premium outreach format, covering Website Optimization, SEO, Social Media Management, PPC, and paid ad strategy._")
+        
+        # Check SMTP configuration
+        if not is_smtp_configured():
+            st.warning("⚠️ **SMTP not configured.** Go to **API Settings** to configure your Hostinger SMTP settings before sending emails.")
+        else:
+            st.success("✅ SMTP configured and ready")
+        
+        # Get domain for email personalization
+        domain = urlparse(audit_data.get('url', '')).netloc.replace("www.", "")
+        
+        # Pre-fill email from audit data
+        emails_found = audit_data.get('emails', [])
+        default_email = emails_found[0] if emails_found else ""
+        
+        # Email subject - use AI generated or default (ensure lowercase)
+        default_subject = audit_data['ai'].get('email_subject', f"quick note about {domain}").lower()
+        
+        # Email body - use AI generated cold email
+        default_body = audit_data['ai'].get('email', '')
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            to_email = st.text_input(
+                "📬 To Email",
+                value=default_email,
+                placeholder="contact@theirsite.com",
+                help="Recipient email address - pre-filled if found during audit"
             )
+        
+        with col2:
+            email_subject = st.text_input(
+                "📝 Subject",
+                value=default_subject,
+                placeholder="quick note about domain.com",
+                help="Lowercase, 3-5 words, personalized to their domain"
+            )
+        
+        email_body = st.text_area(
+            "✉️ Email Body",
+            value=default_body,
+            height=280,
+            help="Premium agency-level cold email - edit as needed"
+        )
+        
+        # Attach PDF checkbox
+        attach_pdf = st.checkbox("📎 Attach PDF Audit Report", value=True, help="Include the full audit report as a PDF attachment")
+        
+        col1, col2, col3 = st.columns([2, 1, 1])
+        
+        with col1:
+            send_email_btn = st.button("📤 Send Email", type="primary", use_container_width=True, disabled=not is_smtp_configured())
+        
+        with col2:
+            # Check regeneration limit using persistence layer
+            audit_url = audit_data.get('url', '')
+            regen_count = get_regen_count(audit_url)
+            can_regen = can_regenerate(audit_url)
+            regen_label = f"🔄 Regenerate ({MAX_REGENERATIONS_PER_URL - regen_count} left)" if can_regen else "🔄 Limit Reached"
             
-            # Attach PDF checkbox
-            attach_pdf = st.checkbox("📎 Attach PDF Audit Report", value=True, help="Include the full audit report as a PDF attachment")
-            
-            col1, col2, col3 = st.columns([2, 1, 1])
-            
-            with col1:
-                send_email_btn = st.button("📤 Send Email", type="primary", use_container_width=True, disabled=not is_smtp_configured())
-            
-            with col2:
-                # Check regeneration limit
-                regen_count = get_regen_count(data['url'])
-                can_regen = can_regenerate(data['url'])
-                regen_label = f"🔄 Regenerate ({MAX_REGENERATIONS_PER_URL - regen_count} left)" if can_regen else "🔄 Limit Reached"
-                
-                if st.button(regen_label, use_container_width=True, disabled=not can_regen):
-                    if not can_regen:
-                        st.warning(f"⚠️ Regeneration limit reached ({MAX_REGENERATIONS_PER_URL} max per audit) to control API costs.")
-                    elif st.session_state.OPENAI_API_KEY:
-                        with st.spinner("Generating new email..."):
-                            # Increment regen counter
-                            increment_regen_count(data['url'])
-                            # Force regenerate (skip cache)
-                            clear_ai_cache_for_url(data['url'])
-                            new_ai = get_ai_consultation(data['url'], data, st.session_state.OPENAI_API_KEY, force_regenerate=True)
-                            data['ai'] = new_ai
-                            st.session_state.current_audit_data = data
-                            st.rerun()
-                    else:
-                        st.error("OpenAI API key required")
-            
-            with col3:
-                st.download_button(
-                    "📋 Copy Email",
-                    f"Subject: {email_subject}\n\n{email_body}",
-                    file_name="cold_email.txt",
-                    mime="text/plain",
-                    use_container_width=True
-                )
-            
-            if send_email_btn:
-                if not to_email:
-                    st.error("❌ Please enter a recipient email address")
-                elif not email_subject:
-                    st.error("❌ Please enter an email subject")
-                elif not email_body:
-                    st.error("❌ Please enter an email body")
+            if st.button(regen_label, use_container_width=True, disabled=not can_regen):
+                if not can_regen:
+                    st.warning(f"⚠️ Regeneration limit reached ({MAX_REGENERATIONS_PER_URL} max per audit) to control API costs.")
+                elif st.session_state.OPENAI_API_KEY:
+                    with st.spinner("Generating new email..."):
+                        # Increment regen counter (persists to disk)
+                        increment_regen_count(audit_url)
+                        # Force regenerate (skip cache)
+                        clear_ai_cache_for_url(audit_url)
+                        new_ai = get_ai_consultation(audit_url, audit_data, st.session_state.OPENAI_API_KEY, force_regenerate=True)
+                        audit_data['ai'] = new_ai
+                        
+                        # Update persistence layer with new AI data
+                        audit_id = audit_data.get('audit_id')
+                        if audit_id:
+                            persist_audit_data(audit_id, audit_data)
+                            store_pdf_context(audit_id, audit_data)
+                        
+                        # Cache the new AI result
+                        cache_ai_result(audit_url, new_ai)
+                        st.rerun()
                 else:
-                    with st.spinner("Sending email..."):
-                        # Generate PDF if checkbox is checked
-                        pdf_bytes = None
-                        pdf_filename = ""
-                        
-                        if attach_pdf:
-                            try:
-                                pdf_bytes = generate_pdf(data)
-                                pdf_filename = f"CodeNest_Audit_{domain.replace('.', '_')}.pdf"
-                            except Exception as e:
-                                st.warning(f"Could not generate PDF: {e}")
-                                pdf_bytes = None
-                        
-                        # Send branded HTML email with PDF attachment
-                        success, message = send_branded_email_with_pdf(
-                            to_email=to_email,
-                            subject=email_subject,
-                            body=email_body,
-                            pdf_bytes=pdf_bytes,
-                            filename=pdf_filename
-                        )
-                        
-                        if success:
-                            st.success(f"✅ {message}")
-                            st.balloons()
-                            logger.info(f"Cold email sent to {to_email} for {domain}")
-                        else:
-                            st.error(f"❌ {message}")
-                            logger.error(f"Failed to send email to {to_email}: {message}")
+                    st.error("OpenAI API key required")
+        
+        with col3:
+            st.download_button(
+                "📋 Copy Email",
+                f"Subject: {email_subject}\n\n{email_body}",
+                file_name="cold_email.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+        
+        if send_email_btn:
+            if not to_email:
+                st.error("❌ Please enter a recipient email address")
+            elif not email_subject:
+                st.error("❌ Please enter an email subject")
+            elif not email_body:
+                st.error("❌ Please enter an email body")
+            else:
+                with st.spinner("Sending email..."):
+                    # Generate PDF if checkbox is checked
+                    pdf_bytes = None
+                    pdf_filename = ""
+                    
+                    if attach_pdf:
+                        try:
+                            pdf_bytes = generate_pdf(audit_data)
+                            pdf_filename = f"CodeNest_Audit_{domain.replace('.', '_')}.pdf"
+                        except Exception as e:
+                            st.warning(f"Could not generate PDF: {e}")
+                            pdf_bytes = None
+                    
+                    # Send branded HTML email with PDF attachment
+                    success, message = send_branded_email_with_pdf(
+                        to_email=to_email,
+                        subject=email_subject,
+                        body=email_body,
+                        pdf_bytes=pdf_bytes,
+                        filename=pdf_filename
+                    )
+                    
+                    if success:
+                        st.success(f"✅ {message}")
+                        st.balloons()
+                        logger.info(f"Cold email sent to {to_email} for {domain}")
+                    else:
+                        st.error(f"❌ {message}")
+                        logger.error(f"Failed to send email to {to_email}: {message}")
         
         # Save to DB (only if not already saved)
-        audit_id = data.get('audit_id')
+        audit_id = audit_data.get('audit_id')
         if not audit_id and DB_AVAILABLE:
-            audit_id = save_audit_to_db(data)
+            audit_id = save_audit_to_db(audit_data)
             if audit_id:
-                data['audit_id'] = audit_id  # Store for future reference
+                audit_data['audit_id'] = audit_id
+                # Persist the updated audit data with new ID
+                persist_audit_data(audit_id, audit_data)
+                set_current_audit(audit_id)
+                store_pdf_context(audit_id, audit_data)
                 st.success(f"✓ Audit saved (ID: {audit_id})")
                 
                 # Send Slack notification
                 if st.session_state.SLACK_WEBHOOK:
-                    send_slack_notification(f"🔍 New audit: {data['url']} (Score: {data['score']}/100)", st.session_state.SLACK_WEBHOOK)
+                    send_slack_notification(f"🔍 New audit: {audit_data['url']} (Score: {audit_data['score']}/100)", st.session_state.SLACK_WEBHOOK)
         
         # PDF export and persistent storage
         st.markdown("---")
         try:
-            pdf_bytes = generate_pdf(data)
-            domain_name = urlparse(data['url']).netloc.replace("www.", "").replace(".", "_")
+            pdf_bytes = generate_pdf(audit_data)
+            domain_name = urlparse(audit_data['url']).netloc.replace("www.", "").replace(".", "_")
             
             # Save PDF to persistent storage if audit was saved to DB
             if audit_id:
@@ -4959,14 +5038,21 @@ def show_bulk_audit():
                                     if audit_id:
                                         if st.button("🔍 Open", key=f"bulk_open_{session.id}_{idx}", use_container_width=True,
                                                      help="Load this audit in Single Audit view"):
-                                            # Load audit data and navigate to Single Audit
+                                            # Load audit data and navigate to Single Audit using persistence layer
                                             db = get_db()
                                             if db:
                                                 try:
                                                     audit = db.query(Audit).filter(Audit.id == audit_id).first()
                                                     if audit:
                                                         data = convert_audit_to_data_dict(audit)
-                                                        st.session_state.current_audit_data = data
+                                                        
+                                                        # Use persistence layer exclusively (no direct session state)
+                                                        set_current_audit(audit_id)
+                                                        persist_audit_data(audit_id, data)
+                                                        store_pdf_context(audit_id, data)
+                                                        save_navigation_state("Single Audit", audit_id)
+                                                        sync_query_params()
+                                                        
                                                         st.session_state.current_section = 'Single Audit'
                                                         st.toast(f"✓ Loaded {domain}")
                                                 except Exception as e:
@@ -5942,11 +6028,17 @@ def render_audit_detail(audit):
                 st.error("PDF generation failed")
     
     with col_btn2:
-        # Load to Single Audit view
+        # Load to Single Audit view using persistence layer
         if st.button("📂 Load to Audit", key=f"load_audit_{audit.id}", use_container_width=True):
-            st.session_state.current_audit_data = data
+            # Use persistence layer instead of direct session state mutation
+            set_current_audit(audit.id)
+            persist_audit_data(audit.id, data)
+            store_pdf_context(audit.id, data)
+            save_navigation_state("Single Audit", audit.id)
+            sync_query_params()
+            
             st.session_state.current_section = 'Single Audit'
-            logger.debug(f"Loaded audit {audit.id} ({audit.domain}) to Single Audit view")
+            logger.debug(f"Loaded audit {audit.id} ({audit.domain}) to Single Audit view via persistence layer")
             st.toast(f"✓ Loaded {audit.domain} to Single Audit page")
             st.rerun()
     

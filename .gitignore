@@ -59,3 +59,5 @@ Thumbs.db
 *.temp
 *.bak
 *.swp
+# Persistence Cache
+.cache/
