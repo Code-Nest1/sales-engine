@@ -640,58 +640,144 @@ def db_get_follow_up_due(days_ahead: int = 7) -> dict:
         return api_error(str(e), code=500)
 
 
-def _lead_to_dict(lead: Lead) -> dict:
-    """Convert Lead model to dictionary."""
+def lead_to_dict(lead) -> dict:
+    """
+    Convert Lead model or dict to a safe dictionary.
+    
+    Handles both ORM Lead objects and existing dicts.
+    Returns dict with all fields safely defaulted.
+    """
+    # If already a dict, ensure all expected keys exist with safe defaults
+    if isinstance(lead, dict):
+        return {
+            "id": lead.get("id"),
+            "domain": lead.get("domain") or "",
+            "email": lead.get("email") or "",
+            "company_name": lead.get("company_name") or "",
+            "phone": lead.get("phone") or "",
+            "address": lead.get("address") or "",
+            "city": lead.get("city") or "",
+            "state": lead.get("state") or "",
+            "zipcode": lead.get("zipcode") or "",
+            "health_score": lead.get("health_score"),
+            "opportunity_rating": lead.get("opportunity_rating") or 0,
+            "industry": lead.get("industry") or "",
+            "company_size": lead.get("company_size") or "",
+            "status": lead.get("status") or "new",
+            "notes": lead.get("notes") or "",
+            "approached": lead.get("approached", False),
+            "approached_date": lead.get("approached_date"),
+            "follow_up_date": lead.get("follow_up_date"),
+            "lead_status": lead.get("lead_status") or "warm",
+            "interested": lead.get("interested") or "maybe",
+            "pipeline_stage": lead.get("pipeline_stage") or "new",
+            "assigned_user": lead.get("assigned_user") or "",
+            "source": lead.get("source") or "single",
+            "last_audit_id": lead.get("last_audit_id"),
+            "created_at": lead.get("created_at"),
+            "updated_at": lead.get("updated_at")
+        }
+    
+    # ORM Lead object
     return {
         "id": lead.id,
-        "domain": lead.domain,
-        "email": lead.email,
-        "company_name": lead.company_name,
-        "phone": lead.phone,
-        "address": lead.address,
-        "city": lead.city,
-        "state": lead.state,
-        "zipcode": lead.zipcode,
+        "domain": lead.domain or "",
+        "email": lead.email or "",
+        "company_name": lead.company_name or "",
+        "phone": lead.phone or "",
+        "address": lead.address or "",
+        "city": lead.city or "",
+        "state": lead.state or "",
+        "zipcode": lead.zipcode or "",
         "health_score": lead.health_score,
-        "opportunity_rating": lead.opportunity_rating,
-        "industry": lead.industry,
-        "company_size": lead.company_size,
-        "status": lead.status,
-        "notes": lead.notes,
-        "approached": lead.approached,
+        "opportunity_rating": lead.opportunity_rating or 0,
+        "industry": lead.industry or "",
+        "company_size": lead.company_size or "",
+        "status": lead.status or "new",
+        "notes": lead.notes or "",
+        "approached": lead.approached if lead.approached is not None else False,
         "approached_date": lead.approached_date.isoformat() if lead.approached_date else None,
         "follow_up_date": lead.follow_up_date.isoformat() if lead.follow_up_date else None,
-        "lead_status": lead.lead_status,
-        "interested": lead.interested,
-        "pipeline_stage": lead.pipeline_stage,
-        "assigned_user": lead.assigned_user,
-        "source": lead.source,
+        "lead_status": lead.lead_status or "warm",
+        "interested": lead.interested or "maybe",
+        "pipeline_stage": lead.pipeline_stage or "new",
+        "assigned_user": lead.assigned_user or "",
+        "source": lead.source or "single",
         "last_audit_id": lead.last_audit_id,
         "created_at": lead.created_at.isoformat() if lead.created_at else None,
         "updated_at": lead.updated_at.isoformat() if lead.updated_at else None
     }
 
 
-def _audit_to_dict(audit: Audit) -> dict:
-    """Convert Audit model to dictionary."""
+# Alias for backward compatibility
+_lead_to_dict = lead_to_dict
+
+
+def audit_to_dict(audit) -> dict:
+    """
+    Convert Audit model or dict to a safe dictionary.
+    
+    Handles both ORM Audit objects and existing dicts.
+    Returns dict with all fields safely defaulted.
+    """
+    # If already a dict, ensure all expected keys exist with safe defaults
+    if isinstance(audit, dict):
+        # Handle timestamp field for backward compatibility
+        timestamp = audit.get("timestamp") or audit.get("created_at")
+        if timestamp and hasattr(timestamp, 'isoformat'):
+            timestamp = timestamp.isoformat()
+        
+        return {
+            "id": audit.get("id"),
+            "url": audit.get("url") or "",
+            "domain": audit.get("domain") or "",
+            "health_score": audit.get("health_score") or audit.get("score") or 0,
+            "score": audit.get("score") or audit.get("health_score") or 0,
+            "psi_score": audit.get("psi_score") or audit.get("psi"),
+            "psi": audit.get("psi") or audit.get("psi_score"),
+            "domain_age": audit.get("domain_age") or "",
+            "tech_stack": audit.get("tech_stack") or [],
+            "issues": audit.get("issues") or [],
+            "emails_found": audit.get("emails_found") or [],
+            "ai_summary": audit.get("ai_summary") or "",
+            "ai_impact": audit.get("ai_impact") or "",
+            "ai_solutions": audit.get("ai_solutions") or "",
+            "ai_email": audit.get("ai_email") or "",
+            "username": audit.get("username") or "",
+            "source": audit.get("source") or "single",
+            "status": audit.get("status") or "",
+            "created_at": timestamp,
+            "timestamp": timestamp  # Backward compatibility alias
+        }
+    
+    # ORM Audit object
+    timestamp = audit.created_at.isoformat() if audit.created_at else None
     return {
         "id": audit.id,
-        "url": audit.url,
-        "domain": audit.domain,
-        "health_score": audit.health_score,
+        "url": audit.url or "",
+        "domain": audit.domain or "",
+        "health_score": audit.health_score or 0,
+        "score": audit.health_score or 0,  # Alias for compatibility
         "psi_score": audit.psi_score,
-        "domain_age": audit.domain_age,
-        "tech_stack": audit.tech_stack,
-        "issues": audit.issues,
-        "emails_found": audit.emails_found,
-        "ai_summary": audit.ai_summary,
-        "ai_impact": audit.ai_impact,
-        "ai_solutions": audit.ai_solutions,
-        "ai_email": audit.ai_email,
-        "username": audit.username,
-        "source": audit.source,
-        "created_at": audit.created_at.isoformat() if audit.created_at else None
+        "psi": audit.psi_score,  # Alias for compatibility
+        "domain_age": audit.domain_age or "",
+        "tech_stack": audit.tech_stack or [],
+        "issues": audit.issues or [],
+        "emails_found": audit.emails_found or [],
+        "ai_summary": audit.ai_summary or "",
+        "ai_impact": audit.ai_impact or "",
+        "ai_solutions": audit.ai_solutions or "",
+        "ai_email": audit.ai_email or "",
+        "username": audit.username or "",
+        "source": audit.source or "single",
+        "status": "",  # Legacy field
+        "created_at": timestamp,
+        "timestamp": timestamp  # Backward compatibility alias
     }
+
+
+# Alias for backward compatibility
+_audit_to_dict = audit_to_dict
 
 
 # ============================================================================
@@ -1678,16 +1764,24 @@ def get_email_template(template_type, data):
 def get_dashboard_analytics():
     """Compile analytics data for dashboard."""
     try:
-        audits = get_audit_history_cached(limit=1000)
-        if not audits:
+        audits_raw = get_audit_history_cached(limit=1000)
+        if not audits_raw:
             return None
         
+        # Convert all audits to dicts (handles ORM objects)
+        audits = [audit_to_dict(a) for a in audits_raw]
+        
         df = pd.DataFrame(audits)
+        
+        # Safe issue count calculation
+        def get_issue_count(a):
+            issues = a.get("issues") or []
+            return len(issues) if isinstance(issues, list) else 0
         
         analytics = {
             "total_audits": len(audits),
             "avg_score": df["score"].mean() if "score" in df.columns else 0,
-            "high_issue_count": len([a for a in audits if a.get("issue_count", 0) > 10]),
+            "high_issue_count": len([a for a in audits if get_issue_count(a) > 10]),
             "audits_by_day": df.groupby(df["timestamp"].str[:10]).size() if "timestamp" in df.columns else {},
             "score_distribution": pd.cut(df["score"], bins=[0, 25, 50, 75, 100]).value_counts() if "score" in df.columns else {},
             "top_issues": get_top_issues(audits),
@@ -1703,9 +1797,17 @@ def get_top_issues(audits, limit=10):
     try:
         issue_count = {}
         for audit in audits:
-            if "issues" in audit and isinstance(audit["issues"], list):
-                for issue in audit["issues"][:5]:  # Take top 5 per audit
-                    issue_count[issue] = issue_count.get(issue, 0) + 1
+            # Ensure audit is a dict
+            if not isinstance(audit, dict):
+                audit = audit_to_dict(audit)
+            
+            issues = audit.get("issues") or []
+            if isinstance(issues, list):
+                for issue in issues[:5]:  # Take top 5 per audit
+                    if isinstance(issue, str):
+                        issue_count[issue] = issue_count.get(issue, 0) + 1
+                    elif isinstance(issue, dict) and issue.get("title"):
+                        issue_count[issue["title"]] = issue_count.get(issue["title"], 0) + 1
         
         return sorted(issue_count.items(), key=lambda x: x[1], reverse=True)[:limit]
     except Exception:
@@ -7568,12 +7670,15 @@ def render_crm_kanban_board():
             st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_kanban_lead_card(lead: dict, current_stage: str):
+def render_kanban_lead_card(lead, current_stage: str):
     """Render a single lead card in the Kanban board."""
-    domain = lead.get("domain", "Unknown")[:25]
-    company = lead.get("company_name", "")[:20] or domain
+    # Ensure lead is a dict (handles ORM objects)
+    lead = lead_to_dict(lead)
+    
+    domain = (lead.get("domain") or "Unknown")[:25]
+    company = (lead.get("company_name") or "")[:20] or domain
     score = lead.get("health_score")
-    status = lead.get("lead_status", "warm")
+    status = lead.get("lead_status") or "warm"
     lead_id = lead.get("id")
     
     # Determine score class
@@ -7650,9 +7755,12 @@ def render_crm_table_view():
     
     leads = result["data"].get("leads", [])
     
+    # Convert all leads to dicts (handles ORM objects if any)
+    leads = [lead_to_dict(l) for l in leads]
+    
     # Apply search filter
     if search_term:
-        leads = [l for l in leads if search_term.lower() in l.get("domain", "").lower()]
+        leads = [l for l in leads if search_term.lower() in (l.get("domain") or "").lower()]
     
     if not leads:
         st.info("No leads found matching your filters")
@@ -7663,16 +7771,22 @@ def render_crm_table_view():
     # Prepare dataframe
     df_data = []
     for lead in leads:
+        follow_up = lead.get("follow_up_date") or ""
+        if isinstance(follow_up, str) and len(follow_up) >= 10:
+            follow_up = follow_up[:10]
+        else:
+            follow_up = "-"
+        
         df_data.append({
             "ID": lead.get("id"),
-            "Domain": lead.get("domain", ""),
-            "Company": lead.get("company_name", ""),
-            "Email": lead.get("email", ""),
-            "Score": lead.get("health_score", "N/A"),
-            "Status": lead.get("lead_status", ""),
-            "Stage": lead.get("pipeline_stage", ""),
+            "Domain": lead.get("domain") or "",
+            "Company": lead.get("company_name") or "",
+            "Email": lead.get("email") or "",
+            "Score": lead.get("health_score") if lead.get("health_score") is not None else "N/A",
+            "Status": lead.get("lead_status") or "",
+            "Stage": lead.get("pipeline_stage") or "",
             "Approached": "✅" if lead.get("approached") else "❌",
-            "Follow-up": lead.get("follow_up_date", "")[:10] if lead.get("follow_up_date") else "-",
+            "Follow-up": follow_up,
         })
     
     df = pd.DataFrame(df_data)
@@ -7806,7 +7920,8 @@ def render_crm_analytics():
             st.markdown(f"#### 🚨 Overdue ({len(overdue)})")
             if overdue:
                 for lead in overdue[:5]:
-                    st.markdown(f"- **{lead.get('domain', 'Unknown')}**")
+                    lead = lead_to_dict(lead)  # Ensure dict
+                    st.markdown(f"- **{lead.get('domain') or 'Unknown'}**")
             else:
                 st.caption("None overdue")
         
@@ -7814,7 +7929,8 @@ def render_crm_analytics():
             st.markdown(f"#### 📅 Today ({len(today)})")
             if today:
                 for lead in today[:5]:
-                    st.markdown(f"- **{lead.get('domain', 'Unknown')}**")
+                    lead = lead_to_dict(lead)  # Ensure dict
+                    st.markdown(f"- **{lead.get('domain') or 'Unknown'}**")
             else:
                 st.caption("None today")
         
@@ -7822,8 +7938,10 @@ def render_crm_analytics():
             st.markdown(f"#### 📆 Upcoming ({len(upcoming)})")
             if upcoming:
                 for lead in upcoming[:5]:
-                    date_str = lead.get('follow_up_date', '')[:10] if lead.get('follow_up_date') else ''
-                    st.markdown(f"- **{lead.get('domain', 'Unknown')}** ({date_str})")
+                    lead = lead_to_dict(lead)  # Ensure dict
+                    follow_up = lead.get('follow_up_date') or ''
+                    date_str = follow_up[:10] if isinstance(follow_up, str) and len(follow_up) >= 10 else ''
+                    st.markdown(f"- **{lead.get('domain') or 'Unknown'}** ({date_str})")
             else:
                 st.caption("None upcoming")
     else:
@@ -7842,25 +7960,27 @@ def render_crm_lead_detail_panel(lead_id: int):
         st.error(f"Could not load lead: {result.get('error', 'Unknown')}")
         return
     
-    lead = result["data"].get("lead", {})
+    lead = lead_to_dict(result["data"].get("lead", {}))  # Ensure dict
     
     st.markdown("### 📋 Lead Details")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown(f"**Domain:** {lead.get('domain', 'Unknown')}")
-        st.markdown(f"**Company:** {lead.get('company_name', 'N/A')}")
-        st.markdown(f"**Email:** {lead.get('email', 'N/A')}")
-        st.markdown(f"**Phone:** {lead.get('phone', 'N/A')}")
-        st.markdown(f"**Health Score:** {lead.get('health_score', 'N/A')}")
+        st.markdown(f"**Domain:** {lead.get('domain') or 'Unknown'}")
+        st.markdown(f"**Company:** {lead.get('company_name') or 'N/A'}")
+        st.markdown(f"**Email:** {lead.get('email') or 'N/A'}")
+        st.markdown(f"**Phone:** {lead.get('phone') or 'N/A'}")
+        st.markdown(f"**Health Score:** {lead.get('health_score') if lead.get('health_score') is not None else 'N/A'}")
     
     with col2:
-        st.markdown(f"**Stage:** {lead.get('pipeline_stage', 'new')}")
-        st.markdown(f"**Status:** {lead.get('lead_status', 'warm')}")
+        st.markdown(f"**Stage:** {lead.get('pipeline_stage') or 'new'}")
+        st.markdown(f"**Status:** {lead.get('lead_status') or 'warm'}")
         st.markdown(f"**Approached:** {'Yes' if lead.get('approached') else 'No'}")
-        st.markdown(f"**Follow-up:** {lead.get('follow_up_date', 'Not set')[:10] if lead.get('follow_up_date') else 'Not set'}")
-        st.markdown(f"**Assigned:** {lead.get('assigned_user', 'Unassigned')}")
+        follow_up = lead.get('follow_up_date') or ''
+        follow_up_display = follow_up[:10] if isinstance(follow_up, str) and len(follow_up) >= 10 else 'Not set'
+        st.markdown(f"**Follow-up:** {follow_up_display}")
+        st.markdown(f"**Assigned:** {lead.get('assigned_user') or 'Unassigned'}")
     
     # Notes
     st.markdown("**Notes:**")
@@ -11467,14 +11587,24 @@ def show_export_reports():
     if export_type == "PDF (Single)":
         st.markdown("### Export Single Audit as PDF")
         
-        # Get list of audits
-        audits = get_audit_history_cached(limit=100)
-        if not audits:
+        # Get list of audits and convert to dicts
+        audits_raw = get_audit_history_cached(limit=100)
+        if not audits_raw:
             st.warning("No audits available to export")
             return
         
-        # Select audit
-        audit_options = {f"{a.get('domain', 'Unknown')} ({a.get('timestamp', 'N/A')[:10]})": a for a in audits}
+        # Convert all audits to dicts (handles ORM objects)
+        audits = [audit_to_dict(a) for a in audits_raw]
+        
+        # Build audit options with safe timestamp handling
+        audit_options = {}
+        for a in audits:
+            domain = a.get('domain') or 'Unknown'
+            timestamp = a.get('timestamp') or a.get('created_at') or ''
+            ts_label = timestamp[:10] if isinstance(timestamp, str) and len(timestamp) >= 10 else 'N/A'
+            label = f"{domain} ({ts_label})"
+            audit_options[label] = a
+        
         selected = st.selectbox("Select Audit", list(audit_options.keys()))
         
         if selected and st.button("Generate PDF Report", use_container_width=True, type="primary"):
@@ -11487,7 +11617,7 @@ def show_export_reports():
                     st.download_button(
                         label="⬇️ Download PDF Report",
                         data=pdf_bytes,
-                        file_name=f"audit_{audit_data.get('domain', 'report').replace('/', '_')}.pdf",
+                        file_name=f"audit_{(audit_data.get('domain') or 'report').replace('/', '_')}.pdf",
                         mime="application/pdf",
                         use_container_width=True
                     )
@@ -11497,10 +11627,13 @@ def show_export_reports():
     elif export_type == "Excel (Batch)":
         st.markdown("### Export Multiple Audits as Excel")
         
-        audits = get_audit_history_cached(limit=500)
-        if not audits:
+        audits_raw = get_audit_history_cached(limit=500)
+        if not audits_raw:
             st.warning("No audits available to export")
             return
+        
+        # Convert all audits to dicts (handles ORM objects)
+        audits = [audit_to_dict(a) for a in audits_raw]
         
         # Filter options
         col1, col2 = st.columns(2)
@@ -11509,7 +11642,16 @@ def show_export_reports():
         with col2:
             max_score = st.slider("Maximum Score", 0, 100, 100)
         
-        filtered_audits = [a for a in audits if min_score <= a.get("score", 0) <= max_score]
+        # Safe score filtering
+        filtered_audits = []
+        for a in audits:
+            score = a.get("score") or a.get("health_score") or 0
+            try:
+                score_int = int(score) if score is not None else 0
+            except (ValueError, TypeError):
+                score_int = 0
+            if min_score <= score_int <= max_score:
+                filtered_audits.append(a)
         
         st.info(f"Exporting {len(filtered_audits)} audits...")
         
@@ -11532,21 +11674,32 @@ def show_export_reports():
     elif export_type == "CSV (Data)":
         st.markdown("### Export as CSV for Analysis")
         
-        audits = get_audit_history_cached(limit=1000)
-        if not audits:
+        audits_raw = get_audit_history_cached(limit=1000)
+        if not audits_raw:
             st.warning("No audits available to export")
             return
         
+        # Convert all audits to dicts (handles ORM objects)
+        audits = [audit_to_dict(a) for a in audits_raw]
+        
         df = pd.DataFrame(audits)
         
-        # Column selection
+        # Column selection with safe defaults
+        existing_cols = df.columns.tolist()
+        preferred_defaults = ["domain", "score", "health_score", "status", "timestamp", "created_at"]
+        default_cols = [c for c in preferred_defaults if c in existing_cols]
+        
+        # If no preferred columns exist, use first few columns
+        if not default_cols and existing_cols:
+            default_cols = existing_cols[:min(4, len(existing_cols))]
+        
         columns = st.multiselect(
             "Select columns to export",
-            df.columns.tolist(),
-            default=["domain", "score", "status", "timestamp"]
+            existing_cols,
+            default=default_cols
         )
         
-        if st.button("Generate CSV", use_container_width=True, type="primary"):
+        if columns and st.button("Generate CSV", use_container_width=True, type="primary"):
             csv_data = df[columns].to_csv(index=False)
             st.success("✅ CSV ready for download")
             st.download_button(
@@ -11558,8 +11711,9 @@ def show_export_reports():
             )
         
         # Preview
-        st.markdown("### Preview")
-        st.dataframe(df[columns].head(10), use_container_width=True)
+        if columns:
+            st.markdown("### Preview")
+            st.dataframe(df[columns].head(10), use_container_width=True)
 
 
 # ============================================================================
