@@ -5129,19 +5129,25 @@ def export_bulk_scan_results(session_id: str) -> bytes:
         results_list = []
         for url, audit_id in session.results.items():
             if audit_id:
-                audit = db.query(Audit).filter(Audit.id == audit_id).first()
-                if audit:
+                audit_orm = db.query(Audit).filter(Audit.id == audit_id).first()
+                if audit_orm:
+                    # Normalize audit for consistent access
+                    audit = normalize_audit(audit_orm)
+                    tech_stack = audit["tech_stack"][:5] if audit["tech_stack"] else []
+                    emails = audit["emails_found"] if audit["emails_found"] else []
+                    ai_summary = audit["ai_summary"]
+                    
                     results_list.append({
                         "Website": url,
-                        "Domain": audit.domain or url,
-                        "Health Score": audit.health_score or "N/A",
-                        "PSI Speed": audit.psi_score or "N/A",
-                        "Issues Found": len(audit.issues) if audit.issues else 0,
-                        "Domain Age": audit.domain_age or "N/A",
-                        "Tech Stack": ", ".join(audit.tech_stack[:5]) if audit.tech_stack else "N/A",
-                        "Emails Found": ", ".join(audit.emails_found) if audit.emails_found else "N/A",
-                        "AI Summary": (audit.ai_summary[:100] + "...") if audit.ai_summary else "N/A",
-                        "Scanned At": audit.created_at.strftime("%Y-%m-%d %H:%M") if audit.created_at else "N/A"
+                        "Domain": audit["domain"] or url,
+                        "Health Score": audit["health_score"] if audit["health_score"] is not None else "N/A",
+                        "PSI Speed": audit["psi_score"] if audit["psi_score"] else "N/A",
+                        "Issues Found": len(audit["issues"]) if audit["issues"] else 0,
+                        "Domain Age": audit["domain_age"] or "N/A",
+                        "Tech Stack": ", ".join(tech_stack) if tech_stack else "N/A",
+                        "Emails Found": ", ".join(emails) if emails else "N/A",
+                        "AI Summary": (ai_summary[:100] + "...") if ai_summary else "N/A",
+                        "Scanned At": safe_timestamp_slice(audit["created_at"], 16).replace("T", " ") if audit["created_at"] else "N/A"
                     })
             else:
                 results_list.append({
@@ -6212,7 +6218,7 @@ def show_audit_history():
     with col_bulk1:
         if st.button("✅ Select All Visible", key="audit_bulk_all", use_container_width=True):
             for audit in audits:
-                st.session_state.audit_bulk_selected.add(audit.id)
+                st.session_state.audit_bulk_selected.add(_get_attr(audit, 'id'))
             logger.debug(f"Selected all {len(audits)} visible audits")
             st.rerun()
     
@@ -6331,37 +6337,51 @@ def render_audit_item(audit, bulk_selected: set):
     """Render a single audit item with checkbox and expandable details.
     
     Args:
-        audit: Audit model instance
+        audit: Audit model instance or dict
         bulk_selected: Set of selected audit IDs (modified in place)
     """
-    status_icon, _, _ = get_score_status_icon(audit.health_score)
+    # Normalize audit to dict for consistent access
+    audit_dict = normalize_audit(audit)
+    audit_id = audit_dict.get("id")
+    
+    status_icon, _, _ = get_score_status_icon(audit_dict["health_score"])
     
     # Checkbox and expander for each audit
     col_check, col_expand = st.columns([0.5, 11.5])
     with col_check:
-        is_selected = audit.id in bulk_selected
-        if st.checkbox("", value=is_selected, key=f"audit_check_{audit.id}", label_visibility="collapsed"):
-            bulk_selected.add(audit.id)
+        is_selected = audit_id in bulk_selected
+        if st.checkbox("", value=is_selected, key=f"audit_check_{audit_id}", label_visibility="collapsed"):
+            bulk_selected.add(audit_id)
         else:
-            bulk_selected.discard(audit.id)
+            bulk_selected.discard(audit_id)
     
     with col_expand:
         # Create expander for each audit with summary info
-        date_str = audit.created_at.strftime('%m/%d/%Y %H:%M') if audit.created_at else 'N/A'
-        score_display = audit.health_score if audit.health_score is not None else 'N/A'
-        with st.expander(f"{status_icon} {audit.domain} - Score: {score_display}/100 - {date_str}"):
-            render_audit_detail(audit)
+        date_str = safe_timestamp_slice(audit_dict["created_at"], 16).replace("T", " ") if audit_dict["created_at"] else 'N/A'
+        score_display = audit_dict["health_score"] if audit_dict["health_score"] is not None else 'N/A'
+        with st.expander(f"{status_icon} {audit_dict['domain']} - Score: {score_display}/100 - {date_str}"):
+            render_audit_detail(audit, audit_dict)
 
 
-def render_audit_detail(audit):
-    """Render full audit details inside an expander with CRM lead management panel."""
+def render_audit_detail(audit, audit_dict=None):
+    """Render full audit details inside an expander with CRM lead management panel.
+    
+    Args:
+        audit: Original audit (ORM or dict) - used for ID references
+        audit_dict: Pre-normalized audit dict (optional, will normalize if not provided)
+    """
     logger = logging.getLogger("sales_engine")
     
-    # Convert audit to data dict using helper
+    # Use pre-normalized dict or normalize now
+    if audit_dict is None:
+        audit_dict = normalize_audit(audit)
+    
+    # Convert to data dict format for display
     data = convert_audit_to_data_dict(audit)
     
-    # Get lead for this audit's domain
-    lead = get_lead_for_audit(audit.id)
+    # Get lead for this audit's domain and normalize it
+    lead_orm = get_lead_for_audit(audit_dict.get("id"))
+    lead = normalize_lead(lead_orm) if lead_orm else None
     
     # Metrics row
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -6375,7 +6395,7 @@ def render_audit_detail(audit):
     with c4:
         st.metric("Age", data.get('domain_age', 'Unknown'))
     with c5:
-        st.metric("Audit ID", audit.id)
+        st.metric("Audit ID", audit_dict["id"])
     
     # =========================================================================
     # CRM LEAD MANAGEMENT PANEL
@@ -6395,23 +6415,23 @@ def render_audit_detail(audit):
             "single": ("Single", "badge-single"),
             "bulk": ("Bulk", "badge-bulk"),
             "manual": ("Manual", "badge-manual")
-        }.get(lead.source or "single", ("Single", "badge-single"))
+        }.get(lead["source"] or "single", ("Single", "badge-single"))
         
         status_badge = {
             "hot": ("🔥 Hot", "badge-hot"),
             "warm": ("☀️ Warm", "badge-warm"),
             "cold": ("❄️ Cold", "badge-cold")
-        }.get(lead.lead_status or "warm", ("☀️ Warm", "badge-warm"))
+        }.get(lead["lead_status"] or "warm", ("☀️ Warm", "badge-warm"))
         
         pipeline_badge = {
             "new": ("New", "badge-new"),
             "contacted": ("Contacted", "badge-contacted"),
             "follow-up": ("Follow-up", "badge-follow-up"),
             "closed": ("Closed", "badge-closed")
-        }.get(lead.pipeline_stage or "new", ("New", "badge-new"))
+        }.get(lead["pipeline_stage"] or "new", ("New", "badge-new"))
         
-        approached_icon = "✅" if lead.approached else "❌"
-        approached_class = "approached-yes" if lead.approached else "approached-no"
+        approached_icon = "✅" if lead["approached"] else "❌"
+        approached_class = "approached-yes" if lead["approached"] else "approached-no"
         
         st.markdown(f"""
         <div style='background: #f8faf9; border: 1px solid #e0e0e0; border-top: none; 
@@ -6426,15 +6446,15 @@ def render_audit_detail(audit):
         # Lead info row (non-editable info)
         col_lead1, col_lead2, col_lead3 = st.columns(3)
         with col_lead1:
-            st.markdown(f"**📧 Email:** {lead.email or 'Not found'}")
-            st.markdown(f"**📞 Phone:** {lead.phone or 'Not found'}")
+            st.markdown(f"**📧 Email:** {lead['email'] or 'Not found'}")
+            st.markdown(f"**📞 Phone:** {lead.get('phone') or 'Not found'}")
         with col_lead2:
-            st.markdown(f"**🏢 Company:** {lead.company_name or lead.domain}")
-            st.markdown(f"**📊 Opportunity:** {lead.opportunity_rating or 'N/A'}/100")
+            st.markdown(f"**🏢 Company:** {lead['company_name'] or lead['domain']}")
+            st.markdown(f"**📊 Opportunity:** {lead.get('opportunity_rating') or 'N/A'}/100")
         with col_lead3:
-            approached_date = lead.approached_date.strftime('%Y-%m-%d') if lead.approached_date else 'Never'
+            approached_date = safe_timestamp_slice(lead['approached_date'], 10) if lead['approached_date'] else 'Never'
             st.markdown(f"**📅 Approached:** {approached_date}")
-            followup_date = lead.follow_up_date.strftime('%Y-%m-%d') if lead.follow_up_date else 'Not set'
+            followup_date = safe_timestamp_slice(lead['follow_up_date'], 10) if lead['follow_up_date'] else 'Not set'
             st.markdown(f"**📆 Follow-up:** {followup_date}")
         
         # Editable CRM fields in expander
@@ -6445,64 +6465,74 @@ def render_audit_detail(audit):
                 # Approached toggle
                 new_approached = st.checkbox(
                     "✅ Mark as Approached",
-                    value=lead.approached,
-                    key=f"lead_approached_{audit.id}",
+                    value=lead["approached"],
+                    key=f"lead_approached_{audit_dict['id']}",
                     help="Check this when you've contacted the lead"
                 )
                 
                 # Lead status
                 status_options = ["hot", "warm", "cold"]
-                current_status_idx = status_options.index(lead.lead_status) if lead.lead_status in status_options else 1
+                current_status_idx = status_options.index(lead["lead_status"]) if lead["lead_status"] in status_options else 1
                 new_lead_status = st.selectbox(
                     "🎯 Lead Status",
                     status_options,
                     index=current_status_idx,
                     format_func=lambda x: {"hot": "🔥 Hot", "warm": "☀️ Warm", "cold": "❄️ Cold"}.get(x, x),
-                    key=f"lead_status_{audit.id}"
+                    key=f"lead_status_{audit_dict['id']}"
                 )
                 
                 # Interested
                 interested_options = ["yes", "maybe", "no"]
-                current_interested_idx = interested_options.index(lead.interested) if lead.interested in interested_options else 1
+                current_interested_idx = interested_options.index(lead["interested"]) if lead["interested"] in interested_options else 1
                 new_interested = st.selectbox(
                     "💡 Interested",
                     interested_options,
                     index=current_interested_idx,
                     format_func=lambda x: {"yes": "✅ Yes", "maybe": "🤔 Maybe", "no": "❌ No"}.get(x, x),
-                    key=f"lead_interested_{audit.id}"
+                    key=f"lead_interested_{audit_dict['id']}"
                 )
             
             with col_e2:
                 # Pipeline stage
                 pipeline_options = ["new", "contacted", "follow-up", "closed"]
-                current_pipeline_idx = pipeline_options.index(lead.pipeline_stage) if lead.pipeline_stage in pipeline_options else 0
+                current_pipeline_idx = pipeline_options.index(lead["pipeline_stage"]) if lead["pipeline_stage"] in pipeline_options else 0
                 new_pipeline_stage = st.selectbox(
                     "📊 Pipeline Stage",
                     pipeline_options,
                     index=current_pipeline_idx,
                     format_func=lambda x: {"new": "🆕 New", "contacted": "📞 Contacted", "follow-up": "📅 Follow-up", "closed": "✅ Closed"}.get(x, x),
-                    key=f"lead_pipeline_{audit.id}"
+                    key=f"lead_pipeline_{audit_dict['id']}"
                 )
                 
-                # Follow-up date
-                default_followup = lead.follow_up_date.date() if lead.follow_up_date else datetime.now().date() + timedelta(days=7)
+                # Follow-up date - parse from string if needed
+                follow_up_val = lead["follow_up_date"]
+                if follow_up_val and isinstance(follow_up_val, str):
+                    try:
+                        follow_up_val = datetime.fromisoformat(follow_up_val.replace('Z', '+00:00')).date()
+                    except:
+                        follow_up_val = datetime.now().date() + timedelta(days=7)
+                elif follow_up_val and hasattr(follow_up_val, 'date'):
+                    follow_up_val = follow_up_val.date()
+                else:
+                    follow_up_val = datetime.now().date() + timedelta(days=7)
+                
                 new_follow_up_date = st.date_input(
                     "📅 Follow-up Date",
-                    value=default_followup,
-                    key=f"lead_followup_{audit.id}"
+                    value=follow_up_val,
+                    key=f"lead_followup_{audit_dict['id']}"
                 )
             
             # Notes field
             new_notes = st.text_area(
                 "📝 Notes",
-                value=lead.notes or "",
+                value=lead["notes"] or "",
                 height=100,
-                key=f"lead_notes_{audit.id}",
+                key=f"lead_notes_{audit_dict['id']}",
                 placeholder="Add notes about this lead..."
             )
             
             # Save button
-            if st.button("💾 Save CRM Changes", key=f"save_lead_{audit.id}", type="primary", use_container_width=True):
+            if st.button("💾 Save CRM Changes", key=f"save_lead_{audit_dict['id']}", type="primary", use_container_width=True):
                 update_fields = {
                     "approached": new_approached,
                     "lead_status": new_lead_status,
@@ -6512,16 +6542,16 @@ def render_audit_detail(audit):
                 }
                 
                 # Set approached date if newly approached
-                if new_approached and not lead.approached:
+                if new_approached and not lead["approached"]:
                     update_fields["approached_date"] = datetime.utcnow()
                 
                 # Set follow-up date
                 if new_follow_up_date:
                     update_fields["follow_up_date"] = datetime.combine(new_follow_up_date, datetime.min.time())
                 
-                if update_lead_crm_fields(lead.id, **update_fields):
+                if update_lead_crm_fields(lead["id"], **update_fields):
                     st.success("✅ Lead updated successfully!")
-                    logger.info(f"Updated CRM fields for lead {lead.id} ({lead.domain})")
+                    logger.info(f"Updated CRM fields for lead {lead['id']} ({lead['domain']})")
                     st.rerun()
                 else:
                     st.error("❌ Failed to update lead")
@@ -6574,7 +6604,7 @@ def render_audit_detail(audit):
         if data['ai'].get('email') and data['ai']['email'] != 'No email draft available':
             st.markdown("**📧 Cold Email Draft**")
             email_text = clean_text(data['ai']['email']) if 'clean_text' in dir() else data['ai']['email']
-            st.text_area("", value=email_text, height=150, key=f"email_draft_{audit.id}")
+            st.text_area("", value=email_text, height=150, key=f"email_draft_{audit_dict['id']}")
     
     # Action buttons
     st.markdown("---")
@@ -6582,67 +6612,67 @@ def render_audit_detail(audit):
     
     with col_btn1:
         # Download PDF - only generate when clicked
-        if st.button("📥 Generate PDF", key=f"gen_pdf_{audit.id}", use_container_width=True):
+        if st.button("📥 Generate PDF", key=f"gen_pdf_{audit_dict['id']}", use_container_width=True):
             try:
                 with st.spinner("Generating PDF..."):
-                    pdf_bytes = get_audit_pdf(audit.id)
+                    pdf_bytes = get_audit_pdf(audit_dict['id'])
                     if not pdf_bytes:
                         pdf_bytes = generate_pdf(data)
                     if pdf_bytes:
                         st.download_button(
                             label="📥 Download PDF",
                             data=pdf_bytes,
-                            file_name=f"audit_{audit.id}_{audit.domain}.pdf",
+                            file_name=f"audit_{audit_dict['id']}_{audit_dict['domain']}.pdf",
                             mime="application/pdf",
-                            key=f"pdf_download_{audit.id}"
+                            key=f"pdf_download_{audit_dict['id']}"
                         )
                     else:
-                        logger.warning(f"Could not generate PDF for audit {audit.id}")
+                        logger.warning(f"Could not generate PDF for audit {audit_dict['id']}")
                         st.error("Could not generate PDF")
             except Exception as e:
-                logger.error(f"PDF generation failed for audit {audit.id}: {str(e)}")
+                logger.error(f"PDF generation failed for audit {audit_dict['id']}: {str(e)}")
                 st.error("PDF generation failed")
     
     with col_btn2:
         # Load to Single Audit view using persistence layer
-        if st.button("📂 Load to Audit", key=f"load_audit_{audit.id}", use_container_width=True):
+        if st.button("📂 Load to Audit", key=f"load_audit_{audit_dict['id']}", use_container_width=True):
             # Use persistence layer instead of direct session state mutation
-            set_current_audit(audit.id)
-            persist_audit_data(audit.id, data)
-            store_pdf_context(audit.id, data)
-            save_navigation_state("Single Audit", audit.id)
+            set_current_audit(audit_dict['id'])
+            persist_audit_data(audit_dict['id'], data)
+            store_pdf_context(audit_dict['id'], data)
+            save_navigation_state("Single Audit", audit_dict['id'])
             sync_query_params()
             
             st.session_state.current_section = 'Single Audit'
-            logger.debug(f"Loaded audit {audit.id} ({audit.domain}) to Single Audit view via persistence layer")
-            st.toast(f"✓ Loaded {audit.domain} to Single Audit page")
+            logger.debug(f"Loaded audit {audit_dict['id']} ({audit_dict['domain']}) to Single Audit view via persistence layer")
+            st.toast(f"✓ Loaded {audit_dict['domain']} to Single Audit page")
             st.rerun()
     
     with col_btn3:
         # Send Email button
-        if lead and lead.email:
-            if st.button("📧 Send Email", key=f"send_email_{audit.id}", use_container_width=True, type="primary"):
+        if lead and lead["email"]:
+            if st.button("📧 Send Email", key=f"send_email_{audit_dict['id']}", use_container_width=True, type="primary"):
                 # Set up session state for email sending
-                st.session_state.email_target_lead_id = lead.id
-                st.session_state.email_target_audit_id = audit.id
-                st.session_state.email_target_domain = lead.domain
-                st.session_state.email_target_address = lead.email
+                st.session_state.email_target_lead_id = lead["id"]
+                st.session_state.email_target_audit_id = audit_dict['id']
+                st.session_state.email_target_domain = lead["domain"]
+                st.session_state.email_target_address = lead["email"]
                 st.session_state.current_section = 'Email Outreach'
-                st.toast(f"📧 Opening email for {lead.domain}")
+                st.toast(f"📧 Opening email for {lead['domain']}")
                 st.rerun()
         else:
-            st.button("📧 Send Email", key=f"send_email_{audit.id}_disabled", use_container_width=True, disabled=True, 
+            st.button("📧 Send Email", key=f"send_email_{audit_dict['id']}_disabled", use_container_width=True, disabled=True, 
                       help="No email address found for this lead")
     
     with col_btn4:
         # Delete audit with confirmation
-        confirm_key = f"_confirm_delete_{audit.id}"
+        confirm_key = f"_confirm_delete_{audit_dict['id']}"
         if st.session_state.get(confirm_key):
-            st.warning(f"Delete audit for **{audit.domain}**?")
+            st.warning(f"Delete audit for **{audit_dict['domain']}**?")
             col_y, col_n = st.columns(2)
             with col_y:
-                if st.button("✅ Yes", key=f"confirm_del_yes_{audit.id}"):
-                    success, domain, error = delete_single_audit(audit.id)
+                if st.button("✅ Yes", key=f"confirm_del_yes_{audit_dict['id']}"):
+                    success, domain, error = delete_single_audit(audit_dict['id'])
                     if success:
                         st.toast(f"✓ Deleted audit for {domain}")
                         st.session_state.pop(confirm_key, None)
@@ -6650,11 +6680,11 @@ def render_audit_detail(audit):
                     else:
                         st.error(f"Failed to delete: {error}")
             with col_n:
-                if st.button("❌ No", key=f"confirm_del_no_{audit.id}"):
+                if st.button("❌ No", key=f"confirm_del_no_{audit_dict['id']}"):
                     st.session_state.pop(confirm_key, None)
                     st.rerun()
         else:
-            if st.button("🗑️ Delete", key=f"del_audit_{audit.id}", use_container_width=True, type="secondary"):
+            if st.button("🗑️ Delete", key=f"del_audit_{audit_dict['id']}", use_container_width=True, type="secondary"):
                 st.session_state[confirm_key] = True
                 st.rerun()
 
@@ -6752,7 +6782,10 @@ def show_email_outreach():
     email_sub1, email_sub2, email_sub3 = st.tabs(["📨 Send Email", "📋 Email Templates", "📊 Outreach Stats"])
     
     with email_sub1:
-        leads = get_leads_cached()
+        leads_orm = get_leads_cached()
+        
+        # Normalize all leads to dicts for consistent access
+        leads = normalize_lead_list(leads_orm) if leads_orm else []
         
         # Check for pre-filled target from audit detail
         target_lead_id = st.session_state.pop('email_target_lead_id', None)
@@ -6765,10 +6798,10 @@ def show_email_outreach():
             lead_opts = {}
             default_idx = 0
             for idx, l in enumerate(leads):
-                label = f"{l.domain} (Score: {l.health_score or 'N/A'}, Opp: {l.opportunity_rating or 'N/A'})"
+                label = f"{l['domain']} (Score: {l['health_score'] or 'N/A'}, Opp: {l.get('opportunity_rating') or 'N/A'})"
                 lead_opts[label] = l
                 # Set default to target lead if coming from audit detail
-                if target_lead_id and l.id == target_lead_id:
+                if target_lead_id and l['id'] == target_lead_id:
                     default_idx = idx
             
             # CRM quick stats
@@ -6776,13 +6809,13 @@ def show_email_outreach():
             with col_stat1:
                 st.metric("📊 Total Leads", len(leads))
             with col_stat2:
-                not_approached = sum(1 for l in leads if not l.approached)
+                not_approached = sum(1 for l in leads if not l["approached"])
                 st.metric("📧 Not Approached", not_approached)
             with col_stat3:
-                with_email = sum(1 for l in leads if l.email)
+                with_email = sum(1 for l in leads if l["email"])
                 st.metric("✉️ With Email", with_email)
             with col_stat4:
-                hot_leads = sum(1 for l in leads if l.lead_status == "hot")
+                hot_leads = sum(1 for l in leads if l["lead_status"] == "hot")
                 st.metric("🔥 Hot Leads", hot_leads)
             
             st.markdown("---")
@@ -6802,19 +6835,19 @@ def show_email_outreach():
                 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.markdown(f"**🌐 Domain:** {selected_lead.domain}")
-                    st.markdown(f"**📊 Score:** {selected_lead.health_score or 'N/A'}")
-                    st.markdown(f"**🎯 Opportunity:** {selected_lead.opportunity_rating or 'N/A'}/100")
+                    st.markdown(f"**🌐 Domain:** {selected_lead['domain']}")
+                    st.markdown(f"**📊 Score:** {selected_lead['health_score'] or 'N/A'}")
+                    st.markdown(f"**🎯 Opportunity:** {selected_lead.get('opportunity_rating') or 'N/A'}/100")
                 with col2:
-                    st.markdown(f"**📧 Email:** {selected_lead.email or 'Not found'}")
-                    st.markdown(f"**📞 Phone:** {selected_lead.phone or 'Not found'}")
-                    st.markdown(f"**🏢 Company:** {selected_lead.company_name or 'Unknown'}")
+                    st.markdown(f"**📧 Email:** {selected_lead['email'] or 'Not found'}")
+                    st.markdown(f"**📞 Phone:** {selected_lead.get('phone') or 'Not found'}")
+                    st.markdown(f"**🏢 Company:** {selected_lead['company_name'] or 'Unknown'}")
                 with col3:
                     # CRM status badges
-                    approached_icon = "✅ Yes" if selected_lead.approached else "❌ No"
+                    approached_icon = "✅ Yes" if selected_lead["approached"] else "❌ No"
                     st.markdown(f"**📮 Approached:** {approached_icon}")
-                    st.markdown(f"**🎯 Status:** {selected_lead.lead_status or 'warm'}")
-                    st.markdown(f"**📊 Pipeline:** {selected_lead.pipeline_stage or 'new'}")
+                    st.markdown(f"**🎯 Status:** {selected_lead['lead_status'] or 'warm'}")
+                    st.markdown(f"**📊 Pipeline:** {selected_lead['pipeline_stage'] or 'new'}")
                 
                 # Inline status update
                 st.markdown("---")
@@ -6823,13 +6856,13 @@ def show_email_outreach():
                     new_status = st.selectbox(
                         "Update lead status after send", 
                         ["new", "contacted", "responded", "converted", "lost"], 
-                        index=["new", "contacted", "responded", "converted", "lost"].index(selected_lead.status) if selected_lead.status in ["new", "contacted", "responded", "converted", "lost"] else 0,
+                        index=["new", "contacted", "responded", "converted", "lost"].index(selected_lead["status"]) if selected_lead["status"] in ["new", "contacted", "responded", "converted", "lost"] else 0,
                         key="email_lead_status"
                     )
                 with col_status2:
                     st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
-                    if new_status != selected_lead.status and st.button("Update Status"):
-                        update_lead_status(selected_lead.id, new_status)
+                    if new_status != selected_lead["status"] and st.button("Update Status"):
+                        update_lead_status(selected_lead["id"], new_status)
                         st.success("✅ Status updated!")
                         st.rerun()
                 
@@ -6837,7 +6870,7 @@ def show_email_outreach():
                 st.markdown("#### ✍️ Compose Email")
                 
                 # Email fields
-                recipient = st.text_input("📧 Recipient", value=selected_lead.email or target_email or "")
+                recipient = st.text_input("📧 Recipient", value=selected_lead["email"] or target_email or "")
                 
                 # Get latest audit for this domain for subject/body template
                 db = get_db()
@@ -6845,7 +6878,7 @@ def show_email_outreach():
                 audit_data = None
                 if db:
                     try:
-                        latest_audit = db.query(Audit).filter(Audit.domain == selected_lead.domain).order_by(Audit.created_at.desc()).first()
+                        latest_audit = db.query(Audit).filter(Audit.domain == selected_lead["domain"]).order_by(Audit.created_at.desc()).first()
                         if latest_audit:
                             audit_data = convert_audit_to_data_dict(latest_audit)
                     except Exception as e:
@@ -6854,7 +6887,7 @@ def show_email_outreach():
                         db.close()
                 
                 # Default subject with personalization
-                default_subject = f"Quick Website Review for {selected_lead.company_name or selected_lead.domain}"
+                default_subject = f"Quick Website Review for {selected_lead['company_name'] or selected_lead['domain']}"
                 subject = st.text_input("📝 Subject", value=default_subject)
                 
                 # Build body with AI draft if available
@@ -6864,9 +6897,9 @@ def show_email_outreach():
                 else:
                     default_body = f"""Hi,
 
-I recently analyzed your website at {selected_lead.domain} and noticed a few opportunities to improve your online presence.
+I recently analyzed your website at {selected_lead['domain']} and noticed a few opportunities to improve your online presence.
 
-Your website scored {selected_lead.health_score or 'N/A'}/100 on our health check. I'd love to share some insights that could help improve your site's performance and conversions.
+Your website scored {selected_lead['health_score'] or 'N/A'}/100 on our health check. I'd love to share some insights that could help improve your site's performance and conversions.
 
 Would you be interested in a quick call to discuss?
 
@@ -6892,7 +6925,7 @@ The Code Nest Team
                     if st.button("💾 Save Draft", use_container_width=True):
                         # Save to session for later
                         st.session_state.email_draft = {
-                            'lead_id': selected_lead.id,
+                            'lead_id': selected_lead["id"],
                             'recipient': recipient,
                             'subject': subject,
                             'body': body
@@ -6914,10 +6947,10 @@ The Code Nest Team
                                     pdf_bytes = None
                                     pdf_filename = None
                                     if attach_pdf and latest_audit:
-                                        pdf_bytes = get_audit_pdf(latest_audit.id)
+                                        pdf_bytes = get_audit_pdf(_get_attr(latest_audit, 'id'))
                                         if not pdf_bytes and audit_data:
                                             pdf_bytes = generate_pdf(audit_data)
-                                        pdf_filename = f"website_audit_{selected_lead.domain}.pdf"
+                                        pdf_filename = f"website_audit_{selected_lead['domain']}.pdf"
                                     
                                     # Send the email
                                     success, message = send_branded_email_with_pdf(
@@ -6938,11 +6971,11 @@ The Code Nest Team
                                         
                                         # Update CRM if requested
                                         if mark_approached:
-                                            mark_lead_as_approached(selected_lead.id, update_pipeline=True)
+                                            mark_lead_as_approached(selected_lead["id"], update_pipeline=True)
                                             st.info("✅ Lead marked as approached in CRM")
                                         
                                         # Log outreach
-                                        logger.info(f"Email sent to {recipient} for lead {selected_lead.domain}")
+                                        logger.info(f"Email sent to {recipient} for lead {selected_lead['domain']}")
                                         
                                         # Clear draft
                                         st.session_state.pop('email_draft', None)
@@ -7142,8 +7175,11 @@ def show_lead_management():
             if size_filter != "All":
                 query = query.filter(Lead.company_size == size_filter)
             
-            leads = query.all()
+            leads_orm = query.all()
             db.close()
+            
+            # Normalize all leads to dicts
+            leads = normalize_lead_list(leads_orm) if leads_orm else []
             
             if leads:
                 # Display metrics
@@ -7151,13 +7187,13 @@ def show_lead_management():
                 with col1:
                     st.metric("Total Leads", len(leads))
                 with col2:
-                    avg_opp = sum(l.opportunity_rating for l in leads) / len(leads) if leads else 0
+                    avg_opp = sum(l.get("opportunity_rating", 0) or 0 for l in leads) / len(leads) if leads else 0
                     st.metric("Avg Opportunity", f"{avg_opp:.0f}/100")
                 with col3:
-                    high_priority = len([l for l in leads if l.opportunity_rating >= 70])
+                    high_priority = len([l for l in leads if (l.get("opportunity_rating") or 0) >= 70])
                     st.metric("High Priority", high_priority)
                 with col4:
-                    converted = len([l for l in leads if l.status == "converted"])
+                    converted = len([l for l in leads if l["status"] == "converted"])
                     st.metric("Converted", converted)
                 
                 st.divider()
@@ -7166,14 +7202,14 @@ def show_lead_management():
                 leads_data = []
                 for lead in leads[:100]:  # Limit to 100 for performance
                     leads_data.append({
-                        "Company": lead.company_name or "N/A",
-                        "Industry": lead.industry or "Unknown",
-                        "Size": lead.company_size or "Unknown",
-                        "Health Score": lead.health_score or "N/A",
-                        "Opportunity": lead.opportunity_rating,
-                        "Status": lead.status,
-                        "Location": f"{lead.city}, {lead.state}" if lead.city else "N/A",
-                        "Phone": lead.phone or "N/A"
+                        "Company": lead["company_name"] or "N/A",
+                        "Industry": lead.get("industry") or "Unknown",
+                        "Size": lead.get("company_size") or "Unknown",
+                        "Health Score": lead["health_score"] if lead["health_score"] is not None else "N/A",
+                        "Opportunity": lead.get("opportunity_rating") or 0,
+                        "Status": lead["status"],
+                        "Location": f"{lead.get('city')}, {lead.get('state')}" if lead.get("city") else "N/A",
+                        "Phone": lead.get("phone") or "N/A"
                     })
                 
                 st.dataframe(
@@ -7195,30 +7231,34 @@ def show_lead_management():
         
         db = get_db()
         if db:
-            leads = db.query(Lead).order_by(Lead.opportunity_rating.desc()).limit(50).all()
+            leads_orm = db.query(Lead).order_by(Lead.opportunity_rating.desc()).limit(50).all()
             db.close()
+            
+            # Normalize leads
+            leads = normalize_lead_list(leads_orm) if leads_orm else []
             
             if leads:
                 # Select a lead to see service opportunities
-                lead_options = {f"{l.company_name} ({l.city}, {l.state})" or l.domain: l for l in leads}
+                lead_options = {f"{l['company_name']} ({l.get('city')}, {l.get('state')})" or l['domain']: l for l in leads}
                 selected_lead_name = st.selectbox("Select a lead to view service opportunities", list(lead_options.keys()))
                 selected_lead = lead_options[selected_lead_name]
                 
                 if selected_lead:
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        st.markdown(f"**Company:** {selected_lead.company_name or 'N/A'}")
-                        st.markdown(f"**Industry:** {selected_lead.industry or 'Unknown'}")
+                        st.markdown(f"**Company:** {selected_lead['company_name'] or 'N/A'}")
+                        st.markdown(f"**Industry:** {selected_lead.get('industry') or 'Unknown'}")
                     with col2:
-                        st.markdown(f"**Size:** {selected_lead.company_size or 'Unknown'}")
-                        st.markdown(f"**Health Score:** {selected_lead.health_score or 'N/A'}/100")
+                        st.markdown(f"**Size:** {selected_lead.get('company_size') or 'Unknown'}")
+                        st.markdown(f"**Health Score:** {selected_lead['health_score'] or 'N/A'}/100")
                     with col3:
-                        st.markdown(f"**Location:** {selected_lead.city}, {selected_lead.state}" if selected_lead.city else "")
-                        st.markdown(f"**Opportunity:** {selected_lead.opportunity_rating}/100")
+                        st.markdown(f"**Location:** {selected_lead.get('city')}, {selected_lead.get('state')}" if selected_lead.get('city') else "")
+                        st.markdown(f"**Opportunity:** {selected_lead.get('opportunity_rating') or 0}/100")
                     
                     st.divider()
                     
-                    if selected_lead.service_priorities:
+                    service_priorities = selected_lead.get('service_priorities') or {}
+                    if service_priorities:
                         st.markdown("### 📈 Service Opportunity Scores")
                         
                         service_names = {
@@ -7235,7 +7275,7 @@ def show_lead_management():
                         }
                         
                         cols = st.columns(2)
-                        for idx, (service_key, score) in enumerate(sorted(selected_lead.service_priorities.items(), 
+                        for idx, (service_key, score) in enumerate(sorted(service_priorities.items(), 
                                                                           key=lambda x: x[1], reverse=True)):
                             with cols[idx % 2]:
                                 service_name = service_names.get(service_key, service_key)
@@ -7260,12 +7300,12 @@ def show_lead_management():
                                 if st.session_state.get(f"show_pitch_{service_key}"):
                                     with st.expander("📧 Service Pitch", expanded=True):
                                         pitch = generate_service_pitch(
-                                            selected_lead.company_name or "Client",
+                                            selected_lead["company_name"] or "Client",
                                             service_key,
                                             score,
-                                            selected_lead.industry or "Unknown",
-                                            selected_lead.company_size or "Unknown",
-                                            {"score": selected_lead.health_score or 0, "issues": []}
+                                            selected_lead["industry"] or "Unknown",
+                                            selected_lead["company_size"] or "Unknown",
+                                            {"score": selected_lead["health_score"] or 0, "issues": []}
                                         )
                                         st.markdown(pitch)
             else:
@@ -7276,36 +7316,38 @@ def show_lead_management():
         
         db = get_db()
         if db:
-            leads_with_ai = db.query(Lead).filter(Lead.ai_enrichment.isnot(None)).order_by(Lead.updated_at.desc()).limit(20).all()
+            leads_with_ai_orm = db.query(Lead).filter(Lead.ai_enrichment.isnot(None)).order_by(Lead.updated_at.desc()).limit(20).all()
             db.close()
+            leads_with_ai = normalize_lead_list(leads_with_ai_orm)
             
             if leads_with_ai:
                 for lead in leads_with_ai:
-                    with st.expander(f"{lead.company_name or lead.domain} - {lead.city}, {lead.state}"):
-                        if lead.ai_enrichment:
+                    with st.expander(f"{lead['company_name'] or lead['domain']} - {lead['city']}, {lead['state']}"):
+                        ai_enrichment = lead["ai_enrichment"]
+                        if ai_enrichment:
                             col1, col2 = st.columns(2)
                             
                             with col1:
                                 st.markdown("**Key Challenges:**")
-                                if isinstance(lead.ai_enrichment, dict):
-                                    for challenge in lead.ai_enrichment.get('key_challenges', []):
+                                if isinstance(ai_enrichment, dict):
+                                    for challenge in ai_enrichment.get('key_challenges', []):
                                         st.markdown(f"- {challenge}")
                                     
                                     st.markdown("**Quick Wins (30 days):**")
-                                    for win in lead.ai_enrichment.get('quick_wins', []):
+                                    for win in ai_enrichment.get('quick_wins', []):
                                         st.markdown(f"✅ {win}")
                             
                             with col2:
                                 st.markdown("**Recommended Services:**")
-                                for service in lead.ai_enrichment.get('recommended_services', []):
+                                for service in ai_enrichment.get('recommended_services', []):
                                     st.markdown(f"• {service}")
                                 
                                 st.markdown("**Conversation Starters:**")
-                                for starter in lead.ai_enrichment.get('conversation_starters', []):
+                                for starter in ai_enrichment.get('conversation_starters', []):
                                     st.markdown(f"💡 {starter}")
                             
                             st.markdown("**Estimated Business Impact:**")
-                            st.info(lead.ai_enrichment.get('estimated_impact', 'N/A'))
+                            st.info(ai_enrichment.get('estimated_impact', 'N/A'))
             else:
                 st.info("No AI-enriched leads yet. Import leads with AI enrichment enabled.")
 
@@ -9775,8 +9817,15 @@ def generate_active_filter_chips(time_filter: str, selected_date, search: str,
     
     return active_filters
 
+def _get_attr(obj, attr, default=None):
+    """Get attribute from either ORM object or dict."""
+    if isinstance(obj, dict):
+        return obj.get(attr, default)
+    return getattr(obj, attr, default)
+
+
 def filter_audits_by_time_period(audits: list, time_filter: str, selected_date=None, date_from=None, date_to=None) -> list:
-    """Filter audits by time period. Extracted helper function."""
+    """Filter audits by time period. Extracted helper function. Works with ORM objects or dicts."""
     if not audits or time_filter == "All Time":
         return audits
     
@@ -9788,10 +9837,11 @@ def filter_audits_by_time_period(audits: list, time_filter: str, selected_date=N
     
     filtered = []
     for audit in audits:
-        if not audit.created_at:
+        created_at = _get_attr(audit, 'created_at')
+        if not created_at:
             continue
         
-        audit_date = audit.created_at
+        audit_date = created_at
         
         if time_filter == "Today":
             if audit_date >= today_start:
@@ -9824,32 +9874,37 @@ def filter_audits_by_time_period(audits: list, time_filter: str, selected_date=N
     return filtered
 
 def dedupe_audits_by_domain(audits: list, per_user: bool = True) -> list:
-    """Deduplicate audits keeping only most recent per domain (optionally per user)."""
+    """Deduplicate audits keeping only most recent per domain (optionally per user). Works with ORM objects or dicts."""
     if not audits:
         return []
     
     domain_map = {}
     for audit in audits:
+        domain = _get_attr(audit, 'domain', '')
+        username = _get_attr(audit, 'username', '')
+        created_at = _get_attr(audit, 'created_at')
+        
         # Create key based on domain (and optionally username for per-user dedup)
-        key = f"{audit.domain}:{audit.username}" if per_user and hasattr(audit, 'username') else audit.domain
+        key = f"{domain}:{username}" if per_user and username else domain
         
         if key not in domain_map:
             domain_map[key] = audit
         else:
             # Keep the one with the latest created_at
             existing = domain_map[key]
-            if audit.created_at and existing.created_at:
-                if audit.created_at > existing.created_at:
+            existing_created_at = _get_attr(existing, 'created_at')
+            if created_at and existing_created_at:
+                if created_at > existing_created_at:
                     domain_map[key] = audit
-            elif audit.created_at:
+            elif created_at:
                 domain_map[key] = audit
     
     result = list(domain_map.values())
-    result.sort(key=lambda x: x.created_at if x.created_at else datetime.min, reverse=True)
+    result.sort(key=lambda x: _get_attr(x, 'created_at') or datetime.min, reverse=True)
     return result
 
 def group_audits_by_period(audits: list) -> dict:
-    """Group audits by time period for organized display."""
+    """Group audits by time period for organized display. Works with ORM objects or dicts."""
     now = datetime.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
@@ -9865,11 +9920,12 @@ def group_audits_by_period(audits: list) -> dict:
     }
     
     for audit in audits:
-        if not audit.created_at:
+        created_at = _get_attr(audit, 'created_at')
+        if not created_at:
             grouped["Older"].append(audit)
             continue
         
-        audit_date = audit.created_at
+        audit_date = created_at
         if audit_date >= today_start:
             grouped["Today"].append(audit)
         elif audit_date >= yesterday_start:
@@ -9882,22 +9938,30 @@ def group_audits_by_period(audits: list) -> dict:
             grouped["Older"].append(audit)
     
     return grouped
+    
+    return grouped
 
 def generate_audit_row_data(audit) -> dict:
-    """Generate display data for a single audit row."""
-    status_icon, status_label, _ = get_score_status_icon(audit.health_score)
-    tags = st.session_state.get('audit_tags', {}).get(audit.id, [])
+    """Generate display data for a single audit row.
+    
+    Normalizes the audit first to ensure consistent dictionary access.
+    """
+    # Normalize audit to dict
+    a = normalize_audit(audit)
+    
+    status_icon, status_label, _ = get_score_status_icon(a["health_score"])
+    tags = st.session_state.get('audit_tags', {}).get(a["id"], [])
     
     return {
         "Status": status_icon,
-        "Domain": audit.domain,
-        "Score": format_score_badge(audit.health_score) if audit.health_score is not None else "N/A",
-        "Speed": audit.psi_score if audit.psi_score else "N/A",
-        "Issues": len(audit.issues) if audit.issues else 0,
-        "Date": audit.created_at.strftime("%m/%d %H:%M") if audit.created_at else "N/A",
+        "Domain": a["domain"],
+        "Score": format_score_badge(a["health_score"]) if a["health_score"] is not None else "N/A",
+        "Speed": a["psi_score"] if a["psi_score"] else "N/A",
+        "Issues": len(a["issues"]) if a["issues"] else 0,
+        "Date": safe_timestamp_slice(a["created_at"], 11).replace("T", " ") if a["created_at"] else "N/A",
         "Tags": ", ".join(tags),
-        "ID": audit.id,
-        "User": audit.username or "Unknown"
+        "ID": a["id"],
+        "User": a["username"] or "Unknown"
     }
 
 def sort_audit_rows(hist_data: list, sort_col: str, reverse: bool = True) -> list:
@@ -10994,28 +11058,31 @@ def get_audit_pdf(audit_id):
         return None
     
     try:
-        audit = db.query(Audit).filter(Audit.id == audit_id).first()
-        if not audit:
+        audit_orm = db.query(Audit).filter(Audit.id == audit_id).first()
+        if not audit_orm:
             return None
+        
+        # Normalize audit to dict for consistent access
+        audit = normalize_audit(audit_orm)
         
         # Prepare audit data for PDF generation
         audit_data = {
-            "domain": audit.domain,
-            "url": audit.url,
-            "score": audit.health_score,
-            "health_score": audit.health_score,
-            "psi": audit.psi_score,
-            "psi_score": audit.psi_score,
-            "domain_age": audit.domain_age,
-            "tech_stack": audit.tech_stack or [],
-            "issues": audit.issues or [],
-            "emails": audit.emails_found or [],
-            "created_at": audit.created_at.strftime("%Y-%m-%d %H:%M:%S") if audit.created_at else "N/A",
+            "domain": audit["domain"],
+            "url": audit["url"],
+            "score": audit["health_score"],
+            "health_score": audit["health_score"],
+            "psi": audit["psi_score"],
+            "psi_score": audit["psi_score"],
+            "domain_age": audit["domain_age"],
+            "tech_stack": audit["tech_stack"] or [],
+            "issues": audit["issues"] or [],
+            "emails": audit["emails_found"] or [],
+            "created_at": safe_timestamp_slice(audit["created_at"], 19).replace("T", " ") if audit["created_at"] else "N/A",
             "ai": {
-                "summary": audit.ai_summary or "",
-                "impact": audit.ai_impact or "",
-                "solutions": audit.ai_solutions or "",
-                "email": audit.ai_email or ""
+                "summary": audit["ai_summary"] or "",
+                "impact": audit["ai_impact"] or "",
+                "solutions": audit["ai_solutions"] or "",
+                "email": audit["ai_email"] or ""
             }
         }
         
